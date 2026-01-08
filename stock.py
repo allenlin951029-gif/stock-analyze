@@ -267,11 +267,16 @@ def get_institutional_data(stock_id, trade_date=None, market_hint=None):
 
             # 外資：排除「外資自營商」相關欄位，避免被自營商誤抓
             foreign_col = (
-                _find_net_col(cols, "外陸資", exclude=["外資自營商"])
-                or _find_net_col(cols, "外資及陸資", exclude=["外資自營商"])
-                or _find_net_col(cols, "外資", exclude=["外資自營商"])
-                or next((c for c in cols if ("外資" in str(c)) and ("買賣超" in str(c)) and ("外資自營商" not in str(c))), None)
-            )
+    _find_net_col(cols, "外陸資", exclude=["外資自營商"])
+    or _find_net_col(cols, "外資及陸資", exclude=["外資自營商"])
+    or _find_net_col(cols, "外資", exclude=["外資自營商"])
+    or next((c for c in cols if ("外資" in str(c)) and ("買賣超" in str(c)) and ("外資自營商" not in str(c))), None)
+    or next((c for c in cols
+             if (("外資" in str(c)) or ("外陸資" in str(c)) or ("外" in str(c)))
+             and (("買賣超" in str(c)) or ("買賣超股數" in str(c)))
+             and ("外資自營商" not in str(c))), None)
+)
+
 
             trust_col = (
                 _find_net_col(cols, "投信")
@@ -575,3 +580,4 @@ if __name__ == "__main__":
         if not user_input:
             continue
         analyze_stock_technical(user_input)
+
