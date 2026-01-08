@@ -11,8 +11,6 @@ st.set_page_config(
 )
 
 # --- 2. 核心檢查機制 (防止崩潰) ---
-# 這裡將所有外部套件的 import 都包起來檢查
-# 任何一個缺漏都會提示您重啟，而不是顯示令人困惑的 Traceback 錯誤代碼
 missing_packages = []
 
 try:
@@ -30,15 +28,17 @@ if missing_packages:
     st.error(f"🚫 系統環境尚未同步，缺少套件：{', '.join(missing_packages)}")
     st.warning(
         """
-        **請執行以下標準修復步驟 (Streamlit Cloud)：**
+        **請執行「核彈級」修復步驟：**
 
-        您的程式碼已更新，但雲端伺服器尚未安裝新套件。
+        您的環境快取 (Cache) 可能卡住了，一般的重啟無法生效。
+        請嘗試 **刪除並重新部署**：
 
-        1. 點擊畫面右下角的 **"Manage app"**。
-        2. 點擊選單右上角的 **三個點 (⋮)**。
-        3. 選擇 **"Reboot app"** (重啟應用程式)。
+        1. 回到 Streamlit Cloud 首頁 (儀表板)。
+        2. 找到這個 App，點擊右邊的 "..." 選擇 **"Delete"** (刪除)。
+        3. 點擊 **"New app"**。
+        4. 重新選取您的 Repository 和 Branch，再次點擊 **"Deploy"**。
 
-        *注意：點擊 Reboot 後，系統會讀取 requirements.txt 並重新安裝缺少的套件。*
+        這會強制伺服器建立全新的環境，保證會讀取 requirements.txt。
         """
     )
     st.stop()
