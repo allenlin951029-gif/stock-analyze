@@ -1,33 +1,9 @@
 import streamlit as st
-import subprocess
-import sys
-import time
-
-# --- 分析師除錯模組 (Auto-Fix) ---
-# 這是針對 Streamlit Cloud 的強制修復方案
-# 如果系統找不到 yfinance，程式會自動執行 pip install
-try:
-    import yfinance as yf
-except ModuleNotFoundError:
-    placeholder = st.empty()
-    placeholder.warning("⚠️ 偵測到環境缺少 yfinance 套件，正在嘗試自動安裝... (這可能需要幾秒鐘)")
-    try:
-        # 使用 subprocess 強制安裝
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "yfinance"])
-        import yfinance as yf
-
-        placeholder.success("✅ yfinance 安裝成功！正在載入分析工具...")
-        time.sleep(1)
-        placeholder.empty()  # 清除訊息
-    except Exception as e:
-        st.error(f"❌ 自動安裝失敗。請確認 requirements.txt 位於專案根目錄。\n詳細錯誤: {e}")
-        st.stop()
-
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
-# --- 設定頁面配置 (展現專業素養) ---
+# --- 設定頁面配置 ---
 st.set_page_config(
     page_title="專業股票分析儀表板",
     page_icon="📈",
@@ -35,7 +11,28 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- 側邊欄：參數設定 (第二層：量化分析技能) ---
+# --- 核心檢查機制 (安全版) ---
+# 這裡移除了會導致崩潰的 subprocess 安裝指令
+# 改為單純檢查，如果失敗則提示您手動重啟
+try:
+    import yfinance as yf
+except ModuleNotFoundError:
+    st.error("🚫 系統錯誤：找不到 `yfinance` 套件")
+    st.warning(
+        """
+        **請執行以下修復步驟 (Streamlit Cloud)：**
+
+        1. 確認您的 **requirements.txt** 檔案內容正確。
+        2. 點擊畫面右下角的 **"Manage app"**。
+        3. 點擊選單右上角的 **三個點 (⋮)**。
+        4. 選擇 **"Reboot app"** (重啟應用程式)。
+
+        *注意：只有執行「Reboot」動作，伺服器才會重新讀取設定檔並安裝 yfinance。*
+        """
+    )
+    st.stop()
+
+# --- 側邊欄：參數設定 ---
 st.sidebar.title("🔍 分析參數設定")
 
 # 預設為台積電 (2330.TW)，但也支援美股 (如 AAPL)
@@ -145,10 +142,8 @@ if stock is not None and not df_history.empty:
         with col_fin1:
             st.markdown("### 損益表摘要 (Income Statement)")
             if not financials.empty:
-                # 顯示最近幾期的營收與獲利
                 try:
                     display_fin = financials.loc[['Total Revenue', 'Net Income', 'Operating Income']].transpose()
-                    # 格式化數字
                     st.dataframe(display_fin.style.format("{:,.0f}"))
                 except KeyError:
                     st.dataframe(financials)
@@ -179,7 +174,6 @@ if stock is not None and not df_history.empty:
             st.subheader("公司概況")
             st.markdown(f"**產業:** {info.get('industry', 'N/A')}")
             st.markdown(f"**板塊:** {info.get('sector', 'N/A')}")
-            st.markdown(f"**員工數:** {info.get('fullTimeEmployees', 'N/A')}")
             st.markdown(f"**說明:**")
             st.caption(info.get('longBusinessSummary', '無詳細說明'))
 
@@ -187,8 +181,7 @@ if stock is not None and not df_history.empty:
             st.subheader("評價模型指標 (Valuation)")
 
             val_data = {
-                "指標": ["市值 (Market Cap)", "本益比 (Trailing PE)", "預估本益比 (Forward PE)", "PEG Ratio",
-                         "企業價值/EBITDA"],
+                "指標": ["市值", "本益比 (PE)", "預估本益比 (Forward PE)", "PEG Ratio", "企業價值/EBITDA"],
                 "數值": [
                     f"{info.get('marketCap', 0):,.0f}",
                     f"{info.get('trailingPE', 'N/A')}",
@@ -197,18 +190,12 @@ if stock is not None and not df_history.empty:
                     f"{info.get('enterpriseToEbitda', 'N/A')}"
                 ]
             }
-            val_df = pd.DataFrame(val_data)
-            st.table(val_df)
-
-            st.markdown("---")
-            st.markdown("**分析師觀點 - PEG 指標解讀：**")
-            st.markdown("- **PEG < 1**: 股價可能被低估（相對於成長性）。")
-            st.markdown("- **PEG ≈ 1**: 估值合理。")
-            st.markdown("- **PEG > 1**: 股價可能被高估，或市場給予極高的成長溢價。")
+            st.table(pd.DataFrame(val_data))
+            st.markdown("**分析師觀點 (PEG)：** PEG < 1 通常代表股價被低估。")
 
 else:
     st.warning("請在左側輸入有效的股票代號以開始分析。")
 
-# --- 頁尾：專業聲明 ---
+# --- 頁尾 ---
 st.markdown("---")
-st.caption("免責聲明：本工具僅供量化分析輔助，不構成投資建議。投資人應運用批判性思考 (Level 2) 並獨立判斷 (Level 3)。")
+st.caption("免責聲明：本工具僅供量化分析輔助，不構成投資建議。")
