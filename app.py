@@ -1,9 +1,8 @@
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
-# --- 設定頁面配置 ---
+# --- 1. 設定頁面配置 (必須是第一個 Streamlit 指令) ---
 st.set_page_config(
     page_title="專業股票分析儀表板",
     page_icon="📈",
@@ -11,28 +10,40 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- 核心檢查機制 (安全版) ---
-# 這裡移除了會導致崩潰的 subprocess 安裝指令
-# 改為單純檢查，如果失敗則提示您手動重啟
+# --- 2. 核心檢查機制 (防止崩潰) ---
+# 這裡將所有外部套件的 import 都包起來檢查
+# 任何一個缺漏都會提示您重啟，而不是顯示令人困惑的 Traceback 錯誤代碼
+missing_packages = []
+
+try:
+    import plotly.graph_objects as go
+except ModuleNotFoundError:
+    missing_packages.append("plotly")
+
 try:
     import yfinance as yf
 except ModuleNotFoundError:
-    st.error("🚫 系統錯誤：找不到 `yfinance` 套件")
+    missing_packages.append("yfinance")
+
+# 如果有缺套件，顯示引導畫面並暫停執行
+if missing_packages:
+    st.error(f"🚫 系統環境尚未同步，缺少套件：{', '.join(missing_packages)}")
     st.warning(
         """
-        **請執行以下修復步驟 (Streamlit Cloud)：**
+        **請執行以下標準修復步驟 (Streamlit Cloud)：**
 
-        1. 確認您的 **requirements.txt** 檔案內容正確。
-        2. 點擊畫面右下角的 **"Manage app"**。
-        3. 點擊選單右上角的 **三個點 (⋮)**。
-        4. 選擇 **"Reboot app"** (重啟應用程式)。
+        您的程式碼已更新，但雲端伺服器尚未安裝新套件。
 
-        *注意：只有執行「Reboot」動作，伺服器才會重新讀取設定檔並安裝 yfinance。*
+        1. 點擊畫面右下角的 **"Manage app"**。
+        2. 點擊選單右上角的 **三個點 (⋮)**。
+        3. 選擇 **"Reboot app"** (重啟應用程式)。
+
+        *注意：點擊 Reboot 後，系統會讀取 requirements.txt 並重新安裝缺少的套件。*
         """
     )
     st.stop()
 
-# --- 側邊欄：參數設定 ---
+# --- 3. 側邊欄：參數設定 ---
 st.sidebar.title("🔍 分析參數設定")
 
 # 預設為台積電 (2330.TW)，但也支援美股 (如 AAPL)
@@ -52,7 +63,7 @@ st.sidebar.info(
 )
 
 
-# --- 核心邏輯 ---
+# --- 4. 核心邏輯：抓取資料 ---
 def get_stock_data(symbol, start, end):
     try:
         stock = yf.Ticker(symbol)
@@ -70,7 +81,7 @@ stock, df_history, info = get_stock_data(ticker_symbol, start_date, end_date)
 
 if stock is not None and not df_history.empty:
 
-    # --- 標題區與即時數據 ---
+    # --- 5. 標題區與即時數據 ---
     st.title(f"📈 {info.get('longName', ticker_symbol)} ({ticker_symbol}) 深度分析報告")
 
     current_price = df_history['Close'].iloc[-1]
@@ -90,9 +101,10 @@ if stock is not None and not df_history.empty:
         st.metric("股東權益報酬率 (ROE)",
                   f"{info.get('returnOnEquity', 0) * 100:.2f}%" if info.get('returnOnEquity') else "N/A")
 
-    # --- 分析模組 ---
+    # --- 6. 分析模組分頁 ---
     tab1, tab2, tab3 = st.tabs(["📊 技術趨勢與量價", "📑 財務報表分析 (Level 1)", "🏢 公司基本面與評價"])
 
+    # 分頁 1: 技術面
     with tab1:
         st.subheader("價格走勢與移動平均線 (MA)")
 
@@ -128,6 +140,7 @@ if stock is not None and not df_history.empty:
 
         st.markdown("**分析師觀點：** 觀察月線與季線的黃金交叉或死亡交叉，配合成交量變化，可判斷短期與中期的多空力道。")
 
+    # 分頁 2: 財報面
     with tab2:
         st.subheader("三大財務報表核心數據 (Financial Accounting)")
         st.markdown("透過損益表與資產負債表，我們可以識別財報中的警訊 (Red Flags)。")
@@ -167,6 +180,7 @@ if stock is not None and not df_history.empty:
             else:
                 st.warning("無法取得詳細現金流數據")
 
+    # 分頁 3: 基本面
     with tab3:
         col_b1, col_b2 = st.columns([1, 2])
 
@@ -174,6 +188,7 @@ if stock is not None and not df_history.empty:
             st.subheader("公司概況")
             st.markdown(f"**產業:** {info.get('industry', 'N/A')}")
             st.markdown(f"**板塊:** {info.get('sector', 'N/A')}")
+            st.markdown(f"**員工數:** {info.get('fullTimeEmployees', 'N/A')}")
             st.markdown(f"**說明:**")
             st.caption(info.get('longBusinessSummary', '無詳細說明'))
 
@@ -196,6 +211,6 @@ if stock is not None and not df_history.empty:
 else:
     st.warning("請在左側輸入有效的股票代號以開始分析。")
 
-# --- 頁尾 ---
+# --- 7. 頁尾 ---
 st.markdown("---")
 st.caption("免責聲明：本工具僅供量化分析輔助，不構成投資建議。")
