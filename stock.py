@@ -180,6 +180,7 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
     """
     回傳 foreign/trust/dealer 皆為「股」（shares）
     顯示時再 /1000 轉「張」
+    外資抓不到買賣超 → 用(買進-賣出)算
     """
     stock_no = stock_id.strip().upper().replace(".TW", "").replace(".TWO", "")
 
@@ -225,15 +226,30 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
     if not prefer_twse:
         markets = [("TPEx", try_tpex), ("TWSE", try_twse)]
 
-    def pick_col(cols, pred):
+    # --- 欄名正規化：消空白/BOM/全形括號 ---
+    def norm(s: str) -> str:
+        s = str(s)
+        s = s.replace("\ufeff", "")
+        s = s.replace("（", "(").replace("）", ")")
+        s = re.sub(r"\s+", "", s)
+        return s
+
+    def build_colmap(cols):
+        # norm_col -> original_col
+        mp = {}
         for c in cols:
-            if pred(str(c)):
-                return c
+            mp[norm(c)] = c
+        return mp
+
+    def find_first(colmap, predicate):
+        for nk, orig in colmap.items():
+            if predicate(nk):
+                return orig
         return None
 
-    def is_foreign_block(s: str) -> bool:
-        # 外資在TWSE常叫「外陸資」；TPEx常叫「外資及陸資」
-        return ("外陸資" in s) or ("外資及陸資" in s) or ("外資" in s)
+    def is_foreign_block(nk: str) -> bool:
+        # 注意：用正規化後 nk 比較
+        return ("外陸資" in nk) or ("外資及陸資" in nk) or ("外資" in nk)
 
     # 往前找 10 天（避開週末/休市）
     for back in range(0, 10):
@@ -246,8 +262,14 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 continue
 
             cols = list(df.columns)
+            colmap = build_colmap(cols)
 
-            code_col = next((c for c in cols if str(c).strip() in ("證券代號", "代號")), None)
+            # 代號欄
+            code_col = None
+            for c in cols:
+                if norm(c) in ("證券代號", "代號"):
+                    code_col = c
+                    break
             if code_col is None:
                 last_error = f"{mkt_name} 欄位找不到代號欄"
                 continue
@@ -257,36 +279,39 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 last_error = f"{mkt_name} 當日資料找不到 {stock_no}"
                 continue
 
-            # --- 外資（優先抓買賣超股數欄）---
-            foreign_col = (
-                _find_net_col(cols, "外陸資", exclude=["外資自營商"])
-                or _find_net_col(cols, "外資及陸資", exclude=["外資自營商"])
-                or _find_net_col(cols, "外資", exclude=["外資自營商"])
-                or pick_col(cols, lambda s: is_foreign_block(s) and ("買賣超" in s) and ("外資自營商" not in s))
+            # --- 外資欄位（買賣超股數）---
+            foreign_col = find_first(
+                colmap,
+                lambda nk: is_foreign_block(nk)
+                and ("買賣超" in nk)
+                and ("外資自營商" not in nk),
             )
 
-            # 投信
-            trust_col = (
-                _find_net_col(cols, "投信")
-                or pick_col(cols, lambda s: ("投信" in s) and ("買賣超" in s))
-                or pick_col(cols, lambda s: "投信" in s)
+            # --- 投信 ---
+            trust_col = find_first(
+                colmap,
+                lambda nk: ("投信" in nk) and ("買賣超" in nk),
+            ) or find_first(colmap, lambda nk: "投信" in nk)
+
+            # --- 自營商（總）排除外資自營商 ---
+            dealer_total_col = find_first(
+                colmap,
+                lambda nk: ("自營商" in nk)
+                and ("買賣超" in nk)
+                and ("外資自營商" not in nk)
+                and ("外資" not in nk)
+                and ("自行買賣" not in nk)
+                and ("避險" not in nk),
             )
 
-            # 自營商（排除外資自營商）
-            dealer_total_col = (
-                _find_net_col(cols, "自營商", exclude=["外資", "外資自營商", "自行買賣", "避險"])
-                or pick_col(
-                    cols,
-                    lambda s: ("自營商" in s)
-                    and ("買賣超" in s)
-                    and ("外資" not in s)
-                    and ("外資自營商" not in s)
-                    and ("自行買賣" not in s)
-                    and ("避險" not in s),
-                )
+            dealer_self_col = find_first(
+                colmap,
+                lambda nk: ("自營商" in nk) and ("自行買賣" in nk) and ("買賣超" in nk) and ("外資" not in nk),
             )
-            dealer_self_col = pick_col(cols, lambda s: ("自營商" in s) and ("自行買賣" in s) and ("買賣超" in s) and ("外資" not in s))
-            dealer_hedge_col = pick_col(cols, lambda s: ("自營商" in s) and ("避險" in s) and ("買賣超" in s) and ("外資" not in s))
+            dealer_hedge_col = find_first(
+                colmap,
+                lambda nk: ("自營商" in nk) and ("避險" in nk) and ("買賣超" in nk) and ("外資" not in nk),
+            )
 
             foreign = _safe_int(row.iloc[0][foreign_col]) if foreign_col else None
             trust = _safe_int(row.iloc[0][trust_col]) if trust_col else None
@@ -299,10 +324,20 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 b = _safe_int(row.iloc[0][dealer_hedge_col]) if dealer_hedge_col else 0
                 dealer = (a or 0) + (b or 0)
 
-            # ✅ 外資 fallback：若買賣超抓不到 → 用(買進 - 賣出)
+            # ✅ 外資 fallback：若買賣超抓不到/不可解析 → 用(買進-賣出)
             if foreign is None:
-                buy_col = pick_col(cols, lambda s: is_foreign_block(s) and ("買進" in s) and ("外資自營商" not in s))
-                sell_col = pick_col(cols, lambda s: is_foreign_block(s) and ("賣出" in s) and ("外資自營商" not in s))
+                buy_col = find_first(
+                    colmap,
+                    lambda nk: is_foreign_block(nk)
+                    and (("買進" in nk) or ("買入" in nk))
+                    and ("外資自營商" not in nk),
+                )
+                sell_col = find_first(
+                    colmap,
+                    lambda nk: is_foreign_block(nk)
+                    and (("賣出" in nk) or ("賣" in nk))
+                    and ("外資自營商" not in nk),
+                )
                 buy_v = _safe_int(row.iloc[0][buy_col]) if buy_col else None
                 sell_v = _safe_int(row.iloc[0][sell_col]) if sell_col else None
                 if buy_v is not None and sell_v is not None:
@@ -319,6 +354,7 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
             }
 
     return {"error": last_error or "未知錯誤", "id": f"{stock_no}.TW"}
+
 
 
 # ---------------------------
@@ -556,3 +592,4 @@ def analyze_stock_technical(stock_id: str) -> str:
 
     out.append("=" * 50)
     return "\n".join(out)
+
