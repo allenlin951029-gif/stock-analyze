@@ -1,7 +1,9 @@
 # stock.py
-# 單位修正：三大法人「買賣超股數」→ 顯示為「張」（股/1000）
-# 同時修正：外資欄位抓不到(外陸資/外資及陸資) + 避免誤抓外資自營商欄位
-# 保留：當日K棒型態 + 當日VOL=0/NaN 改用昨日VOL
+# 1) 三大法人單位：官方回來是「股」→ 顯示改成「張」（股/1000）
+# 2) 外資抓不到時：改用「外資買進 - 外資賣出」計算淨買賣（fallback）
+# 3) 自營商避免誤抓「外資自營商」
+# 4) 當日VOL=0/NaN → 改用昨日VOL（量增量縮用昨日 vs 前日）
+# 5) 額外：當日K棒型態
 
 import io
 import re
@@ -12,15 +14,16 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-# 若你 requirements.txt 有 truststore，可保留；沒有就刪掉下面兩行
+# optional (if you have truststore in requirements)
 try:
     import truststore
     truststore.inject_into_ssl()
 except Exception:
     pass
 
+
 # ---------------------------
-# 基本工具
+# Basic helpers
 # ---------------------------
 def clean_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -47,8 +50,17 @@ def _safe_int(x):
         return None
 
 
+def _resolve_yf_ticker(stock_id: str) -> str:
+    s = stock_id.strip().upper()
+    if s.endswith(".TW") or s.endswith(".TWO"):
+        return s
+    return f"{s}.TW"
+
+
+# ---------------------------
+# Candle (emoji + pattern)
+# ---------------------------
 def get_k_status(open_p, close_p, high_p=None, low_p=None):
-    # 若提供 high/low，能判斷十字
     try:
         o = float(open_p)
         c = float(close_p)
@@ -63,9 +75,6 @@ def get_k_status(open_p, close_p, high_p=None, low_p=None):
         return "➖"
 
 
-# ---------------------------
-# 當日K棒型態
-# ---------------------------
 def describe_candle(open_p, high_p, low_p, close_p):
     o, h, l, c = float(open_p), float(high_p), float(low_p), float(close_p)
     rng = h - l
@@ -81,7 +90,6 @@ def describe_candle(open_p, high_p, low_p, close_p):
     lower_r = lower / rng
     bullish = c > o
 
-    # 十字系
     if body_r <= 0.10:
         if upper_r >= 0.65 and lower_r <= 0.15:
             return "墓碑十字"
@@ -89,15 +97,12 @@ def describe_candle(open_p, high_p, low_p, close_p):
             return "蜻蜓十字"
         return "十字星"
 
-    # 長紅/長黑
     if body_r >= 0.60:
         return "長紅K" if bullish else "長黑K"
 
-    # 錘頭/吊人（下影長）
     if lower_r >= 0.60 and body_r <= 0.30 and upper_r <= 0.20:
         return "錘頭線" if bullish else "吊人線"
 
-    # 倒錘/流星（上影長）
     if upper_r >= 0.60 and body_r <= 0.30 and lower_r <= 0.20:
         return "倒錘線" if bullish else "流星線"
 
@@ -112,7 +117,7 @@ def describe_candle(open_p, high_p, low_p, close_p):
 
 
 # ---------------------------
-# 三大法人：官方 CSV 解析（TWSE / TPEx）
+# Institutional: TWSE / TPEx CSV parsing
 # ---------------------------
 def _find_net_col(cols, keyword, exclude=None):
     exclude = exclude or []
@@ -173,7 +178,7 @@ def _parse_tpex_csv(text):
 
 def get_institutional_data(stock_id, trade_date, market_hint=None):
     """
-    回傳：foreign/trust/dealer 為「股數」（不是張）
+    回傳 foreign/trust/dealer 皆為「股」（shares）
     顯示時再 /1000 轉「張」
     """
     stock_no = stock_id.strip().upper().replace(".TW", "").replace(".TWO", "")
@@ -220,6 +225,17 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
     if not prefer_twse:
         markets = [("TPEx", try_tpex), ("TWSE", try_twse)]
 
+    def pick_col(cols, pred):
+        for c in cols:
+            if pred(str(c)):
+                return c
+        return None
+
+    def is_foreign_block(s: str) -> bool:
+        # 外資在TWSE常叫「外陸資」；TPEx常叫「外資及陸資」
+        return ("外陸資" in s) or ("外資及陸資" in s) or ("外資" in s)
+
+    # 往前找 10 天（避開週末/休市）
     for back in range(0, 10):
         d = trade_date - timedelta(days=back)
 
@@ -231,7 +247,6 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
 
             cols = list(df.columns)
 
-            # 代號欄
             code_col = next((c for c in cols if str(c).strip() in ("證券代號", "代號")), None)
             if code_col is None:
                 last_error = f"{mkt_name} 欄位找不到代號欄"
@@ -242,30 +257,36 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 last_error = f"{mkt_name} 當日資料找不到 {stock_no}"
                 continue
 
-            # 外資：必抓「外陸資」或「外資及陸資(不含外資自營商)」
+            # --- 外資（優先抓買賣超股數欄）---
             foreign_col = (
                 _find_net_col(cols, "外陸資", exclude=["外資自營商"])
                 or _find_net_col(cols, "外資及陸資", exclude=["外資自營商"])
                 or _find_net_col(cols, "外資", exclude=["外資自營商"])
-                or next((c for c in cols if ("外" in str(c)) and ("買賣超" in str(c)) and ("外資自營商" not in str(c))), None)
+                or pick_col(cols, lambda s: is_foreign_block(s) and ("買賣超" in s) and ("外資自營商" not in s))
             )
 
+            # 投信
             trust_col = (
                 _find_net_col(cols, "投信")
-                or next((c for c in cols if ("投信" in str(c)) and ("買賣超" in str(c))), None)
-                or next((c for c in cols if "投信" in str(c)), None)
+                or pick_col(cols, lambda s: ("投信" in s) and ("買賣超" in s))
+                or pick_col(cols, lambda s: "投信" in s)
             )
 
-            # 自營商：排除外資自營商，避免抓錯
+            # 自營商（排除外資自營商）
             dealer_total_col = (
                 _find_net_col(cols, "自營商", exclude=["外資", "外資自營商", "自行買賣", "避險"])
-                or next((c for c in cols
-                         if ("自營商" in str(c)) and ("買賣超" in str(c))
-                         and ("外資" not in str(c)) and ("外資自營商" not in str(c))
-                         and ("自行買賣" not in str(c)) and ("避險" not in str(c))), None)
+                or pick_col(
+                    cols,
+                    lambda s: ("自營商" in s)
+                    and ("買賣超" in s)
+                    and ("外資" not in s)
+                    and ("外資自營商" not in s)
+                    and ("自行買賣" not in s)
+                    and ("避險" not in s),
+                )
             )
-            dealer_self_col = next((c for c in cols if ("自營商" in str(c)) and ("自行買賣" in str(c)) and ("買賣超" in str(c)) and ("外資" not in str(c))), None)
-            dealer_hedge_col = next((c for c in cols if ("自營商" in str(c)) and ("避險" in str(c)) and ("買賣超" in str(c)) and ("外資" not in str(c))), None)
+            dealer_self_col = pick_col(cols, lambda s: ("自營商" in s) and ("自行買賣" in s) and ("買賣超" in s) and ("外資" not in s))
+            dealer_hedge_col = pick_col(cols, lambda s: ("自營商" in s) and ("避險" in s) and ("買賣超" in s) and ("外資" not in s))
 
             foreign = _safe_int(row.iloc[0][foreign_col]) if foreign_col else None
             trust = _safe_int(row.iloc[0][trust_col]) if trust_col else None
@@ -277,6 +298,15 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 a = _safe_int(row.iloc[0][dealer_self_col]) if dealer_self_col else 0
                 b = _safe_int(row.iloc[0][dealer_hedge_col]) if dealer_hedge_col else 0
                 dealer = (a or 0) + (b or 0)
+
+            # ✅ 外資 fallback：若買賣超抓不到 → 用(買進 - 賣出)
+            if foreign is None:
+                buy_col = pick_col(cols, lambda s: is_foreign_block(s) and ("買進" in s) and ("外資自營商" not in s))
+                sell_col = pick_col(cols, lambda s: is_foreign_block(s) and ("賣出" in s) and ("外資自營商" not in s))
+                buy_v = _safe_int(row.iloc[0][buy_col]) if buy_col else None
+                sell_v = _safe_int(row.iloc[0][sell_col]) if sell_col else None
+                if buy_v is not None and sell_v is not None:
+                    foreign = buy_v - sell_v
 
             yf_suffix = ".TW" if mkt_name == "TWSE" else ".TWO"
             return {
@@ -292,7 +322,7 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
 
 
 # ---------------------------
-# 技術指標（保留你原本的計算架構，略作整理）
+# Indicators
 # ---------------------------
 def calculate_adx(df, period=14):
     df = df.copy()
@@ -311,8 +341,8 @@ def calculate_adx(df, period=14):
     df["+DM_s"] = df["+DM"].ewm(alpha=alpha, adjust=False).mean()
     df["-DM_s"] = df["-DM"].ewm(alpha=alpha, adjust=False).mean()
 
-    df["+DI"] = 100 * (df["+DM_s"] / df["TR_s"])
-    df["-DI"] = 100 * (df["-DM_s"] / df["TR_s"])
+    df["+DI"] = 100 * (df["+DM_s"] / df["TR_s"].replace(0, np.nan))
+    df["-DI"] = 100 * (df["-DM_s"] / df["TR_s"].replace(0, np.nan))
 
     df["DX"] = 100 * abs(df["+DI"] - df["-DI"]) / (df["+DI"] + df["-DI"]).replace(0, np.nan)
     df["ADX"] = df["DX"].ewm(alpha=alpha, adjust=False).mean()
@@ -361,15 +391,8 @@ def calculate_rsi(series, period):
     return 100 - (100 / (1 + rs))
 
 
-def _resolve_yf_ticker(stock_id: str) -> str:
-    s = stock_id.strip().upper()
-    if s.endswith(".TW") or s.endswith(".TWO"):
-        return s
-    return f"{s}.TW"
-
-
 # ---------------------------
-# 主分析（回傳字串，適合 Streamlit 顯示）
+# Main analysis (returns string for Streamlit)
 # ---------------------------
 def analyze_stock_technical(stock_id: str) -> str:
     stock_id = stock_id.strip().upper()
@@ -377,11 +400,10 @@ def analyze_stock_technical(stock_id: str) -> str:
         return "請輸入股票代號"
 
     yf_ticker = _resolve_yf_ticker(stock_id)
-
     out = []
     out.append(f"🔄 正在分析 {stock_id} ... (連線 Yahoo Finance)")
 
-    # 1) 下載日/週/月
+    # Daily
     df_daily = yf.download(yf_ticker, period="1y", interval="1d", progress=False, auto_adjust=False)
     df_daily = clean_yf_columns(df_daily)
 
@@ -395,9 +417,9 @@ def analyze_stock_technical(stock_id: str) -> str:
     if df_daily.empty:
         return "\n".join(out + [f"❌ 找不到股票代號 {stock_id} (Yahoo Finance 無數據)"])
 
+    # Weekly/Monthly
     df_weekly = yf.download(yf_ticker, period="1y", interval="1wk", progress=False, auto_adjust=False)
     df_weekly = clean_yf_columns(df_weekly)
-
     df_monthly = yf.download(yf_ticker, period="2y", interval="1mo", progress=False, auto_adjust=False)
     df_monthly = clean_yf_columns(df_monthly)
 
@@ -405,43 +427,39 @@ def analyze_stock_technical(stock_id: str) -> str:
     prev_daily = df_daily.iloc[-2] if len(df_daily) >= 2 else latest_daily
     latest_trade_date = df_daily.index[-1].date()
 
-    # 2) 三大法人（股數）
+    # Institutional (shares)
     chips = get_institutional_data(stock_id, trade_date=latest_trade_date, market_hint=yf_ticker)
 
-    # 3) 報表
     out.append("")
     out.append("=" * 50)
     out.append(f"📊 {yf_ticker} 專業版數據表 (含三大法人)")
     out.append(f"📅 資料日期: {df_daily.index[-1].strftime('%Y-%m-%d')}")
     out.append("=" * 50)
 
-    # 近5日
+    # Last 5 days
     out.append("📋 近 5 日交易紀錄:")
-    recent_5 = df_daily.tail(5)
     out.append(f"{'日期':<12} {'收盤':<12} {'漲跌':<12} {'K棒'}")
     out.append("-" * 50)
+    recent_5 = df_daily.tail(5)
     for idx, row in recent_5.iterrows():
         date_str = idx.strftime("%m-%d")
         close_p = float(row["Close"])
         open_p = float(row["Open"])
         high_p = float(row["High"])
         low_p = float(row["Low"])
-
         loc = df_daily.index.get_loc(idx)
         change = close_p - float(df_daily.iloc[loc - 1]["Close"]) if loc > 0 else 0.0
-
         out.append(f"{date_str:<12} {close_p:<12.2f} {change:<+12.2f} {get_k_status(open_p, close_p, high_p, low_p)}")
     out.append("-" * 50)
 
-    # 當日K棒型態
+    # Candle pattern
     try:
-        candle_type = describe_candle(latest_daily["Open"], latest_daily["High"], latest_daily["Low"], latest_daily["Close"])
-        out.append(f"🕯 當日K棒型態: {candle_type}")
+        out.append(f"🕯 當日K棒型態: {describe_candle(latest_daily['Open'], latest_daily['High'], latest_daily['Low'], latest_daily['Close'])}")
         out.append("-" * 50)
     except Exception:
         pass
 
-    # 三大法人：顯示為「張」（股/1000）
+    # Chips formatting: shares -> lots
     out.append("💰 籌碼面 (三大法人):")
     if chips and chips.get("error") is None:
         def fmt_to_lots(v_shares):
@@ -463,23 +481,23 @@ def analyze_stock_technical(stock_id: str) -> str:
         out.append(f"⚠️ 無法抓取三大法人數據 ({chips.get('error') if isinstance(chips, dict) else '未知錯誤'})")
     out.append("-" * 50)
 
-    # 長線趨勢
+    # Long trend
     out.append("📈 長線趨勢:")
-    if not df_weekly.empty and "Close" in df_weekly.columns:
+    if df_weekly is not None and (not df_weekly.empty) and "Close" in df_weekly.columns:
         ma20_week = df_weekly["Close"].rolling(20).mean().iloc[-1]
         out.append(f"• [週 K] 收: {float(df_weekly.iloc[-1]['Close']):.2f} | 20週均價: {float(ma20_week):.2f}")
-    if not df_monthly.empty and "Close" in df_monthly.columns:
+    if df_monthly is not None and (not df_monthly.empty) and "Close" in df_monthly.columns:
         out.append(f"• [月 K] 收: {float(df_monthly.iloc[-1]['Close']):.2f}")
     out.append("-" * 50)
 
-    # 基礎指標
+    # Base indicators
     out.append("🔍 基礎指標:")
     ma5 = df_daily["Close"].rolling(5).mean().iloc[-1]
     ma20 = df_daily["Close"].rolling(20).mean().iloc[-1]
     ma60 = df_daily["Close"].rolling(60).mean().iloc[-1]
     out.append(f"• 均線: MA5={float(ma5):.2f}, MA20={float(ma20):.2f}, MA60={float(ma60):.2f}")
 
-    # VOL：當日0/NaN → 用昨日；量增量縮改用「昨日 vs 前日」
+    # Volume fallback (lots)
     vol_today = float(latest_daily["Volume"]) if "Volume" in latest_daily else float("nan")
     vol_yesterday = float(prev_daily["Volume"]) if "Volume" in prev_daily else float("nan")
 
@@ -517,7 +535,7 @@ def analyze_stock_technical(stock_id: str) -> str:
     out.append(f"• MACD: OSC={float(osc.iloc[-1]):.2f}")
     out.append("-" * 50)
 
-    # 進階指標
+    # Advanced
     out.append("🚀 進階指標 (趨勢/波動/量能):")
     adx, pdi, mdi = calculate_adx(df_daily)
     out.append(f"• ADX(14): {float(adx.iloc[-1]):.2f} | +DI: {float(pdi.iloc[-1]):.2f}, -DI: {float(mdi.iloc[-1]):.2f}")
