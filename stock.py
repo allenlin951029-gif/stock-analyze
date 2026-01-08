@@ -68,6 +68,7 @@ def get_k_status(open_p, close_p, high_p=None, low_p=None):
             h = float(high_p)
             l = float(low_p)
             rng = h - l
+            # 若實體極小，視為十字
             if rng > 0 and abs(c - o) / rng <= 0.10:
                 return "➖ 十字"
         return "🔴 紅棒" if c > o else ("🟢 綠棒" if c < o else "➖ 十字")
@@ -119,14 +120,9 @@ def describe_candle(open_p, high_p, low_p, close_p):
 # ---------------------------
 # Institutional: TWSE / TPEx CSV parsing
 # ---------------------------
-def _find_net_col(cols, keyword, exclude=None):
-    exclude = exclude or []
-    for c in cols:
-        s = str(c)
-        if (keyword in s) and ("買賣超" in s) and not any(e in s for e in exclude):
-            return c
-    return None
-
+def _clean_header_list(cols):
+    """移除 CSV 標頭中的換行符號與空白，方便比對"""
+    return [str(c).replace("\n", "").replace("\r", "").strip() for c in cols]
 
 def _parse_twse_t86_csv(text):
     text = text.replace("\r", "").replace("=", "")
@@ -147,7 +143,9 @@ def _parse_twse_t86_csv(text):
 
     csv_text = "\n".join(lines[start:end])
     try:
-        return pd.read_csv(io.StringIO(csv_text))
+        df = pd.read_csv(io.StringIO(csv_text))
+        df.columns = _clean_header_list(df.columns) # 清理標頭
+        return df
     except Exception:
         return None
 
@@ -171,7 +169,9 @@ def _parse_tpex_csv(text):
 
     csv_text = "\n".join(lines[start:end])
     try:
-        return pd.read_csv(io.StringIO(csv_text))
+        df = pd.read_csv(io.StringIO(csv_text))
+        df.columns = _clean_header_list(df.columns) # 清理標頭
+        return df
     except Exception:
         return None
 
@@ -180,7 +180,6 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
     """
     回傳 foreign/trust/dealer 皆為「股」（shares）
     顯示時再 /1000 轉「張」
-    外資抓不到買賣超 → 用(買進-賣出)算
     """
     stock_no = stock_id.strip().upper().replace(".TW", "").replace(".TWO", "")
 
@@ -226,31 +225,6 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
     if not prefer_twse:
         markets = [("TPEx", try_tpex), ("TWSE", try_twse)]
 
-    # --- 欄名正規化：消空白/BOM/全形括號 ---
-    def norm(s: str) -> str:
-        s = str(s)
-        s = s.replace("\ufeff", "")
-        s = s.replace("（", "(").replace("）", ")")
-        s = re.sub(r"\s+", "", s)
-        return s
-
-    def build_colmap(cols):
-        # norm_col -> original_col
-        mp = {}
-        for c in cols:
-            mp[norm(c)] = c
-        return mp
-
-    def find_first(colmap, predicate):
-        for nk, orig in colmap.items():
-            if predicate(nk):
-                return orig
-        return None
-
-    def is_foreign_block(nk: str) -> bool:
-        # 注意：用正規化後 nk 比較
-        return ("外陸資" in nk) or ("外資及陸資" in nk) or ("外資" in nk)
-
     # 往前找 10 天（避開週末/休市）
     for back in range(0, 10):
         d = trade_date - timedelta(days=back)
@@ -262,86 +236,95 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 continue
 
             cols = list(df.columns)
-            colmap = build_colmap(cols)
-
-            # 代號欄
-            code_col = None
-            for c in cols:
-                if norm(c) in ("證券代號", "代號"):
-                    code_col = c
-                    break
+            
+            # 尋找代號欄
+            code_col = next((c for c in cols if c in ("證券代號", "代號")), None)
             if code_col is None:
                 last_error = f"{mkt_name} 欄位找不到代號欄"
                 continue
 
+            # 轉字串並去空白比對
             row = df[df[code_col].astype(str).str.strip() == stock_no]
             if row.empty:
                 last_error = f"{mkt_name} 當日資料找不到 {stock_no}"
                 continue
+            
+            # ==========================================
+            # 核心邏輯修正：精準抓取欄位
+            # ==========================================
+            def get_val(col_name):
+                if col_name and col_name in row.columns:
+                    return _safe_int(row.iloc[0][col_name])
+                return None
 
-            # --- 外資欄位（買賣超股數）---
-            foreign_col = find_first(
-                colmap,
-                lambda nk: is_foreign_block(nk)
-                and ("買賣超" in nk)
-                and ("外資自營商" not in nk),
-            )
+            def find_col(keywords, must_not_have=None):
+                """在 cols 中尋找符合所有關鍵字的欄位"""
+                for c in cols:
+                    if all(k in c for k in keywords):
+                        if must_not_have and any(bad in c for bad in must_not_have):
+                            continue
+                        return c
+                return None
 
-            # --- 投信 ---
-            trust_col = find_first(
-                colmap,
-                lambda nk: ("投信" in nk) and ("買賣超" in nk),
-            ) or find_first(colmap, lambda nk: "投信" in nk)
+            # --- 1. 外資 Foreign ---
+            # 優先級 1: 完整名稱 (TWSE: "外陸資買賣超股數(不含外資自營商)", TPEx: "外資及陸資買賣超股數(不含外資自營商)")
+            # 我們搜尋 "買賣超" 且包含 "(不含外資自營商)"，這是最準確的
+            foreign_col = find_col(["買賣超", "(不含外資自營商)"], must_not_have=["買進", "賣出"])
+            
+            # 優先級 2: 若找不到，找 "外陸資" 或 "外資" + "買賣超"，但必須 *不* 以 "外資自營商" 開頭
+            if not foreign_col:
+                # 這裡的邏輯是：欄位名稱可以是 "外陸資買賣超..." 但不能是 "外資自營商買賣超..."
+                # 注意：find_col 的 must_not_have 如果放 "外資自營商"，會把正確的 "(不含外資自營商)" 給殺掉
+                # 所以我們手動遍歷
+                for c in cols:
+                    if ("外陸資" in c or "外資" in c) and "買賣超" in c:
+                        if c.startswith("外資自營商"): # 關鍵修正：只排除以「外資自營商」開頭的
+                            continue
+                        foreign_col = c
+                        break
+            
+            foreign = get_val(foreign_col)
 
-            # --- 自營商（總）排除外資自營商 ---
-            dealer_total_col = find_first(
-                colmap,
-                lambda nk: ("自營商" in nk)
-                and ("買賣超" in nk)
-                and ("外資自營商" not in nk)
-                and ("外資" not in nk)
-                and ("自行買賣" not in nk)
-                and ("避險" not in nk),
-            )
+            # --- 2. 投信 Trust ---
+            trust_col = find_col(["投信", "買賣超"])
+            trust = get_val(trust_col)
 
-            dealer_self_col = find_first(
-                colmap,
-                lambda nk: ("自營商" in nk) and ("自行買賣" in nk) and ("買賣超" in nk) and ("外資" not in nk),
-            )
-            dealer_hedge_col = find_first(
-                colmap,
-                lambda nk: ("自營商" in nk) and ("避險" in nk) and ("買賣超" in nk) and ("外資" not in nk),
-            )
-
-            foreign = _safe_int(row.iloc[0][foreign_col]) if foreign_col else None
-            trust = _safe_int(row.iloc[0][trust_col]) if trust_col else None
-
+            # --- 3. 自營商 Dealer ---
+            # 邏輯：總合欄位優先 -> 否則自行買賣+避險
+            # 排除外資相關、排除權證相關(如果有)
+            dealer_total_col = find_col(["自營商", "買賣超"], must_not_have=["外資", "自行", "避險"])
+            
             dealer = None
             if dealer_total_col:
-                dealer = _safe_int(row.iloc[0][dealer_total_col])
-            elif dealer_self_col or dealer_hedge_col:
-                a = _safe_int(row.iloc[0][dealer_self_col]) if dealer_self_col else 0
-                b = _safe_int(row.iloc[0][dealer_hedge_col]) if dealer_hedge_col else 0
-                dealer = (a or 0) + (b or 0)
+                dealer = get_val(dealer_total_col)
+            else:
+                dealer_self = get_val(find_col(["自營商", "自行", "買賣超"])) or 0
+                dealer_hedge = get_val(find_col(["自營商", "避險", "買賣超"])) or 0
+                dealer = dealer_self + dealer_hedge
 
-            # ✅ 外資 fallback：若買賣超抓不到/不可解析 → 用(買進-賣出)
+            # --- 4. 外資 Fallback (買進 - 賣出) ---
             if foreign is None:
-                buy_col = find_first(
-                    colmap,
-                    lambda nk: is_foreign_block(nk)
-                    and (("買進" in nk) or ("買入" in nk))
-                    and ("外資自營商" not in nk),
-                )
-                sell_col = find_first(
-                    colmap,
-                    lambda nk: is_foreign_block(nk)
-                    and (("賣出" in nk) or ("賣" in nk))
-                    and ("外資自營商" not in nk),
-                )
-                buy_v = _safe_int(row.iloc[0][buy_col]) if buy_col else None
-                sell_v = _safe_int(row.iloc[0][sell_col]) if sell_col else None
-                if buy_v is not None and sell_v is not None:
-                    foreign = buy_v - sell_v
+                # 找買進欄位 (包含 "不含外資自營商" 或 不以 "外資自營商" 開頭)
+                buy_col = find_col(["買進", "(不含外資自營商)"])
+                if not buy_col:
+                    for c in cols:
+                        if ("外陸資" in c or "外資" in c) and "買進" in c and not c.startswith("外資自營商"):
+                            buy_col = c
+                            break
+                
+                # 找賣出欄位
+                sell_col = find_col(["賣出", "(不含外資自營商)"])
+                if not sell_col:
+                    for c in cols:
+                        if ("外陸資" in c or "外資" in c) and "賣出" in c and not c.startswith("外資自營商"):
+                            sell_col = c
+                            break
+                            
+                b_val = get_val(buy_col)
+                s_val = get_val(sell_col)
+                
+                if b_val is not None and s_val is not None:
+                    foreign = b_val - s_val
 
             yf_suffix = ".TW" if mkt_name == "TWSE" else ".TWO"
             return {
@@ -354,7 +337,6 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
             }
 
     return {"error": last_error or "未知錯誤", "id": f"{stock_no}.TW"}
-
 
 
 # ---------------------------
@@ -592,4 +574,3 @@ def analyze_stock_technical(stock_id: str) -> str:
 
     out.append("=" * 50)
     return "\n".join(out)
-
