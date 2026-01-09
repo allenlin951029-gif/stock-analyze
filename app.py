@@ -42,9 +42,7 @@ def load_current_from_cookie():
     return (v or "0050").strip().upper()
 
 # ✅ 同一個 rerun 只存一次，避免 DuplicateElementKey
-if "_cookie_saved_this_run" not in st.session_state:
-    st.session_state["_cookie_saved_this_run"] = False
-
+st.session_state["_cookie_saved_this_run"] = False
 def commit_cookies_once():
     if not st.session_state.get("_cookie_saved_this_run", False):
         cookies.save()
@@ -67,6 +65,8 @@ if "current_id" not in st.session_state:
     st.session_state.current_id = load_current_from_cookie()
 if "report" not in st.session_state:
     st.session_state.report = ""
+if "_last_debug" not in st.session_state:
+    st.session_state._last_debug = ""
 
 # -------------------------
 # Helpers
@@ -81,10 +81,6 @@ def push_history(stock_id: str):
     save_history_to_cookie(st.session_state.history)
 
 def run_analysis(stock_id: str, write_history: bool):
-    """
-    ✅ 重要：用 redirect_stdout 把 analyze_stock_technical 的 print 輸出抓回來
-    這樣 auto-refresh 才能「看見」每次 rerun 的更新結果
-    """
     sid = stock_id.strip().upper()
     if not sid:
         st.session_state.report = "請輸入股票代號"
@@ -98,13 +94,34 @@ def run_analysis(stock_id: str, write_history: bool):
 
     with st.spinner(f"正在分析 {sid} ..."):
         buf = io.StringIO()
+        ret = None
         try:
+            # 同時抓 print 輸出
             with redirect_stdout(buf):
-                analyze_stock_technical(sid)  # 不管有沒有 return，都抓 print
-            text = buf.getvalue()
-            st.session_state.report = text if text.strip() else "（沒有輸出：可能抓取失敗或代號無資料）"
+                ret = analyze_stock_technical(sid)
+
+            stdout_text = buf.getvalue()
+
+            # ✅ 優先順序：return 字串 > stdout > 其它型別 > 沒輸出
+            if isinstance(ret, str) and ret.strip():
+                st.session_state.report = ret
+            elif stdout_text.strip():
+                st.session_state.report = stdout_text
+            elif ret is not None:
+                st.session_state.report = f"（函式有回傳，但不是字串：{type(ret).__name__}）\n{ret}"
+            else:
+                st.session_state.report = "（沒有輸出：函式沒有 return 字串、也沒有 print 輸出）"
+
+            # Debug 資訊（方便你定位是不是根本沒進函式）
+            st.session_state._last_debug = (
+                f"ret_type={type(ret).__name__}, "
+                f"ret_is_none={ret is None}, "
+                f"stdout_len={len(stdout_text)}"
+            )
+
         except Exception as e:
             st.session_state.report = f"⚠️ 分析失敗：{type(e).__name__}: {e}"
+            st.session_state._last_debug = f"exception={type(e).__name__}"
 
 # -------------------------
 # Sidebar
@@ -112,13 +129,15 @@ def run_analysis(stock_id: str, write_history: bool):
 with st.sidebar:
     st.subheader("設定")
 
-    # ✅ 加 key，並且 interval 是「毫秒」
     auto = st.toggle("即時更新（每 10 秒刷新）", value=False, key="auto_refresh")
 
     refresh_count = 0
     if auto:
+        # ✅ interval 單位是毫秒，10 秒 = 10_000
         refresh_count = st_autorefresh(interval=10_000, key="autorefresh_10s")
-        st.caption(f"autorefresh tick = {refresh_count}")  # ✅ 這個數字會一直變，代表真的有 rerun
+        st.caption(f"autorefresh tick = {refresh_count}")
+
+    st.caption(f"debug: {st.session_state._last_debug}")
 
     st.divider()
     st.subheader("搜尋歷史（前 5 筆，會保存）")
@@ -154,7 +173,7 @@ with col2:
 if search:
     run_analysis(stock_id, write_history=True)
 
-# ✅ Auto refresh：只在 tick > 0 時才跑（避免開啟瞬間重跑造成混亂）
+# Auto refresh：只在 tick > 0 時才跑（避免開啟瞬間就跑一次造成混亂）
 if auto and refresh_count > 0 and st.session_state.current_id:
     run_analysis(st.session_state.current_id, write_history=False)
 
