@@ -94,9 +94,9 @@ def run_analysis(stock_id: str, write_history: bool):
 # -------------------------
 with st.sidebar:
     st.subheader("設定")
-    auto = st.toggle("即時更新（每 5 秒刷新）", value=False)
+    auto = st.toggle("即時更新（每 10 秒刷新）", value=False)
     if auto:
-        st_autorefresh(interval=5000, key="autorefresh_5s")
+        st_autorefresh(interval=10000, key="autorefresh_10s")
 
     st.divider()
     st.subheader("搜尋歷史（前 5 筆，會保存）")
@@ -140,3 +140,4 @@ if st.session_state.report and str(st.session_state.report).strip():
     st.code(st.session_state.report, language="text")
 else:
     st.info("尚未分析。請輸入代號後按「開始分析」。")
+
