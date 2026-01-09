@@ -233,6 +233,13 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
     def is_foreign_block(nk: str) -> bool:
         return ("外陸資" in nk) or ("外資及陸資" in nk) or ("外資" in nk)
 
+    # ✅ 修正點：允許「不含外資自營商」的外資欄，僅排除真正外資自營商欄
+    def is_foreign_usable(nk: str) -> bool:
+        # 例如「外資及陸資(不含外資自營商)買賣超股數」要允許
+        if "外資自營商" in nk and "不含外資自營商" not in nk:
+            return False
+        return is_foreign_block(nk)
+
     # 往前找 10 天（避開週末/休市）
     for back in range(0, 10):
         d = trade_date - timedelta(days=back)
@@ -261,12 +268,10 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 last_error = f"{mkt_name} 當日資料找不到 {stock_no}"
                 continue
 
-            # 外資（買賣超股數）
+            # 外資（買賣超股數）— ✅ 允許「不含外資自營商」
             foreign_col = find_first(
                 colmap,
-                lambda nk: is_foreign_block(nk)
-                and ("買賣超" in nk)
-                and ("外資自營商" not in nk),
+                lambda nk: is_foreign_usable(nk) and ("買賣超" in nk),
             )
 
             # 投信
@@ -278,13 +283,18 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 colmap,
                 lambda nk: ("自營商" in nk)
                 and ("買賣超" in nk)
-                and ("外資自營商" not in nk)
                 and ("外資" not in nk)
                 and ("自行買賣" not in nk)
                 and ("避險" not in nk),
             )
-            dealer_self_col = find_first(colmap, lambda nk: ("自營商" in nk) and ("自行買賣" in nk) and ("買賣超" in nk) and ("外資" not in nk))
-            dealer_hedge_col = find_first(colmap, lambda nk: ("自營商" in nk) and ("避險" in nk) and ("買賣超" in nk) and ("外資" not in nk))
+            dealer_self_col = find_first(
+                colmap,
+                lambda nk: ("自營商" in nk) and ("自行買賣" in nk) and ("買賣超" in nk) and ("外資" not in nk)
+            )
+            dealer_hedge_col = find_first(
+                colmap,
+                lambda nk: ("自營商" in nk) and ("避險" in nk) and ("買賣超" in nk) and ("外資" not in nk)
+            )
 
             foreign = _safe_int(row.iloc[0][foreign_col]) if foreign_col else None
             trust = _safe_int(row.iloc[0][trust_col]) if trust_col else None
@@ -297,19 +307,19 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 b = _safe_int(row.iloc[0][dealer_hedge_col]) if dealer_hedge_col else 0
                 dealer = (a or 0) + (b or 0)
 
-            # 外資 fallback：用(買進-賣出)
+            # 外資 fallback：買進-賣出（✅ 不會誤抓到「買賣超」欄）
             if foreign is None:
                 buy_col = find_first(
                     colmap,
-                    lambda nk: is_foreign_block(nk)
+                    lambda nk: is_foreign_usable(nk)
                     and (("買進" in nk) or ("買入" in nk))
-                    and ("外資自營商" not in nk),
+                    and ("買賣超" not in nk),
                 )
                 sell_col = find_first(
                     colmap,
-                    lambda nk: is_foreign_block(nk)
-                    and (("賣出" in nk) or ("賣" in nk))
-                    and ("外資自營商" not in nk),
+                    lambda nk: is_foreign_usable(nk)
+                    and ("賣出" in nk)
+                    and ("買賣超" not in nk),
                 )
                 buy_v = _safe_int(row.iloc[0][buy_col]) if buy_col else None
                 sell_v = _safe_int(row.iloc[0][sell_col]) if sell_col else None
