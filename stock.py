@@ -1,10 +1,3 @@
-# stock.py
-# 1) 三大法人單位：官方回來是「股」→ 顯示改成「張」（股/1000）
-# 2) 外資抓不到時：改用「外資買進 - 外資賣出」計算淨買賣（fallback）
-# 3) 自營商避免誤抓「外資自營商」
-# 4) 當日VOL=0/NaN → 改用昨日VOL（量增量縮用昨日 vs 前日）
-# 5) 額外：當日K棒型態
-
 import io
 import re
 from datetime import datetime, timedelta
@@ -14,7 +7,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-# optional (if you have truststore in requirements)
+# Optional: helps some SSL envs
 try:
     import truststore
     truststore.inject_into_ssl()
@@ -23,7 +16,7 @@ except Exception:
 
 
 # ---------------------------
-# Basic helpers
+# Helpers
 # ---------------------------
 def clean_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -68,7 +61,6 @@ def get_k_status(open_p, close_p, high_p=None, low_p=None):
             h = float(high_p)
             l = float(low_p)
             rng = h - l
-            # 若實體極小，視為十字
             if rng > 0 and abs(c - o) / rng <= 0.10:
                 return "➖ 十字"
         return "🔴 紅棒" if c > o else ("🟢 綠棒" if c < o else "➖ 十字")
@@ -120,10 +112,6 @@ def describe_candle(open_p, high_p, low_p, close_p):
 # ---------------------------
 # Institutional: TWSE / TPEx CSV parsing
 # ---------------------------
-def _clean_header_list(cols):
-    """移除 CSV 標頭中的換行符號與空白，方便比對"""
-    return [str(c).replace("\n", "").replace("\r", "").strip() for c in cols]
-
 def _parse_twse_t86_csv(text):
     text = text.replace("\r", "").replace("=", "")
     lines = [ln for ln in text.split("\n") if ln.strip()]
@@ -143,9 +131,7 @@ def _parse_twse_t86_csv(text):
 
     csv_text = "\n".join(lines[start:end])
     try:
-        df = pd.read_csv(io.StringIO(csv_text))
-        df.columns = _clean_header_list(df.columns) # 清理標頭
-        return df
+        return pd.read_csv(io.StringIO(csv_text))
     except Exception:
         return None
 
@@ -169,9 +155,7 @@ def _parse_tpex_csv(text):
 
     csv_text = "\n".join(lines[start:end])
     try:
-        df = pd.read_csv(io.StringIO(csv_text))
-        df.columns = _clean_header_list(df.columns) # 清理標頭
-        return df
+        return pd.read_csv(io.StringIO(csv_text))
     except Exception:
         return None
 
@@ -180,6 +164,7 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
     """
     回傳 foreign/trust/dealer 皆為「股」（shares）
     顯示時再 /1000 轉「張」
+    外資抓不到買賣超 → 用(買進-賣出)算
     """
     stock_no = stock_id.strip().upper().replace(".TW", "").replace(".TWO", "")
 
@@ -225,6 +210,29 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
     if not prefer_twse:
         markets = [("TPEx", try_tpex), ("TWSE", try_twse)]
 
+    # 欄名正規化：消空白/BOM/全形括號
+    def norm(s: str) -> str:
+        s = str(s)
+        s = s.replace("\ufeff", "")
+        s = s.replace("（", "(").replace("）", ")")
+        s = re.sub(r"\s+", "", s)
+        return s
+
+    def build_colmap(cols):
+        mp = {}
+        for c in cols:
+            mp[norm(c)] = c
+        return mp
+
+    def find_first(colmap, predicate):
+        for nk, orig in colmap.items():
+            if predicate(nk):
+                return orig
+        return None
+
+    def is_foreign_block(nk: str) -> bool:
+        return ("外陸資" in nk) or ("外資及陸資" in nk) or ("外資" in nk)
+
     # 往前找 10 天（避開週末/休市）
     for back in range(0, 10):
         d = trade_date - timedelta(days=back)
@@ -236,95 +244,77 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 continue
 
             cols = list(df.columns)
-            
-            # 尋找代號欄
-            code_col = next((c for c in cols if c in ("證券代號", "代號")), None)
+            colmap = build_colmap(cols)
+
+            # 代號欄
+            code_col = None
+            for c in cols:
+                if norm(c) in ("證券代號", "代號"):
+                    code_col = c
+                    break
             if code_col is None:
                 last_error = f"{mkt_name} 欄位找不到代號欄"
                 continue
 
-            # 轉字串並去空白比對
             row = df[df[code_col].astype(str).str.strip() == stock_no]
             if row.empty:
                 last_error = f"{mkt_name} 當日資料找不到 {stock_no}"
                 continue
-            
-            # ==========================================
-            # 核心邏輯修正：精準抓取欄位
-            # ==========================================
-            def get_val(col_name):
-                if col_name and col_name in row.columns:
-                    return _safe_int(row.iloc[0][col_name])
-                return None
 
-            def find_col(keywords, must_not_have=None):
-                """在 cols 中尋找符合所有關鍵字的欄位"""
-                for c in cols:
-                    if all(k in c for k in keywords):
-                        if must_not_have and any(bad in c for bad in must_not_have):
-                            continue
-                        return c
-                return None
+            # 外資（買賣超股數）
+            foreign_col = find_first(
+                colmap,
+                lambda nk: is_foreign_block(nk)
+                and ("買賣超" in nk)
+                and ("外資自營商" not in nk),
+            )
 
-            # --- 1. 外資 Foreign ---
-            # 優先級 1: 完整名稱 (TWSE: "外陸資買賣超股數(不含外資自營商)", TPEx: "外資及陸資買賣超股數(不含外資自營商)")
-            # 我們搜尋 "買賣超" 且包含 "(不含外資自營商)"，這是最準確的
-            foreign_col = find_col(["買賣超", "(不含外資自營商)"], must_not_have=["買進", "賣出"])
-            
-            # 優先級 2: 若找不到，找 "外陸資" 或 "外資" + "買賣超"，但必須 *不* 以 "外資自營商" 開頭
-            if not foreign_col:
-                # 這裡的邏輯是：欄位名稱可以是 "外陸資買賣超..." 但不能是 "外資自營商買賣超..."
-                # 注意：find_col 的 must_not_have 如果放 "外資自營商"，會把正確的 "(不含外資自營商)" 給殺掉
-                # 所以我們手動遍歷
-                for c in cols:
-                    if ("外陸資" in c or "外資" in c) and "買賣超" in c:
-                        if c.startswith("外資自營商"): # 關鍵修正：只排除以「外資自營商」開頭的
-                            continue
-                        foreign_col = c
-                        break
-            
-            foreign = get_val(foreign_col)
+            # 投信
+            trust_col = find_first(colmap, lambda nk: ("投信" in nk) and ("買賣超" in nk)) \
+                        or find_first(colmap, lambda nk: "投信" in nk)
 
-            # --- 2. 投信 Trust ---
-            trust_col = find_col(["投信", "買賣超"])
-            trust = get_val(trust_col)
+            # 自營商（總）
+            dealer_total_col = find_first(
+                colmap,
+                lambda nk: ("自營商" in nk)
+                and ("買賣超" in nk)
+                and ("外資自營商" not in nk)
+                and ("外資" not in nk)
+                and ("自行買賣" not in nk)
+                and ("避險" not in nk),
+            )
+            dealer_self_col = find_first(colmap, lambda nk: ("自營商" in nk) and ("自行買賣" in nk) and ("買賣超" in nk) and ("外資" not in nk))
+            dealer_hedge_col = find_first(colmap, lambda nk: ("自營商" in nk) and ("避險" in nk) and ("買賣超" in nk) and ("外資" not in nk))
 
-            # --- 3. 自營商 Dealer ---
-            # 邏輯：總合欄位優先 -> 否則自行買賣+避險
-            # 排除外資相關、排除權證相關(如果有)
-            dealer_total_col = find_col(["自營商", "買賣超"], must_not_have=["外資", "自行", "避險"])
-            
+            foreign = _safe_int(row.iloc[0][foreign_col]) if foreign_col else None
+            trust = _safe_int(row.iloc[0][trust_col]) if trust_col else None
+
             dealer = None
             if dealer_total_col:
-                dealer = get_val(dealer_total_col)
-            else:
-                dealer_self = get_val(find_col(["自營商", "自行", "買賣超"])) or 0
-                dealer_hedge = get_val(find_col(["自營商", "避險", "買賣超"])) or 0
-                dealer = dealer_self + dealer_hedge
+                dealer = _safe_int(row.iloc[0][dealer_total_col])
+            elif dealer_self_col or dealer_hedge_col:
+                a = _safe_int(row.iloc[0][dealer_self_col]) if dealer_self_col else 0
+                b = _safe_int(row.iloc[0][dealer_hedge_col]) if dealer_hedge_col else 0
+                dealer = (a or 0) + (b or 0)
 
-            # --- 4. 外資 Fallback (買進 - 賣出) ---
+            # 外資 fallback：用(買進-賣出)
             if foreign is None:
-                # 找買進欄位 (包含 "不含外資自營商" 或 不以 "外資自營商" 開頭)
-                buy_col = find_col(["買進", "(不含外資自營商)"])
-                if not buy_col:
-                    for c in cols:
-                        if ("外陸資" in c or "外資" in c) and "買進" in c and not c.startswith("外資自營商"):
-                            buy_col = c
-                            break
-                
-                # 找賣出欄位
-                sell_col = find_col(["賣出", "(不含外資自營商)"])
-                if not sell_col:
-                    for c in cols:
-                        if ("外陸資" in c or "外資" in c) and "賣出" in c and not c.startswith("外資自營商"):
-                            sell_col = c
-                            break
-                            
-                b_val = get_val(buy_col)
-                s_val = get_val(sell_col)
-                
-                if b_val is not None and s_val is not None:
-                    foreign = b_val - s_val
+                buy_col = find_first(
+                    colmap,
+                    lambda nk: is_foreign_block(nk)
+                    and (("買進" in nk) or ("買入" in nk))
+                    and ("外資自營商" not in nk),
+                )
+                sell_col = find_first(
+                    colmap,
+                    lambda nk: is_foreign_block(nk)
+                    and (("賣出" in nk) or ("賣" in nk))
+                    and ("外資自營商" not in nk),
+                )
+                buy_v = _safe_int(row.iloc[0][buy_col]) if buy_col else None
+                sell_v = _safe_int(row.iloc[0][sell_col]) if sell_col else None
+                if buy_v is not None and sell_v is not None:
+                    foreign = buy_v - sell_v
 
             yf_suffix = ".TW" if mkt_name == "TWSE" else ".TWO"
             return {
@@ -342,6 +332,14 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
 # ---------------------------
 # Indicators
 # ---------------------------
+def calculate_rsi(series, period):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
 def calculate_adx(df, period=14):
     df = df.copy()
     df["H-L"] = df["High"] - df["Low"]
@@ -401,12 +399,241 @@ def calculate_avwap(df, anchor_date):
     return cum_pv / cum_v
 
 
-def calculate_rsi(series, period):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+# ---------------------------
+# Pattern detection (no chart)
+# ---------------------------
+def _find_pivots(df: pd.DataFrame, left: int = 3, right: int = 3):
+    if df is None or df.empty or len(df) < (left + right + 5):
+        return [], []
+
+    highs = df["High"].to_numpy(dtype=float)
+    lows = df["Low"].to_numpy(dtype=float)
+    idx = df.index
+
+    hp, lp = [], []
+    n = len(df)
+
+    for i in range(left, n - right):
+        h_win = highs[i - left : i + right + 1]
+        l_win = lows[i - left : i + right + 1]
+
+        if np.isfinite(highs[i]) and highs[i] == np.nanmax(h_win):
+            if not hp or hp[-1][0] != i - 1:
+                hp.append((i, idx[i], highs[i]))
+
+        if np.isfinite(lows[i]) and lows[i] == np.nanmin(l_win):
+            if not lp or lp[-1][0] != i - 1:
+                lp.append((i, idx[i], lows[i]))
+
+    return hp, lp
+
+
+def _between(df, a_pos: int, b_pos: int) -> pd.DataFrame:
+    lo = min(a_pos, b_pos)
+    hi = max(a_pos, b_pos)
+    return df.iloc[lo:hi+1]
+
+
+def _pct_diff(a: float, b: float) -> float:
+    if a == 0 or not np.isfinite(a) or not np.isfinite(b):
+        return np.inf
+    return abs(a - b) / abs(a)
+
+
+def detect_double_top(df: pd.DataFrame,
+                      lookback: int = 120,
+                      pivot_lr: int = 3,
+                      peak_tol: float = 0.018,
+                      min_gap: int = 8,
+                      max_gap: int = 60,
+                      confirm_margin: float = 0.003):
+    if df is None or df.empty:
+        return None
+
+    sub = df.tail(lookback).copy()
+    hp, _ = _find_pivots(sub, left=pivot_lr, right=pivot_lr)
+    if len(hp) < 2:
+        return None
+
+    p2 = hp[-1]
+    p1 = None
+    for cand in reversed(hp[:-1]):
+        gap = p2[0] - cand[0]
+        if min_gap <= gap <= max_gap:
+            p1 = cand
+            break
+    if p1 is None:
+        return None
+
+    peak1 = float(p1[2])
+    peak2 = float(p2[2])
+    if _pct_diff(peak1, peak2) > peak_tol:
+        return None
+
+    mid = _between(sub, p1[0], p2[0])
+    neckline = float(mid["Low"].min())
+
+    close_now = float(sub["Close"].iloc[-1])
+    status = "形成中"
+    confirmed = False
+    if close_now < neckline * (1 - confirm_margin):
+        status = "已確認（跌破頸線）"
+        confirmed = True
+
+    height = max(peak1, peak2) - neckline
+    target = neckline - height
+
+    return {
+        "pattern": "M頭（Double Top）",
+        "status": status,
+        "confirmed": confirmed,
+        "peak1_date": str(p1[1].date()),
+        "peak2_date": str(p2[1].date()),
+        "peak1": peak1,
+        "peak2": peak2,
+        "neckline": neckline,
+        "target": target
+    }
+
+
+def detect_double_bottom(df: pd.DataFrame,
+                         lookback: int = 160,
+                         pivot_lr: int = 3,
+                         trough_tol: float = 0.020,
+                         min_gap: int = 8,
+                         max_gap: int = 80,
+                         confirm_margin: float = 0.003):
+    if df is None or df.empty:
+        return None
+
+    sub = df.tail(lookback).copy()
+    _, lp = _find_pivots(sub, left=pivot_lr, right=pivot_lr)
+    if len(lp) < 2:
+        return None
+
+    t2 = lp[-1]
+    t1 = None
+    for cand in reversed(lp[:-1]):
+        gap = t2[0] - cand[0]
+        if min_gap <= gap <= max_gap:
+            t1 = cand
+            break
+    if t1 is None:
+        return None
+
+    trough1 = float(t1[2])
+    trough2 = float(t2[2])
+    if _pct_diff(trough1, trough2) > trough_tol:
+        return None
+
+    mid = _between(sub, t1[0], t2[0])
+    neckline = float(mid["High"].max())
+
+    close_now = float(sub["Close"].iloc[-1])
+    status = "形成中"
+    confirmed = False
+    if close_now > neckline * (1 + confirm_margin):
+        status = "已確認（突破頸線）"
+        confirmed = True
+
+    height = neckline - min(trough1, trough2)
+    target = neckline + height
+
+    return {
+        "pattern": "W底（Double Bottom）",
+        "status": status,
+        "confirmed": confirmed,
+        "trough1_date": str(t1[1].date()),
+        "trough2_date": str(t2[1].date()),
+        "trough1": trough1,
+        "trough2": trough2,
+        "neckline": neckline,
+        "target": target
+    }
+
+
+def detect_sym_triangle(df: pd.DataFrame,
+                        lookback: int = 180,
+                        pivot_lr: int = 3,
+                        need_points: int = 3,
+                        tighten_ratio: float = 0.65,
+                        breakout_margin: float = 0.003):
+    if df is None or df.empty:
+        return None
+
+    sub = df.tail(lookback).copy()
+    hp, lp = _find_pivots(sub, left=pivot_lr, right=pivot_lr)
+    if len(hp) < need_points or len(lp) < need_points:
+        return None
+
+    highs = hp[-need_points:]
+    lows = lp[-need_points:]
+
+    highs_prices = [x[2] for x in highs]
+    lows_prices = [x[2] for x in lows]
+
+    if not (highs_prices[0] > highs_prices[1] > highs_prices[2]):
+        return None
+    if not (lows_prices[0] < lows_prices[1] < lows_prices[2]):
+        return None
+
+    xh = np.array([p[0] for p in highs], dtype=float)
+    yh = np.array([p[2] for p in highs], dtype=float)
+    xl = np.array([p[0] for p in lows], dtype=float)
+    yl = np.array([p[2] for p in lows], dtype=float)
+
+    ah, bh = np.polyfit(xh, yh, 1)
+    al, bl = np.polyfit(xl, yl, 1)
+
+    if not (ah < 0 and al > 0):
+        return None
+
+    early = sub.iloc[: max(30, len(sub)//3)]
+    late = sub.iloc[-max(30, len(sub)//3):]
+    early_range = float(early["High"].max() - early["Low"].min())
+    late_range = float(late["High"].max() - late["Low"].min())
+
+    if early_range <= 0 or late_range / early_range > tighten_ratio:
+        return None
+
+    last_pos = len(sub) - 1
+    upper_now = ah * last_pos + bh
+    lower_now = al * last_pos + bl
+    close_now = float(sub["Close"].iloc[-1])
+
+    status = "形成中"
+    direction = "未突破"
+    if close_now > upper_now * (1 + breakout_margin):
+        status = "已確認（向上突破）"
+        direction = "向上"
+    elif close_now < lower_now * (1 - breakout_margin):
+        status = "已確認（向下跌破）"
+        direction = "向下"
+
+    return {
+        "pattern": "收斂三角（Sym Triangle）",
+        "status": status,
+        "direction": direction,
+        "upper_now": float(upper_now),
+        "lower_now": float(lower_now),
+        "high_pivots": [(str(p[1].date()), float(p[2])) for p in highs],
+        "low_pivots": [(str(p[1].date()), float(p[2])) for p in lows],
+        "range_shrink": float(late_range / early_range)
+    }
+
+
+def detect_patterns(df: pd.DataFrame):
+    res = []
+    m = detect_double_top(df)
+    if m:
+        res.append(m)
+    w = detect_double_bottom(df)
+    if w:
+        res.append(w)
+    t = detect_sym_triangle(df)
+    if t:
+        res.append(t)
+    return res
 
 
 # ---------------------------
@@ -421,7 +648,6 @@ def analyze_stock_technical(stock_id: str) -> str:
     out = []
     out.append(f"🔄 正在分析 {stock_id} ... (連線 Yahoo Finance)")
 
-    # Daily
     df_daily = yf.download(yf_ticker, period="1y", interval="1d", progress=False, auto_adjust=False)
     df_daily = clean_yf_columns(df_daily)
 
@@ -435,7 +661,6 @@ def analyze_stock_technical(stock_id: str) -> str:
     if df_daily.empty:
         return "\n".join(out + [f"❌ 找不到股票代號 {stock_id} (Yahoo Finance 無數據)"])
 
-    # Weekly/Monthly
     df_weekly = yf.download(yf_ticker, period="1y", interval="1wk", progress=False, auto_adjust=False)
     df_weekly = clean_yf_columns(df_weekly)
     df_monthly = yf.download(yf_ticker, period="2y", interval="1mo", progress=False, auto_adjust=False)
@@ -445,7 +670,6 @@ def analyze_stock_technical(stock_id: str) -> str:
     prev_daily = df_daily.iloc[-2] if len(df_daily) >= 2 else latest_daily
     latest_trade_date = df_daily.index[-1].date()
 
-    # Institutional (shares)
     chips = get_institutional_data(stock_id, trade_date=latest_trade_date, market_hint=yf_ticker)
 
     out.append("")
@@ -471,15 +695,12 @@ def analyze_stock_technical(stock_id: str) -> str:
     out.append("-" * 50)
 
     # Candle pattern
-    try:
-        out.append(f"🕯 當日K棒型態: {describe_candle(latest_daily['Open'], latest_daily['High'], latest_daily['Low'], latest_daily['Close'])}")
-        out.append("-" * 50)
-    except Exception:
-        pass
+    out.append(f"🕯 當日K棒型態: {describe_candle(latest_daily['Open'], latest_daily['High'], latest_daily['Low'], latest_daily['Close'])}")
+    out.append("-" * 50)
 
-    # Chips formatting: shares -> lots
+    # Chips (shares -> lots)
     out.append("💰 籌碼面 (三大法人):")
-    if chips and chips.get("error") is None:
+    if isinstance(chips, dict) and chips.get("error") is None:
         def fmt_to_lots(v_shares):
             v = _safe_int(v_shares)
             if v is None:
@@ -515,7 +736,7 @@ def analyze_stock_technical(stock_id: str) -> str:
     ma60 = df_daily["Close"].rolling(60).mean().iloc[-1]
     out.append(f"• 均線: MA5={float(ma5):.2f}, MA20={float(ma20):.2f}, MA60={float(ma60):.2f}")
 
-    # Volume fallback (lots)
+    # Volume fallback
     vol_today = float(latest_daily["Volume"]) if "Volume" in latest_daily else float("nan")
     vol_yesterday = float(prev_daily["Volume"]) if "Volume" in prev_daily else float("nan")
 
@@ -566,66 +787,40 @@ def analyze_stock_technical(stock_id: str) -> str:
 
     current_year = datetime.now().year
     avwap = calculate_avwap(df_daily, f"{current_year}-01-01")
-    if avwap is not None and not avwap.empty and not np.isnan(float(avwap.iloc[-1])):
+    if avwap is not None and not avwap.empty and np.isfinite(float(avwap.iloc[-1])):
         dist = (float(latest_daily["Close"]) - float(avwap.iloc[-1])) / float(avwap.iloc[-1]) * 100
         out.append(f"• AVWAP (YTD): {float(avwap.iloc[-1]):.2f} (乖離: {dist:+.2f}%)")
     else:
         out.append("• AVWAP (YTD): 資料不足")
+    out.append("-" * 50)
+
+    # Pattern detection (no chart)
+    try:
+        patterns = detect_patterns(df_daily)
+        out.append("🧠 型態辨識（M頭 / W底 / 收斂三角）:")
+        if not patterns:
+            out.append("• 未偵測到明確型態（或資料不足/型態不符合條件）")
+        else:
+            for p in patterns:
+                if p["pattern"].startswith("M頭"):
+                    out.append(
+                        f"• {p['pattern']}：{p['status']} | 頸線 {p['neckline']:.2f} | 目標 {p['target']:.2f} "
+                        f"(頭1 {p['peak1_date']} {p['peak1']:.2f}, 頭2 {p['peak2_date']} {p['peak2']:.2f})"
+                    )
+                elif p["pattern"].startswith("W底"):
+                    out.append(
+                        f"• {p['pattern']}：{p['status']} | 頸線 {p['neckline']:.2f} | 目標 {p['target']:.2f} "
+                        f"(底1 {p['trough1_date']} {p['trough1']:.2f}, 底2 {p['trough2_date']} {p['trough2']:.2f})"
+                    )
+                else:
+                    out.append(
+                        f"• {p['pattern']}：{p['status']} | 上緣 {p['upper_now']:.2f} / 下緣 {p['lower_now']:.2f} "
+                        f"| 收斂比 {p['range_shrink']:.2f} | 方向 {p['direction']}"
+                    )
+        out.append("-" * 50)
+    except Exception:
+        out.append("🧠 型態辨識：計算失敗（資料不足或格式異常）")
+        out.append("-" * 50)
 
     out.append("=" * 50)
     return "\n".join(out)
-
-import pandas as pd
-import numpy as np
-import yfinance as yf
-
-def get_chart_data(stock_id: str, period: str = "6mo"):
-    """
-    回傳 (yf_ticker, df)
-    df 欄位包含: Open High Low Close Volume MA5 MA20 MA60 BB_MID BB_UP BB_DN RSI14 K D
-    """
-    stock_id = stock_id.strip().upper()
-    if not stock_id:
-        return None, None
-
-    yf_ticker = _resolve_yf_ticker(stock_id)
-    df = yf.download(yf_ticker, period=period, interval="1d", progress=False, auto_adjust=False)
-    df = clean_yf_columns(df)
-
-    # .TW 沒資料就試 .TWO
-    if (df is None or df.empty) and yf_ticker.endswith(".TW"):
-        yf_ticker = yf_ticker.replace(".TW", ".TWO")
-        df = yf.download(yf_ticker, period=period, interval="1d", progress=False, auto_adjust=False)
-        df = clean_yf_columns(df)
-
-    if df is None or df.empty:
-        return yf_ticker, None
-
-    df = df.copy()
-    # --- MA ---
-    df["MA5"] = df["Close"].rolling(5).mean()
-    df["MA20"] = df["Close"].rolling(20).mean()
-    df["MA60"] = df["Close"].rolling(60).mean()
-
-    # --- Bollinger (20,2) ---
-    mid = df["Close"].rolling(20).mean()
-    std = df["Close"].rolling(20).std()
-    df["BB_MID"] = mid
-    df["BB_UP"] = mid + 2 * std
-    df["BB_DN"] = mid - 2 * std
-
-    # --- RSI(14) ---
-    delta = df["Close"].diff()
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    df["RSI14"] = 100 - (100 / (1 + rs))
-
-    # --- KD(9,3,3) ---
-    low_min = df["Low"].rolling(9).min()
-    high_max = df["High"].rolling(9).max()
-    rsv = (df["Close"] - low_min) / (high_max - low_min).replace(0, np.nan) * 100
-    df["K"] = rsv.ewm(com=2).mean()
-    df["D"] = df["K"].ewm(com=2).mean()
-
-    return yf_ticker, df
