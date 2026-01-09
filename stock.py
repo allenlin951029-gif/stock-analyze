@@ -574,3 +574,58 @@ def analyze_stock_technical(stock_id: str) -> str:
 
     out.append("=" * 50)
     return "\n".join(out)
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+
+def get_chart_data(stock_id: str, period: str = "6mo"):
+    """
+    回傳 (yf_ticker, df)
+    df 欄位包含: Open High Low Close Volume MA5 MA20 MA60 BB_MID BB_UP BB_DN RSI14 K D
+    """
+    stock_id = stock_id.strip().upper()
+    if not stock_id:
+        return None, None
+
+    yf_ticker = _resolve_yf_ticker(stock_id)
+    df = yf.download(yf_ticker, period=period, interval="1d", progress=False, auto_adjust=False)
+    df = clean_yf_columns(df)
+
+    # .TW 沒資料就試 .TWO
+    if (df is None or df.empty) and yf_ticker.endswith(".TW"):
+        yf_ticker = yf_ticker.replace(".TW", ".TWO")
+        df = yf.download(yf_ticker, period=period, interval="1d", progress=False, auto_adjust=False)
+        df = clean_yf_columns(df)
+
+    if df is None or df.empty:
+        return yf_ticker, None
+
+    df = df.copy()
+    # --- MA ---
+    df["MA5"] = df["Close"].rolling(5).mean()
+    df["MA20"] = df["Close"].rolling(20).mean()
+    df["MA60"] = df["Close"].rolling(60).mean()
+
+    # --- Bollinger (20,2) ---
+    mid = df["Close"].rolling(20).mean()
+    std = df["Close"].rolling(20).std()
+    df["BB_MID"] = mid
+    df["BB_UP"] = mid + 2 * std
+    df["BB_DN"] = mid - 2 * std
+
+    # --- RSI(14) ---
+    delta = df["Close"].diff()
+    gain = delta.where(delta > 0, 0).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df["RSI14"] = 100 - (100 / (1 + rs))
+
+    # --- KD(9,3,3) ---
+    low_min = df["Low"].rolling(9).min()
+    high_max = df["High"].rolling(9).max()
+    rsv = (df["Close"] - low_min) / (high_max - low_min).replace(0, np.nan) * 100
+    df["K"] = rsv.ewm(com=2).mean()
+    df["D"] = df["K"].ewm(com=2).mean()
+
+    return yf_ticker, df
