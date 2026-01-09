@@ -140,7 +140,7 @@ with st.sidebar:
     st.caption(f"debug: {st.session_state._last_debug}")
 
     st.divider()
-    st.subheader("搜尋歷史（前 5 筆，會保存）")
+    st.subheader("搜尋歷史（前 5 筆）")
 
     if st.session_state.history:
         picked = st.selectbox("點選快速回查", st.session_state.history, index=0)
@@ -182,3 +182,4 @@ if st.session_state.report and str(st.session_state.report).strip():
     st.code(st.session_state.report, language="text")
 else:
     st.info("尚未分析。請輸入代號後按「開始分析」。")
+
