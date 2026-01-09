@@ -7,4 +7,5 @@ yfinance
 streamlit-autorefresh
 streamlit-cookies-manager
 numpy
+truststore
 
