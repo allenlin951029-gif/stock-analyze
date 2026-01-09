@@ -1,11 +1,8 @@
-streamlit
-yfinance
 pandas
-numpy
 requests
-truststore
+lxml
+html5lib
+plotly
+yfinance
 streamlit-autorefresh
 streamlit-cookies-manager
-
-
-
