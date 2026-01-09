@@ -1,6 +1,6 @@
 import io
 import re
-from datetime import datetime, timedelta, date as dt_date
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -15,9 +15,9 @@ except Exception:
     pass
 
 
-# ---------------------------
-# Helpers
-# ---------------------------
+# =========================
+# Utils
+# =========================
 def clean_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -36,7 +36,7 @@ def clean_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
 def _safe_int(x):
     try:
         s = str(x).strip().replace(",", "")
-        if s in ("", "--", "—", "NaN", "nan", "None", "N/A", "n/a"):
+        if s in ("", "--", "—", "NaN", "nan", "None"):
             return None
         return int(float(s))
     except Exception:
@@ -47,52 +47,60 @@ def _resolve_yf_ticker(stock_id: str) -> str:
     s = stock_id.strip().upper()
     if s.endswith(".TW") or s.endswith(".TWO"):
         return s
-    return f"{s}.TW"  # default .TW, fallback to .TWO later
+    return f"{s}.TW"
 
 
-def _parse_as_of(as_of_date):
-    if as_of_date is None:
+def _strip_suffix(stock_id: str) -> str:
+    return stock_id.strip().upper().replace(".TW", "").replace(".TWO", "")
+
+
+def _norm_col(s: str) -> str:
+    s = str(s).replace("\ufeff", "")
+    s = s.replace("（", "(").replace("）", ")")
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
+def _ensure_naive_index(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    idx = df.index
+    try:
+        if getattr(idx, "tz", None) is not None:
+            df = df.copy()
+            df.index = df.index.tz_localize(None)
+    except Exception:
+        pass
+    return df
+
+
+def _nearest_trading_ts(df: pd.DataFrame, target_date):
+    """
+    給一個 date/datetime，回傳 df.index 中 <= target_date 的最後一個交易日 timestamp
+    """
+    if df is None or df.empty:
         return None
-    if isinstance(as_of_date, dt_date):
-        return as_of_date
-    if isinstance(as_of_date, str):
-        try:
-            return datetime.strptime(as_of_date.strip(), "%Y-%m-%d").date()
-        except Exception:
-            return None
-    return None
+    if target_date is None:
+        target_date = datetime.now().date()
 
+    target = pd.Timestamp(target_date)
+    idx = df.index
+    try:
+        if getattr(idx, "tz", None) is not None:
+            idx = idx.tz_localize(None)
+    except Exception:
+        pass
 
-def _to_lots(v_shares_or_shareslike):
-    v = _safe_int(v_shares_or_shareslike)
-    if v is None:
+    # 找 <= target_date 的最後一筆：用 searchsorted(隔天) - 1
+    pos = idx.searchsorted(target + pd.Timedelta(days=1)) - 1
+    if pos < 0:
         return None
-    return int(round(v / 1000))
+    return idx[pos]
 
 
-def _fmt_net_lots(lots):
-    if lots is None:
-        return "n/a"
-    if lots > 0:
-        return f"🔴 買超 {lots:,} 張"
-    if lots < 0:
-        return f"🟢 賣超 {abs(lots):,} 張"
-    return "➖ 無變動"
-
-
-def _fmt_delta(today_lots, prev_lots):
-    if today_lots is None or prev_lots is None:
-        return ""
-    d = today_lots - prev_lots
-    if d == 0:
-        return "（較前一交易日 0 張）"
-    sign = "+" if d > 0 else ""
-    return f"（較前一交易日 {sign}{d:,} 張）"
-
-
-# ---------------------------
-# Candle (emoji + pattern)
-# ---------------------------
+# =========================
+# Candle
+# =========================
 def get_k_status(open_p, close_p, high_p=None, low_p=None):
     try:
         o = float(open_p)
@@ -149,10 +157,10 @@ def describe_candle(open_p, high_p, low_p, close_p):
     return base
 
 
-# ---------------------------
-# Institutional: TWSE / TPEx CSV parsing
-# ---------------------------
-def _parse_twse_t86_csv(text):
+# =========================
+# Institutional (三大法人)
+# =========================
+def _parse_twse_t86_csv(text: str):
     text = text.replace("\r", "").replace("=", "")
     lines = [ln for ln in text.split("\n") if ln.strip()]
     start = None
@@ -176,7 +184,7 @@ def _parse_twse_t86_csv(text):
         return None
 
 
-def _parse_tpex_csv(text):
+def _parse_tpex_csv(text: str):
     text = text.replace("\ufeff", "").replace("\r", "")
     lines = [ln for ln in text.split("\n") if ln.strip()]
     start = None
@@ -200,13 +208,12 @@ def _parse_tpex_csv(text):
         return None
 
 
-def get_institutional_data(stock_id, trade_date, market_hint=None):
+def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back: int = 10):
     """
     回傳 foreign/trust/dealer 皆為「股」（shares）
     顯示時再 /1000 轉「張」
-    外資抓不到買賣超 → 用(買進-賣出)算
     """
-    stock_no = stock_id.strip().upper().replace(".TW", "").replace(".TWO", "")
+    stock_no = _strip_suffix(stock_id)
 
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -250,18 +257,12 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
     if not prefer_twse:
         markets = [("TPEx", try_tpex), ("TWSE", try_twse)]
 
-    def norm(s: str) -> str:
-        s = str(s).replace("\ufeff", "")
-        s = s.replace("（", "(").replace("）", ")")
-        s = re.sub(r"\s+", "", s)
-        return s
-
     def build_colmap(cols):
-        return {norm(c): c for c in cols}
+        return {_norm_col(c): c for c in cols}
 
-    def find_first(colmap, predicate):
+    def find_first(colmap, pred):
         for nk, orig in colmap.items():
-            if predicate(nk):
+            if pred(nk):
                 return orig
         return None
 
@@ -273,7 +274,7 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
             return False
         return is_foreign_block(nk)
 
-    for back in range(0, 10):
+    for back in range(0, max_back + 1):
         d = trade_date - timedelta(days=back)
 
         for mkt_name, fn in markets:
@@ -287,7 +288,7 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
 
             code_col = None
             for c in cols:
-                if norm(c) in ("證券代號", "代號"):
+                if _norm_col(c) in ("證券代號", "代號"):
                     code_col = c
                     break
             if code_col is None:
@@ -300,8 +301,10 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 continue
 
             foreign_col = find_first(colmap, lambda nk: is_foreign_usable(nk) and ("買賣超" in nk))
-            trust_col = find_first(colmap, lambda nk: ("投信" in nk) and ("買賣超" in nk)) \
-                        or find_first(colmap, lambda nk: "投信" in nk)
+            trust_col = (
+                find_first(colmap, lambda nk: ("投信" in nk) and ("買賣超" in nk))
+                or find_first(colmap, lambda nk: "投信" in nk)
+            )
 
             dealer_total_col = find_first(
                 colmap,
@@ -311,8 +314,12 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 and ("自行買賣" not in nk)
                 and ("避險" not in nk),
             )
-            dealer_self_col = find_first(colmap, lambda nk: ("自營商" in nk) and ("自行買賣" in nk) and ("買賣超" in nk) and ("外資" not in nk))
-            dealer_hedge_col = find_first(colmap, lambda nk: ("自營商" in nk) and ("避險" in nk) and ("買賣超" in nk) and ("外資" not in nk))
+            dealer_self_col = find_first(
+                colmap, lambda nk: ("自營商" in nk) and ("自行買賣" in nk) and ("買賣超" in nk) and ("外資" not in nk)
+            )
+            dealer_hedge_col = find_first(
+                colmap, lambda nk: ("自營商" in nk) and ("避險" in nk) and ("買賣超" in nk) and ("外資" not in nk)
+            )
 
             foreign = _safe_int(row.iloc[0][foreign_col]) if foreign_col else None
             trust = _safe_int(row.iloc[0][trust_col]) if trust_col else None
@@ -328,15 +335,11 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
             if foreign is None:
                 buy_col = find_first(
                     colmap,
-                    lambda nk: is_foreign_usable(nk)
-                    and (("買進" in nk) or ("買入" in nk))
-                    and ("買賣超" not in nk),
+                    lambda nk: is_foreign_usable(nk) and (("買進" in nk) or ("買入" in nk)) and ("買賣超" not in nk),
                 )
                 sell_col = find_first(
                     colmap,
-                    lambda nk: is_foreign_usable(nk)
-                    and ("賣出" in nk)
-                    and ("買賣超" not in nk),
+                    lambda nk: is_foreign_usable(nk) and ("賣出" in nk) and ("買賣超" not in nk),
                 )
                 buy_v = _safe_int(row.iloc[0][buy_col]) if buy_col else None
                 sell_v = _safe_int(row.iloc[0][sell_col]) if sell_col else None
@@ -356,18 +359,67 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
     return {"error": last_error or "未知錯誤", "id": f"{stock_no}.TW"}
 
 
-# ---------------------------
-# Margin trading (融資融券)
-# ---------------------------
-def _parse_twse_margn_csv(text: str):
-    """
-    TWSE MI_MARGN CSV：有時候會有 =、\r、說明列；用「證券代號」當表頭起點
-    """
-    text = text.replace("\r", "").replace("=", "")
+# =========================
+# Margin Trading (融資融券)
+# =========================
+def _parse_twse_json_table(obj):
+    if not isinstance(obj, dict):
+        return None
+    fields = obj.get("fields")
+    data = obj.get("data")
+    if not fields or not data:
+        return None
+    try:
+        return pd.DataFrame(data, columns=fields)
+    except Exception:
+        return None
+
+
+def _twse_margin_json(date_yyyymmdd: str, headers: dict):
+    urls = [
+        f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
+        f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
+        f"https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN?date={date_yyyymmdd}&selectType=ALL",
+    ]
+    last_err = None
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code != 200 or not r.text:
+                last_err = f"TWSE HTTP {r.status_code}"
+                continue
+            try:
+                j = r.json()
+            except Exception:
+                last_err = "TWSE JSON 解析失敗"
+                continue
+
+            if isinstance(j, list):
+                df = pd.DataFrame(j)
+                if df is not None and not df.empty:
+                    return df, None
+                last_err = "TWSE list 回傳空資料"
+                continue
+
+            df = _parse_twse_json_table(j)
+            if df is not None and not df.empty:
+                return df, None
+
+            last_err = "TWSE 回傳格式不支援/空資料"
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return None, last_err or "TWSE 取資料失敗"
+
+
+def _parse_tpex_margin_csv(text: str):
+    if not text:
+        return None
+    text = text.replace("\ufeff", "").replace("\r", "")
     lines = [ln for ln in text.split("\n") if ln.strip()]
     start = None
     for i, ln in enumerate(lines):
-        if ("證券代號" in ln) and ("證券名稱" in ln):
+        if ("代號" in ln) and ("名稱" in ln) and ("資" in ln or "融資" in ln):
             start = i
             break
     if start is None:
@@ -375,7 +427,7 @@ def _parse_twse_margn_csv(text: str):
 
     end = len(lines)
     for j in range(start + 1, len(lines)):
-        if lines[j].startswith("說明") or lines[j].startswith("備註"):
+        if lines[j].startswith("*****") or lines[j].startswith("說明") or lines[j].startswith("備註"):
             end = j
             break
 
@@ -386,12 +438,12 @@ def _parse_twse_margn_csv(text: str):
         return None
 
 
-def get_margin_data(stock_id, trade_date, market_hint=None):
+def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, max_back: int = 10):
     """
-    回傳:
-      finance_balance / short_balance：股(share) -> 顯示時 /1000 張
+    回傳單位：張
+      margin_balance, margin_change, short_balance, short_change
     """
-    stock_no = stock_id.strip().upper().replace(".TW", "").replace(".TWO", "")
+    stock_no = _strip_suffix(stock_id)
 
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -404,98 +456,138 @@ def get_margin_data(stock_id, trade_date, market_hint=None):
 
     last_error = None
 
-    def norm(s: str) -> str:
-        s = str(s).replace("\ufeff", "")
-        s = s.replace("（", "(").replace("）", ")")
-        s = re.sub(r"\s+", "", s)
-        return s
-
-    def find_col(df, want_keys):
-        mp = {norm(c): c for c in df.columns}
-        for k in want_keys:
-            for nk, orig in mp.items():
-                if k in nk:
-                    return orig
+    def find_col(colmap, contains):
+        for nk, orig in colmap.items():
+            ok = True
+            for kw in contains:
+                if kw not in nk:
+                    ok = False
+                    break
+            if ok:
+                return orig
         return None
 
-    def try_twse(d_):
-        # MI_MARGN：融資融券餘額
-        url = f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=csv&date={d_.strftime('%Y%m%d')}&selectType=ALL"
-        r = requests.get(url, headers=headers, timeout=15)
-        if r.status_code != 200 or len(r.text) < 200:
-            return None, f"TWSE HTTP {r.status_code}"
-        if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
-            return None, "TWSE 無資料(可能休市)"
-        df = _parse_twse_margn_csv(r.text)
-        return df, None if df is not None else "TWSE 解析失敗"
-
-    def try_tpex(d_):
-        roc_year = d_.year - 1911
-        roc_date = f"{roc_year:03d}/{d_.month:02d}/{d_.day:02d}"
-        url = (
-            "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
-            f"?l=zh-tw&o=csv&t=D&d={roc_date}&s=0,asc"
-        )
-        headers2 = dict(headers)
-        headers2["Referer"] = "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal.php"
-        r = requests.get(url, headers=headers2, timeout=15)
-        if r.status_code != 200 or len(r.text) < 200:
-            return None, f"TPEx HTTP {r.status_code}"
-        if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
-            return None, "TPEx 無資料(可能休市)"
-        df = _parse_tpex_csv(r.text)
-        return df, None if df is not None else "TPEx 解析失敗"
-
-    markets = [("TWSE", try_twse), ("TPEx", try_tpex)]
-    if not prefer_twse:
-        markets = [("TPEx", try_tpex), ("TWSE", try_twse)]
-
-    for back in range(0, 10):
+    for back in range(0, max_back + 1):
         d = trade_date - timedelta(days=back)
-        for mkt_name, fn in markets:
-            df, err = fn(d)
-            if df is None:
+
+        # ---- TWSE ----
+        if prefer_twse:
+            ymd = d.strftime("%Y%m%d")
+            df, err = _twse_margin_json(ymd, headers=headers)
+            if df is None or df.empty:
                 last_error = err
                 continue
 
-            # 代號欄
-            code_col = None
-            for c in df.columns:
-                if norm(c) in ("證券代號", "代號"):
-                    code_col = c
-                    break
-            if code_col is None:
-                last_error = f"{mkt_name} 欄位找不到代號欄"
+            colmap = {_norm_col(c): c for c in df.columns}
+            code_col = (
+                colmap.get("股票代號")
+                or colmap.get("證券代號")
+                or colmap.get("證券代碼")
+                or colmap.get("SecuritiesCode")
+                or colmap.get("SecurityCode")
+                or colmap.get("Code")
+            )
+            if not code_col:
+                last_error = "TWSE 欄位找不到代號欄"
                 continue
 
-            row = df[df[code_col].astype(str).str.strip() == stock_no]
-            if row.empty:
-                last_error = f"{mkt_name} 當日資料找不到 {stock_no}"
+            sub = df[df[code_col].astype(str).str.strip() == stock_no]
+            if sub.empty:
+                last_error = f"TWSE 找不到 {stock_no}"
                 continue
 
-            # 欄位名稱不同站點會不太一樣：用關鍵字找
-            # 目標：融資餘額、融券餘額
-            fin_col = find_col(df, ["融資餘額", "融資餘額(股)", "融資餘額股數", "融資餘額股"])
-            sh_col = find_col(df, ["融券餘額", "融券餘額(股)", "融券餘額股數", "融券餘額股"])
+            row = sub.iloc[0]
+            m_bal_col = find_col(colmap, ["融資", "餘額"]) or find_col(colmap, ["資", "餘額"])
+            m_chg_col = find_col(colmap, ["融資", "增減"]) or find_col(colmap, ["資", "增減"])
+            s_bal_col = find_col(colmap, ["融券", "餘額"]) or find_col(colmap, ["券", "餘額"])
+            s_chg_col = find_col(colmap, ["融券", "增減"]) or find_col(colmap, ["券", "增減"])
 
-            fin = _safe_int(row.iloc[0][fin_col]) if fin_col else None
-            sh = _safe_int(row.iloc[0][sh_col]) if sh_col else None
+            m_bal = _safe_int(row[m_bal_col]) if m_bal_col else None
+            s_bal = _safe_int(row[s_bal_col]) if s_bal_col else None
+            m_chg = _safe_int(row[m_chg_col]) if m_chg_col else None
+            s_chg = _safe_int(row[s_chg_col]) if s_chg_col else None
 
-            yf_suffix = ".TW" if mkt_name == "TWSE" else ".TWO"
             return {
-                "id": f"{stock_no}{yf_suffix}",
+                "id": f"{stock_no}.TW",
                 "date": d.strftime("%Y-%m-%d"),
-                "finance_balance": fin,  # 股
-                "short_balance": sh,     # 股
+                "margin_balance": m_bal,
+                "margin_change": m_chg,
+                "short_balance": s_bal,
+                "short_change": s_chg,
                 "error": None,
             }
 
-    return {"error": last_error or "未知錯誤", "id": f"{stock_no}.TW"}
+        # ---- TPEx ----
+        roc_year = d.year - 1911
+        roc_date = f"{roc_year:03d}/{d.month:02d}/{d.day:02d}"
+        url_csv = (
+            "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
+            f"?l=zh-tw&d={roc_date}&o=csv&s=0,asc"
+        )
+        url_htm = (
+            "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
+            f"?l=zh-tw&d={roc_date}&o=htm&s=0,asc"
+        )
+
+        try:
+            r = requests.get(url_csv, headers=headers, timeout=15)
+            df = _parse_tpex_margin_csv(r.text) if (r.status_code == 200 and r.text and len(r.text) > 200) else None
+
+            if df is None or df.empty:
+                r2 = requests.get(url_htm, headers=headers, timeout=15)
+                if r2.status_code == 200 and r2.text and len(r2.text) > 200:
+                    try:
+                        tables = pd.read_html(r2.text)
+                        df = tables[0] if tables else None
+                    except Exception:
+                        df = None
+
+            if df is None or df.empty:
+                last_error = f"TPEx 無資料/解析失敗（{roc_date}）"
+                continue
+
+            colmap = {_norm_col(c): c for c in df.columns}
+            code_col = colmap.get("代號") or colmap.get("股票代號") or colmap.get("證券代號")
+            if not code_col:
+                last_error = "TPEx 欄位找不到代號欄"
+                continue
+
+            sub = df[df[code_col].astype(str).str.strip() == stock_no]
+            if sub.empty:
+                last_error = f"TPEx 找不到 {stock_no}"
+                continue
+            row = sub.iloc[0]
+
+            m_bal_col = colmap.get("資餘額(張)") or colmap.get("資餘額") or find_col(colmap, ["資", "餘額"])
+            m_chg_col = colmap.get("資餘額增減(張)") or colmap.get("資餘額增減") or find_col(colmap, ["資", "增減"])
+            s_bal_col = colmap.get("券餘額(張)") or colmap.get("券餘額") or find_col(colmap, ["券", "餘額"])
+            s_chg_col = colmap.get("券餘額增減(張)") or colmap.get("券餘額增減") or find_col(colmap, ["券", "增減"])
+
+            m_bal = _safe_int(row[m_bal_col]) if m_bal_col else None
+            s_bal = _safe_int(row[s_bal_col]) if s_bal_col else None
+            m_chg = _safe_int(row[m_chg_col]) if m_chg_col else None
+            s_chg = _safe_int(row[s_chg_col]) if s_chg_col else None
+
+            return {
+                "id": f"{stock_no}.TWO",
+                "date": d.strftime("%Y-%m-%d"),
+                "margin_balance": m_bal,
+                "margin_change": m_chg,
+                "short_balance": s_bal,
+                "short_change": s_chg,
+                "error": None,
+            }
+
+        except Exception as e:
+            last_error = f"TPEx 取資料失敗: {e}"
+            continue
+
+    return {"error": last_error or "未知錯誤"}
 
 
-# ---------------------------
+# =========================
 # Indicators
-# ---------------------------
+# =========================
 def calculate_rsi(series, period):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(period).mean()
@@ -563,9 +655,9 @@ def calculate_avwap(df, anchor_date):
     return cum_pv / cum_v
 
 
-# ---------------------------
+# =========================
 # Pattern detection (no chart)
-# ---------------------------
+# =========================
 def _find_pivots(df: pd.DataFrame, left: int = 3, right: int = 3):
     if df is None or df.empty or len(df) < (left + right + 5):
         return [], []
@@ -806,191 +898,197 @@ def detect_patterns(df: pd.DataFrame):
     return res
 
 
-# ---------------------------
-# Main analysis (returns string for Streamlit)
-# ---------------------------
+# =========================
+# Main analysis
+# =========================
 def analyze_stock_technical(stock_id: str, as_of_date=None) -> str:
+    """
+    as_of_date: date (from st.date_input). 預設今天。
+    技術面輸出：依 as_of_date 對應的最近交易日。
+    三大法人：顯示「該日」+「較前一交易日」。
+    融資融券：只顯示「最新交易日」的一筆（不跟 as_of_date 跑）。
+    """
     stock_id = stock_id.strip().upper()
     if not stock_id:
         return "請輸入股票代號"
-
-    req_date = _parse_as_of(as_of_date)
 
     yf_ticker = _resolve_yf_ticker(stock_id)
     out = []
     out.append(f"🔄 正在分析 {stock_id} ... (連線 Yahoo Finance)")
 
-    df_daily = yf.download(yf_ticker, period="1y", interval="1d", progress=False, auto_adjust=False)
+    # 下載一段較長，避免你選舊日期時資料不夠算指標/型態
+    df_daily = yf.download(yf_ticker, period="2y", interval="1d", progress=False, auto_adjust=False)
     df_daily = clean_yf_columns(df_daily)
+    df_daily = _ensure_naive_index(df_daily)
 
     if df_daily.empty and yf_ticker.endswith(".TW"):
         alt = yf_ticker.replace(".TW", ".TWO")
         out.append(f"⚠️ .TW 無資料，改試上櫃代碼: {alt}")
         yf_ticker = alt
-        df_daily = yf.download(yf_ticker, period="1y", interval="1d", progress=False, auto_adjust=False)
+        df_daily = yf.download(yf_ticker, period="2y", interval="1d", progress=False, auto_adjust=False)
         df_daily = clean_yf_columns(df_daily)
+        df_daily = _ensure_naive_index(df_daily)
 
     if df_daily.empty:
         return "\n".join(out + [f"❌ 找不到股票代號 {stock_id} (Yahoo Finance 無數據)"])
 
-    # 日期系統：截到 <= 你選的日期（最近可用交易日）
-    if req_date is not None:
-        df_daily = df_daily[df_daily.index.date <= req_date]
-        if df_daily.empty:
-            return "\n".join(out + [f"❌ 你選的基準日 {req_date} 太早，1y 區間內無可用交易日資料"])
+    latest_overall_ts = df_daily.index[-1]
 
-    # 週/月資料
-    df_weekly = yf.download(yf_ticker, period="1y", interval="1wk", progress=False, auto_adjust=False)
+    chosen_ts = _nearest_trading_ts(df_daily, as_of_date)
+    if chosen_ts is None:
+        return "\n".join(out + [f"❌ {stock_id} 在你選的日期之前沒有可用交易資料"])
+
+    # 技術面只看「選定日期當下」
+    df_daily_upto = df_daily.loc[:chosen_ts].copy()
+    if df_daily_upto.empty:
+        return "\n".join(out + [f"❌ {stock_id} 在 {as_of_date} 之前沒有可用資料"])
+
+    df_weekly = yf.download(yf_ticker, period="2y", interval="1wk", progress=False, auto_adjust=False)
     df_weekly = clean_yf_columns(df_weekly)
-    if req_date is not None and df_weekly is not None and not df_weekly.empty:
-        df_weekly = df_weekly[df_weekly.index.date <= req_date]
+    df_weekly = _ensure_naive_index(df_weekly)
+    df_weekly_upto = df_weekly.loc[:chosen_ts] if (df_weekly is not None and not df_weekly.empty) else df_weekly
 
-    df_monthly = yf.download(yf_ticker, period="2y", interval="1mo", progress=False, auto_adjust=False)
+    df_monthly = yf.download(yf_ticker, period="5y", interval="1mo", progress=False, auto_adjust=False)
     df_monthly = clean_yf_columns(df_monthly)
-    if req_date is not None and df_monthly is not None and not df_monthly.empty:
-        df_monthly = df_monthly[df_monthly.index.date <= req_date]
+    df_monthly = _ensure_naive_index(df_monthly)
+    df_monthly_upto = df_monthly.loc[:chosen_ts] if (df_monthly is not None and not df_monthly.empty) else df_monthly
 
-    latest_daily = df_daily.iloc[-1]
-    prev_daily = df_daily.iloc[-2] if len(df_daily) >= 2 else latest_daily
+    latest_daily = df_daily_upto.iloc[-1]
+    prev_daily = df_daily_upto.iloc[-2] if len(df_daily_upto) >= 2 else latest_daily
+    latest_trade_date = chosen_ts.date()
+    prev_trade_date = df_daily_upto.index[-2].date() if len(df_daily_upto) >= 2 else None
 
-    latest_trade_date = df_daily.index[-1].date()
-    prev_trade_date = df_daily.index[-2].date() if len(df_daily) >= 2 else None
-
-    # 三大法人：當日 + 前一交易日（若能取到）
-    chips_today = get_institutional_data(stock_id, trade_date=latest_trade_date, market_hint=yf_ticker)
+    # 三大法人：該日 + 前一交易日（嚴格不回溯，避免兩筆日期一樣）
+    chips_today = get_institutional_data(stock_id, trade_date=latest_trade_date, market_hint=yf_ticker, max_back=0)
     chips_prev = None
     if prev_trade_date is not None:
-        chips_prev = get_institutional_data(stock_id, trade_date=prev_trade_date, market_hint=yf_ticker)
-        if (
-            isinstance(chips_prev, dict)
-            and isinstance(chips_today, dict)
-            and chips_prev.get("error") is None
-            and chips_today.get("error") is None
-            and chips_prev.get("date") == chips_today.get("date")
-        ):
-            chips_prev = None
+        chips_prev = get_institutional_data(stock_id, trade_date=prev_trade_date, market_hint=yf_ticker, max_back=0)
 
-    # 融資融券：最新（同 trade_date），可選擇抓前一交易日做比較
-    margin_today = get_margin_data(stock_id, trade_date=latest_trade_date, market_hint=yf_ticker)
-    margin_prev = None
-    if prev_trade_date is not None:
-        margin_prev = get_margin_data(stock_id, trade_date=prev_trade_date, market_hint=yf_ticker)
-        if (
-            isinstance(margin_prev, dict)
-            and isinstance(margin_today, dict)
-            and margin_prev.get("error") is None
-            and margin_today.get("error") is None
-            and margin_prev.get("date") == margin_today.get("date")
-        ):
-            margin_prev = None
+    # 融資融券：只抓「最新交易日」一筆（允許小幅回溯，避免資料源延遲）
+    margin_latest = get_margin_short_data(stock_id, trade_date=latest_overall_ts.date(), market_hint=yf_ticker, max_back=7)
 
     out.append("")
     out.append("=" * 50)
-    out.append(f"📊 {yf_ticker} 專業版數據表 (含三大法人)")
-    out.append(f"📅 資料日期: {df_daily.index[-1].strftime('%Y-%m-%d')}")
-    if req_date is not None:
-        out.append(f"🗓️ 查詢基準日: {req_date.strftime('%Y-%m-%d')}（實際落在最近交易日）")
+    out.append(f"📊 {yf_ticker} 專業版數據表")
+    out.append(f"📅 資料日期: {chosen_ts.strftime('%Y-%m-%d')}（你選：{as_of_date}）")
     out.append("=" * 50)
 
-    # 近 5 日
+    # Last 5 days (up to chosen)
     out.append("📋 近 5 日交易紀錄:")
     out.append(f"{'日期':<12} {'收盤':<12} {'漲跌':<12} {'K棒'}")
     out.append("-" * 50)
-    recent_5 = df_daily.tail(5)
+
+    recent_5 = df_daily_upto.tail(5)
     for idx, row in recent_5.iterrows():
         date_str = idx.strftime("%m-%d")
         close_p = float(row["Close"])
         open_p = float(row["Open"])
         high_p = float(row["High"])
         low_p = float(row["Low"])
-        loc = df_daily.index.get_loc(idx)
-        change = close_p - float(df_daily.iloc[loc - 1]["Close"]) if loc > 0 else 0.0
-        out.append(f"{date_str:<12} {close_p:<12.2f} {change:<+12.2f} {get_k_status(open_p, close_p, high_p, low_p)}")
+        loc = df_daily_upto.index.get_loc(idx)
+        change = close_p - float(df_daily_upto.iloc[loc - 1]["Close"]) if loc > 0 else 0.0
+        out.append(
+            f"{date_str:<12} {close_p:<12.2f} {change:<+12.2f} {get_k_status(open_p, close_p, high_p, low_p)}"
+        )
     out.append("-" * 50)
 
-    # 當日K棒型態
-    out.append(f"🕯 當日K棒型態: {describe_candle(latest_daily['Open'], latest_daily['High'], latest_daily['Low'], latest_daily['Close'])}")
+    out.append(
+        f"🕯 當日K棒型態: {describe_candle(latest_daily['Open'], latest_daily['High'], latest_daily['Low'], latest_daily['Close'])}"
+    )
     out.append("-" * 50)
 
-    # 三大法人 + 前一交易日差
+    # Chips compare
     out.append("💰 籌碼面 (三大法人):")
+
+    def _lots_from_shares(v_shares):
+        v = _safe_int(v_shares)
+        if v is None:
+            return None
+        return int(round(v / 1000))
+
+    def _fmt_lots(v_shares):
+        lots = _lots_from_shares(v_shares)
+        if lots is None:
+            return "n/a"
+        if lots > 0:
+            return f"🔴 買超 {lots:,} 張"
+        if lots < 0:
+            return f"🟢 賣超 {abs(lots):,} 張"
+        return "➖ 無變動"
+
+    def _fmt_lots_with_delta(today_shares, prev_shares):
+        today_lots = _lots_from_shares(today_shares)
+        prev_lots = _lots_from_shares(prev_shares)
+        main = _fmt_lots(today_shares)
+        if today_lots is None or prev_lots is None:
+            return main
+        dlt = today_lots - prev_lots
+        sign = "+" if dlt > 0 else ""
+        return f"{main}（較前一交易日 {sign}{dlt:,} 張）"
+
     if isinstance(chips_today, dict) and chips_today.get("error") is None:
         prev_ok = isinstance(chips_prev, dict) and (chips_prev.get("error") is None)
 
-        f_today = _to_lots(chips_today.get("foreign"))
-        t_today = _to_lots(chips_today.get("trust"))
-        d_today = _to_lots(chips_today.get("dealer"))
+        foreign_prev = chips_prev.get("foreign") if prev_ok else None
+        trust_prev = chips_prev.get("trust") if prev_ok else None
+        dealer_prev = chips_prev.get("dealer") if prev_ok else None
 
-        f_prev = _to_lots(chips_prev.get("foreign")) if prev_ok else None
-        t_prev = _to_lots(chips_prev.get("trust")) if prev_ok else None
-        d_prev = _to_lots(chips_prev.get("dealer")) if prev_ok else None
-
-        out.append(f"• 外資 : {_fmt_net_lots(f_today)}{_fmt_delta(f_today, f_prev)}")
-        out.append(f"• 投信 : {_fmt_net_lots(t_today)}{_fmt_delta(t_today, t_prev)}")
-        out.append(f"• 自營商: {_fmt_net_lots(d_today)}{_fmt_delta(d_today, d_prev)}")
-
-        if prev_ok:
-            out.append(f"  (日期: {chips_today.get('date')}；比較基準: {chips_prev.get('date')}；市場代碼推定: {chips_today.get('id')})")
-        else:
-            out.append(f"  (日期: {chips_today.get('date')}；市場代碼推定: {chips_today.get('id')}；前一交易日比較: n/a)")
+        out.append(f"• 外資 : {_fmt_lots_with_delta(chips_today.get('foreign'), foreign_prev)}")
+        out.append(f"• 投信 : {_fmt_lots_with_delta(chips_today.get('trust'), trust_prev)}")
+        out.append(f"• 自營商: {_fmt_lots_with_delta(chips_today.get('dealer'), dealer_prev)}")
+        out.append(f"  (日期: {chips_today.get('date')}, 市場代碼推定: {chips_today.get('id')})")
+        if not prev_ok and prev_trade_date is not None:
+            out.append(f"  (前一交易日三大法人：n/a，日期={prev_trade_date})")
     else:
         out.append(f"⚠️ 無法抓取三大法人數據 ({chips_today.get('error') if isinstance(chips_today, dict) else '未知錯誤'})")
     out.append("-" * 50)
 
-    # 融資融券（最新）
-    out.append("💸 融資融券（散戶槓桿指標）:")
-    if isinstance(margin_today, dict) and margin_today.get("error") is None:
-        prev_ok = isinstance(margin_prev, dict) and (margin_prev.get("error") is None)
+    # Margin latest only
+    out.append("💸 融資融券（散戶槓桿指標）:（僅顯示最新交易日）")
+    if isinstance(margin_latest, dict) and margin_latest.get("error") is None:
 
-        fin_today = _to_lots(margin_today.get("finance_balance"))
-        sh_today = _to_lots(margin_today.get("short_balance"))
+        def fmt_bal_chg(bal, chg):
+            b = _safe_int(bal)
+            c = _safe_int(chg)
+            if b is None:
+                return "n/a"
+            if c is None:
+                return f"{b:,} 張"
+            sign = "+" if c > 0 else ""
+            return f"{b:,} 張（較前日 {sign}{c:,} 張）"
 
-        fin_prev = _to_lots(margin_prev.get("finance_balance")) if prev_ok else None
-        sh_prev = _to_lots(margin_prev.get("short_balance")) if prev_ok else None
-
-        if fin_today is None:
-            out.append("• 融資餘額: n/a")
-        else:
-            out.append(f"• 融資餘額: {fin_today:,} 張{_fmt_delta(fin_today, fin_prev)}")
-
-        if sh_today is None:
-            out.append("• 融券餘額: n/a")
-        else:
-            out.append(f"• 融券餘額: {sh_today:,} 張{_fmt_delta(sh_today, sh_prev)}")
-
-        if prev_ok:
-            out.append(f"  (日期: {margin_today.get('date')}；比較基準: {margin_prev.get('date')}；市場代碼推定: {margin_today.get('id')})")
-        else:
-            out.append(f"  (日期: {margin_today.get('date')}；市場代碼推定: {margin_today.get('id')}；前一交易日比較: n/a)")
+        out.append(f"• 融資餘額: {fmt_bal_chg(margin_latest.get('margin_balance'), margin_latest.get('margin_change'))}")
+        out.append(f"• 融券餘額: {fmt_bal_chg(margin_latest.get('short_balance'), margin_latest.get('short_change'))}")
+        out.append(f"  (日期: {margin_latest.get('date')}, 市場代碼推定: {margin_latest.get('id')})")
     else:
-        out.append("⚠️ 無法抓取融資融券 (抓取失敗/休市/資料源未回應)")
+        out.append(f"⚠️ 無法抓取融資融券數據 ({margin_latest.get('error') if isinstance(margin_latest, dict) else '未知錯誤'})")
     out.append("-" * 50)
 
-    # 長線趨勢
+    # Long trend (up to chosen)
     out.append("📈 長線趨勢:")
-    if df_weekly is not None and (not df_weekly.empty) and "Close" in df_weekly.columns:
-        ma20_week = df_weekly["Close"].rolling(20).mean().iloc[-1]
-        out.append(f"• [週 K] 收: {float(df_weekly.iloc[-1]['Close']):.2f} | 20週均價: {float(ma20_week):.2f}")
-    if df_monthly is not None and (not df_monthly.empty) and "Close" in df_monthly.columns:
-        out.append(f"• [月 K] 收: {float(df_monthly.iloc[-1]['Close']):.2f}")
+    if df_weekly_upto is not None and (not df_weekly_upto.empty) and "Close" in df_weekly_upto.columns:
+        ma20_week = df_weekly_upto["Close"].rolling(20).mean().iloc[-1]
+        out.append(f"• [週 K] 收: {float(df_weekly_upto.iloc[-1]['Close']):.2f} | 20週均價: {float(ma20_week):.2f}")
+    if df_monthly_upto is not None and (not df_monthly_upto.empty) and "Close" in df_monthly_upto.columns:
+        out.append(f"• [月 K] 收: {float(df_monthly_upto.iloc[-1]['Close']):.2f}")
     out.append("-" * 50)
 
-    # 基礎指標
+    # Base indicators (use df_daily_upto)
     out.append("🔍 基礎指標:")
-    ma5 = df_daily["Close"].rolling(5).mean().iloc[-1]
-    ma20 = df_daily["Close"].rolling(20).mean().iloc[-1]
-    ma60 = df_daily["Close"].rolling(60).mean().iloc[-1]
+    ma5 = df_daily_upto["Close"].rolling(5).mean().iloc[-1]
+    ma20 = df_daily_upto["Close"].rolling(20).mean().iloc[-1]
+    ma60 = df_daily_upto["Close"].rolling(60).mean().iloc[-1]
     out.append(f"• 均線: MA5={float(ma5):.2f}, MA20={float(ma20):.2f}, MA60={float(ma60):.2f}")
 
-    # Volume fallback（當日 volume=0/NaN -> 用前一交易日）
+    # Volume fallback
     vol_today = float(latest_daily["Volume"]) if "Volume" in latest_daily else float("nan")
     vol_yesterday = float(prev_daily["Volume"]) if "Volume" in prev_daily else float("nan")
 
-    use_prev_vol = (pd.isna(vol_today) or vol_today == 0) and len(df_daily) >= 2
+    use_prev_vol = (pd.isna(vol_today) or vol_today == 0) and len(df_daily_upto) >= 2
     if use_prev_vol:
         vol_used = vol_yesterday
-        vol_prev_used = float(df_daily.iloc[-3]["Volume"]) if len(df_daily) >= 3 else vol_yesterday
-        vol_note = f" (改用前一交易日量 {df_daily.index[-2].strftime('%Y-%m-%d')})"
+        vol_prev_used = float(df_daily_upto.iloc[-3]["Volume"]) if len(df_daily_upto) >= 3 else vol_yesterday
+        vol_note = f" (改用昨日量 {df_daily_upto.index[-2].strftime('%Y-%m-%d')})"
     else:
         vol_used = vol_today
         vol_prev_used = vol_yesterday
@@ -1001,16 +1099,16 @@ def analyze_stock_technical(stock_id: str, as_of_date=None) -> str:
     vol_status = "量增" if (not pd.isna(vol_used) and not pd.isna(vol_prev_used) and vol_used > vol_prev_used) else "量縮"
     out.append(f"• 成交量: {vol_in_lots:,} 張 ({vol_status}, 較昨 {vol_diff:+,} 張){vol_note}")
 
-    rsi6 = calculate_rsi(df_daily["Close"], 6).iloc[-1]
+    rsi6 = calculate_rsi(df_daily_upto["Close"], 6).iloc[-1]
 
-    low_min = df_daily["Low"].rolling(9).min()
-    high_max = df_daily["High"].rolling(9).max()
-    rsv = (df_daily["Close"] - low_min) / (high_max - low_min).replace(0, np.nan) * 100
+    low_min = df_daily_upto["Low"].rolling(9).min()
+    high_max = df_daily_upto["High"].rolling(9).max()
+    rsv = (df_daily_upto["Close"] - low_min) / (high_max - low_min).replace(0, np.nan) * 100
     k = rsv.ewm(com=2).mean()
     d = k.ewm(com=2).mean()
 
-    ema12 = df_daily["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = df_daily["Close"].ewm(span=26, adjust=False).mean()
+    ema12 = df_daily_upto["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df_daily_upto["Close"].ewm(span=26, adjust=False).mean()
     dif = ema12 - ema26
     dea = dif.ewm(span=9, adjust=False).mean()
     osc = dif - dea
@@ -1020,30 +1118,29 @@ def analyze_stock_technical(stock_id: str, as_of_date=None) -> str:
     out.append(f"• MACD: OSC={float(osc.iloc[-1]):.2f}")
     out.append("-" * 50)
 
-    # 進階指標
+    # Advanced
     out.append("🚀 進階指標 (趨勢/波動/量能):")
-    adx, pdi, mdi = calculate_adx(df_daily)
+    adx, pdi, mdi = calculate_adx(df_daily_upto)
     out.append(f"• ADX(14): {float(adx.iloc[-1]):.2f} | +DI: {float(pdi.iloc[-1]):.2f}, -DI: {float(mdi.iloc[-1]):.2f}")
 
-    bbw, upper, lower = calculate_bbw(df_daily)
+    bbw, upper, lower = calculate_bbw(df_daily_upto)
     out.append(f"• BBW: {float(bbw.iloc[-1]):.2f}% | 上軌: {float(upper.iloc[-1]):.2f}, 下軌: {float(lower.iloc[-1]):.2f}")
 
-    mfi = calculate_mfi(df_daily)
+    mfi = calculate_mfi(df_daily_upto)
     out.append(f"• MFI(14): {float(mfi.iloc[-1]):.2f} (資金流向)")
 
-    y = (req_date.year if req_date is not None else datetime.now().year)
-    avwap = calculate_avwap(df_daily, f"{y}-01-01")
-    if avwap is not None and not avwap.empty and np.isfinite(float(avwap.iloc[-1])):
+    avwap = calculate_avwap(df_daily_upto, f"{chosen_ts.year}-01-01")
+    if avwap is not None and (not avwap.empty) and np.isfinite(float(avwap.iloc[-1])):
         dist = (float(latest_daily["Close"]) - float(avwap.iloc[-1])) / float(avwap.iloc[-1]) * 100
         out.append(f"• AVWAP (YTD): {float(avwap.iloc[-1]):.2f} (乖離: {dist:+.2f}%)")
     else:
         out.append("• AVWAP (YTD): 資料不足")
     out.append("-" * 50)
 
-    # 🧠 型態辨識
-    out.append("🧠 型態辨識（M頭 / W底 / 收斂三角）:")
+    # Pattern detection (use df_daily_upto)
     try:
-        patterns = detect_patterns(df_daily)
+        patterns = detect_patterns(df_daily_upto)
+        out.append("🧠 型態辨識（M頭 / W底 / 收斂三角）:")
         if not patterns:
             out.append("• 未偵測到明確型態（或資料不足/型態不符合條件）")
         else:
@@ -1063,9 +1160,10 @@ def analyze_stock_technical(stock_id: str, as_of_date=None) -> str:
                         f"• {p['pattern']}：{p['status']} | 上緣 {p['upper_now']:.2f} / 下緣 {p['lower_now']:.2f} "
                         f"| 收斂比 {p['range_shrink']:.2f} | 方向 {p['direction']}"
                     )
+        out.append("-" * 50)
     except Exception:
-        out.append("• 型態辨識：計算失敗（資料不足或格式異常）")
+        out.append("🧠 型態辨識：計算失敗（資料不足或格式異常）")
+        out.append("-" * 50)
 
-    out.append("-" * 50)
     out.append("=" * 50)
     return "\n".join(out)
