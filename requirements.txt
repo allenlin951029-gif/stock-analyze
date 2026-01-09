@@ -5,7 +5,7 @@ numpy
 requests
 truststore
 streamlit-autorefresh
-streamlit-autorefresh
 streamlit-cookies-manager
+
 
 
