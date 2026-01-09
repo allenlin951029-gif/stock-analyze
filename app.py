@@ -34,25 +34,33 @@ def load_history_from_cookie():
         return []
     return []
 
-def save_history_to_cookie(history_list):
-    cookies[HIST_KEY] = json.dumps(history_list, ensure_ascii=False)
-    cookies.save()
-
 def load_current_from_cookie():
     v = cookies.get(CUR_KEY)
     return (v or "0050").strip().upper()
 
+# ✅ 同一個 rerun 只存一次，避免 DuplicateElementKey
+st.session_state["_cookie_saved_this_run"] = False
+
+def commit_cookies_once():
+    if not st.session_state.get("_cookie_saved_this_run", False):
+        cookies.save()
+        st.session_state["_cookie_saved_this_run"] = True
+
+def save_history_to_cookie(history_list):
+    cookies[HIST_KEY] = json.dumps(history_list, ensure_ascii=False)
+    commit_cookies_once()
+
 def save_current_to_cookie(sid):
     cookies[CUR_KEY] = sid.strip().upper()
-    cookies.save()
+    commit_cookies_once()
 
 # -------------------------
 # Session state init
 # -------------------------
 if "history" not in st.session_state:
-    st.session_state.history = load_history_from_cookie()  # persistent load
+    st.session_state.history = load_history_from_cookie()
 if "current_id" not in st.session_state:
-    st.session_state.current_id = load_current_from_cookie()  # persistent load
+    st.session_state.current_id = load_current_from_cookie()
 if "report" not in st.session_state:
     st.session_state.report = ""
 
@@ -63,7 +71,6 @@ def push_history(stock_id: str):
     sid = stock_id.strip().upper()
     if not sid:
         return
-    # dedupe + keep 5
     st.session_state.history = [x for x in st.session_state.history if x != sid]
     st.session_state.history.insert(0, sid)
     st.session_state.history = st.session_state.history[:5]
@@ -76,10 +83,10 @@ def run_analysis(stock_id: str, write_history: bool):
         return
 
     st.session_state.current_id = sid
-    save_current_to_cookie(sid)
+    save_current_to_cookie(sid)  # 這輪只會 save 一次
 
     if write_history:
-        push_history(sid)
+        push_history(sid)         # 這輪不會再觸發第二次 save（被 guard 擋住）
 
     with st.spinner(f"正在分析 {sid} ..."):
         st.session_state.report = analyze_stock_technical(sid)
@@ -101,7 +108,7 @@ with st.sidebar:
         col_a, col_b = st.columns(2)
         with col_a:
             if st.button("回查這筆", use_container_width=True):
-                run_analysis(picked, write_history=False)  # 回查不重複寫入
+                run_analysis(picked, write_history=False)
         with col_b:
             if st.button("清除歷史", use_container_width=True):
                 st.session_state.history = []
