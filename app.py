@@ -1,3 +1,4 @@
+# app.py
 import json
 from datetime import date
 
@@ -22,7 +23,6 @@ if not cookies.ready():
 
 HIST_KEY = "history"
 CUR_KEY = "current_id"
-DATE_KEY = "as_of_date"  # YYYY-MM-DD
 
 def load_history_from_cookie():
     raw = cookies.get(HIST_KEY)
@@ -40,18 +40,8 @@ def load_current_from_cookie():
     v = cookies.get(CUR_KEY)
     return (v or "0050").strip().upper()
 
-def load_date_from_cookie():
-    v = cookies.get(DATE_KEY)
-    if not v:
-        return date.today()
-    try:
-        y, m, d = [int(x) for x in str(v).split("-")]
-        return date(y, m, d)
-    except Exception:
-        return date.today()
-
-# ✅ 同一個 rerun 只存一次，避免 DuplicateElementKey
 st.session_state["_cookie_saved_this_run"] = False
+
 def commit_cookies_once():
     if not st.session_state.get("_cookie_saved_this_run", False):
         cookies.save()
@@ -65,10 +55,6 @@ def save_current_to_cookie(sid):
     cookies[CUR_KEY] = sid.strip().upper()
     commit_cookies_once()
 
-def save_date_to_cookie(d: date):
-    cookies[DATE_KEY] = d.strftime("%Y-%m-%d")
-    commit_cookies_once()
-
 # -------------------------
 # Session init
 # -------------------------
@@ -76,8 +62,6 @@ if "history" not in st.session_state:
     st.session_state.history = load_history_from_cookie()
 if "current_id" not in st.session_state:
     st.session_state.current_id = load_current_from_cookie()
-if "as_of_date" not in st.session_state:
-    st.session_state.as_of_date = load_date_from_cookie()
 if "report" not in st.session_state:
     st.session_state.report = ""
 
@@ -93,7 +77,7 @@ def push_history(stock_id: str):
     st.session_state.history = st.session_state.history[:5]
     save_history_to_cookie(st.session_state.history)
 
-def run_analysis(stock_id: str, as_of: date, write_history: bool):
+def run_analysis(stock_id: str, write_history: bool):
     sid = stock_id.strip().upper()
     if not sid:
         st.session_state.report = "請輸入股票代號"
@@ -102,29 +86,21 @@ def run_analysis(stock_id: str, as_of: date, write_history: bool):
     st.session_state.current_id = sid
     save_current_to_cookie(sid)
 
-    st.session_state.as_of_date = as_of
-    save_date_to_cookie(as_of)
-
     if write_history:
         push_history(sid)
 
-    with st.spinner(f"正在分析 {sid}（基準日 {as_of.strftime('%Y-%m-%d')}）..."):
-        st.session_state.report = analyze_stock_technical(sid, as_of_date=as_of)
+    with st.spinner(f"正在分析 {sid} ..."):
+        st.session_state.report = analyze_stock_technical(sid)
 
 # -------------------------
 # Sidebar
 # -------------------------
 with st.sidebar:
     st.subheader("設定")
-
-    as_of = st.date_input(
-        "選擇分析日期（預設今天）",
-        value=st.session_state.as_of_date,
-    )
-
     auto = st.toggle("即時更新（每 10 秒刷新）", value=False)
     if auto:
-        st_autorefresh(interval=10000, key="autorefresh_10s")
+        tick = st_autorefresh(interval=10000, key="autorefresh_10s")
+        st.caption(f"autorefresh tick = {tick}")
 
     st.divider()
     st.subheader("搜尋歷史（前 5 筆，會保存）")
@@ -134,7 +110,7 @@ with st.sidebar:
         col_a, col_b = st.columns(2)
         with col_a:
             if st.button("回查這筆", use_container_width=True):
-                run_analysis(picked, as_of, write_history=False)
+                run_analysis(picked, write_history=False)
         with col_b:
             if st.button("清除歷史", use_container_width=True):
                 st.session_state.history = []
@@ -157,11 +133,11 @@ with col2:
     search = st.button("開始分析", use_container_width=True)
 
 if search:
-    run_analysis(stock_id, as_of, write_history=True)
+    run_analysis(stock_id, write_history=True)
 
 # Auto refresh: do not spam history
 if auto and st.session_state.current_id:
-    run_analysis(st.session_state.current_id, as_of, write_history=False)
+    run_analysis(st.session_state.current_id, write_history=False)
 
 st.divider()
 if st.session_state.report and str(st.session_state.report).strip():
