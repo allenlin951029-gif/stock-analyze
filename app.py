@@ -96,28 +96,38 @@ def run_analysis(stock_id: str, write_history: bool):
         buf = io.StringIO()
         ret = None
         try:
-            # 同時抓 print 輸出
             with redirect_stdout(buf):
                 ret = analyze_stock_technical(sid)
 
             stdout_text = buf.getvalue()
 
-            # ✅ 優先順序：return 字串 > stdout > 其它型別 > 沒輸出
-            if isinstance(ret, str) and ret.strip():
-                st.session_state.report = ret
+            # 先算一些 debug 資訊
+            ret_len = len(ret) if isinstance(ret, str) else -1
+            ret_preview = repr(ret[:200]) if isinstance(ret, str) else ""
+            st.session_state._last_debug = (
+                f"ret_type={type(ret).__name__}, ret_len={ret_len}, "
+                f"ret_is_none={ret is None}, stdout_len={len(stdout_text)}, "
+                f"ret_preview={ret_preview}"
+            )
+
+            # 兼容：return > stdout > 其他
+            if isinstance(ret, str):
+                if ret.strip():
+                    st.session_state.report = ret
+                elif stdout_text.strip():
+                    st.session_state.report = stdout_text
+                else:
+                    # ✅ 回傳是空字串：直接把原因顯示出來
+                    st.session_state.report = (
+                        "（函式回傳字串，但內容是空的/只有空白）\n"
+                        f"ret_len={ret_len}\nret_preview={ret_preview}"
+                    )
             elif stdout_text.strip():
                 st.session_state.report = stdout_text
             elif ret is not None:
-                st.session_state.report = f"（函式有回傳，但不是字串：{type(ret).__name__}）\n{ret}"
+                st.session_state.report = f"（函式回傳非字串：{type(ret).__name__}）\n{ret}"
             else:
-                st.session_state.report = "（沒有輸出：函式沒有 return 字串、也沒有 print 輸出）"
-
-            # Debug 資訊（方便你定位是不是根本沒進函式）
-            st.session_state._last_debug = (
-                f"ret_type={type(ret).__name__}, "
-                f"ret_is_none={ret is None}, "
-                f"stdout_len={len(stdout_text)}"
-            )
+                st.session_state.report = "（函式沒有 return、也沒有 print）"
 
         except Exception as e:
             st.session_state.report = f"⚠️ 分析失敗：{type(e).__name__}: {e}"
@@ -182,4 +192,5 @@ if st.session_state.report and str(st.session_state.report).strip():
     st.code(st.session_state.report, language="text")
 else:
     st.info("尚未分析。請輸入代號後按「開始分析」。")
+
 
