@@ -1,7 +1,6 @@
 # stock.py
 import io
 import re
-import time
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -12,15 +11,14 @@ import yfinance as yf
 # Optional: helps some SSL envs
 try:
     import truststore
-
     truststore.inject_into_ssl()
 except Exception:
     pass
 
 
-# ---------------------------
-# Helpers
-# ---------------------------
+# =========================
+# Utils
+# =========================
 def clean_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -53,9 +51,20 @@ def _resolve_yf_ticker(stock_id: str) -> str:
     return f"{s}.TW"
 
 
-# ---------------------------
-# Candle (emoji + pattern)
-# ---------------------------
+def _strip_suffix(stock_id: str) -> str:
+    return stock_id.strip().upper().replace(".TW", "").replace(".TWO", "")
+
+
+def _norm_col(s: str) -> str:
+    s = str(s).replace("\ufeff", "")
+    s = s.replace("（", "(").replace("）", ")")
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
+# =========================
+# Candle
+# =========================
 def get_k_status(open_p, close_p, high_p=None, low_p=None):
     try:
         o = float(open_p)
@@ -112,10 +121,10 @@ def describe_candle(open_p, high_p, low_p, close_p):
     return base
 
 
-# ---------------------------
-# Institutional: TWSE / TPEx CSV parsing
-# ---------------------------
-def _parse_twse_t86_csv(text):
+# =========================
+# Institutional (三大法人)
+# =========================
+def _parse_twse_t86_csv(text: str):
     text = text.replace("\r", "").replace("=", "")
     lines = [ln for ln in text.split("\n") if ln.strip()]
     start = None
@@ -139,7 +148,7 @@ def _parse_twse_t86_csv(text):
         return None
 
 
-def _parse_tpex_csv(text):
+def _parse_tpex_csv(text: str):
     text = text.replace("\ufeff", "").replace("\r", "")
     lines = [ln for ln in text.split("\n") if ln.strip()]
     start = None
@@ -163,13 +172,12 @@ def _parse_tpex_csv(text):
         return None
 
 
-def get_institutional_data(stock_id, trade_date, market_hint=None):
+def get_institutional_data(stock_id: str, trade_date, market_hint=None):
     """
     回傳 foreign/trust/dealer 皆為「股」（shares）
     顯示時再 /1000 轉「張」
-    外資抓不到買賣超 → 用(買進-賣出)算
     """
-    stock_no = stock_id.strip().upper().replace(".TW", "").replace(".TWO", "")
+    stock_no = _strip_suffix(stock_id)
 
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -213,37 +221,26 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
     if not prefer_twse:
         markets = [("TPEx", try_tpex), ("TWSE", try_twse)]
 
-    # 欄名正規化：消空白/BOM/全形括號
-    def norm(s: str) -> str:
-        s = str(s)
-        s = s.replace("\ufeff", "")
-        s = s.replace("（", "(").replace("）", ")")
-        s = re.sub(r"\s+", "", s)
-        return s
-
     def build_colmap(cols):
         mp = {}
         for c in cols:
-            mp[norm(c)] = c
+            mp[_norm_col(c)] = c
         return mp
 
-    def find_first(colmap, predicate):
+    def find_first(colmap, pred):
         for nk, orig in colmap.items():
-            if predicate(nk):
+            if pred(nk):
                 return orig
         return None
 
     def is_foreign_block(nk: str) -> bool:
         return ("外陸資" in nk) or ("外資及陸資" in nk) or ("外資" in nk)
 
-    # ✅ 修正點：允許「不含外資自營商」的外資欄，僅排除真正外資自營商欄
     def is_foreign_usable(nk: str) -> bool:
-        # 例如「外資及陸資(不含外資自營商)買賣超股數」要允許
         if "外資自營商" in nk and "不含外資自營商" not in nk:
             return False
         return is_foreign_block(nk)
 
-    # 往前找 10 天（避開週末/休市）
     for back in range(0, 10):
         d = trade_date - timedelta(days=back)
 
@@ -256,10 +253,9 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
             cols = list(df.columns)
             colmap = build_colmap(cols)
 
-            # 代號欄
             code_col = None
             for c in cols:
-                if norm(c) in ("證券代號", "代號"):
+                if _norm_col(c) in ("證券代號", "代號"):
                     code_col = c
                     break
             if code_col is None:
@@ -271,18 +267,10 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 last_error = f"{mkt_name} 當日資料找不到 {stock_no}"
                 continue
 
-            # 外資（買賣超股數）— ✅ 允許「不含外資自營商」
-            foreign_col = find_first(
-                colmap,
-                lambda nk: is_foreign_usable(nk) and ("買賣超" in nk),
-            )
+            # 外資買賣超
+            foreign_col = find_first(colmap, lambda nk: is_foreign_usable(nk) and ("買賣超" in nk))
+            trust_col = find_first(colmap, lambda nk: ("投信" in nk) and ("買賣超" in nk)) or find_first(colmap, lambda nk: "投信" in nk)
 
-            # 投信
-            trust_col = find_first(colmap, lambda nk: ("投信" in nk) and ("買賣超" in nk)) or find_first(
-                colmap, lambda nk: "投信" in nk
-            )
-
-            # 自營商（總）
             dealer_total_col = find_first(
                 colmap,
                 lambda nk: ("自營商" in nk)
@@ -292,12 +280,10 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 and ("避險" not in nk),
             )
             dealer_self_col = find_first(
-                colmap,
-                lambda nk: ("自營商" in nk) and ("自行買賣" in nk) and ("買賣超" in nk) and ("外資" not in nk),
+                colmap, lambda nk: ("自營商" in nk) and ("自行買賣" in nk) and ("買賣超" in nk) and ("外資" not in nk)
             )
             dealer_hedge_col = find_first(
-                colmap,
-                lambda nk: ("自營商" in nk) and ("避險" in nk) and ("買賣超" in nk) and ("外資" not in nk),
+                colmap, lambda nk: ("自營商" in nk) and ("避險" in nk) and ("買賣超" in nk) and ("外資" not in nk)
             )
 
             foreign = _safe_int(row.iloc[0][foreign_col]) if foreign_col else None
@@ -311,7 +297,7 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 b = _safe_int(row.iloc[0][dealer_hedge_col]) if dealer_hedge_col else 0
                 dealer = (a or 0) + (b or 0)
 
-            # 外資 fallback：買進-賣出（✅ 不會誤抓到「買賣超」欄）
+            # 外資 fallback: 買進-賣出
             if foreign is None:
                 buy_col = find_first(
                     colmap,
@@ -331,17 +317,17 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 "id": f"{stock_no}{yf_suffix}",
                 "date": d.strftime("%Y-%m-%d"),
                 "foreign": foreign,  # 股
-                "trust": trust,  # 股
-                "dealer": dealer,  # 股
+                "trust": trust,      # 股
+                "dealer": dealer,    # 股
                 "error": None,
             }
 
     return {"error": last_error or "未知錯誤", "id": f"{stock_no}.TW"}
 
 
-# ---------------------------
-# Margin Trading (融資融券) - TWSE / TPEx
-# ---------------------------
+# =========================
+# Margin Trading (融資融券)
+# =========================
 def _parse_twse_json_table(obj):
     if not isinstance(obj, dict):
         return None
@@ -423,7 +409,7 @@ def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None):
     回傳單位：張
       margin_balance, margin_change, short_balance, short_change
     """
-    stock_no = stock_id.strip().upper().replace(".TW", "").replace(".TWO", "")
+    stock_no = _strip_suffix(stock_id)
 
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -434,211 +420,140 @@ def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None):
     if isinstance(market_hint, str) and market_hint.upper().endswith(".TWO"):
         prefer_twse = False
 
-    def norm(s):
-        s = str(s).replace("\ufeff", "")
-        s = s.replace("（", "(").replace("）", ")")
-        s = re.sub(r"\s+", "", s)
-        return s
-
     last_error = None
+
+    def find_col(colmap, contains):
+        for nk, orig in colmap.items():
+            ok = True
+            for kw in contains:
+                if kw not in nk:
+                    ok = False
+                    break
+            if ok:
+                return orig
+        return None
 
     for back in range(0, 10):
         d = trade_date - timedelta(days=back)
 
-        # ---------- TWSE ----------
+        # ---- TWSE ----
         if prefer_twse:
             ymd = d.strftime("%Y%m%d")
             df, err = _twse_margin_json(ymd, headers=headers)
             if df is None or df.empty:
                 last_error = err
-            else:
-                colmap = {norm(c): c for c in df.columns}
-
-                code_col = (
-                    colmap.get("股票代號")
-                    or colmap.get("證券代號")
-                    or colmap.get("證券代碼")
-                    or colmap.get("SecuritiesCode")
-                    or colmap.get("SecurityCode")
-                    or colmap.get("Code")
-                )
-                if not code_col:
-                    last_error = "TWSE 欄位找不到代號欄"
-                else:
-                    sub = df[df[code_col].astype(str).str.strip() == stock_no]
-                    if sub.empty:
-                        last_error = f"TWSE 找不到 {stock_no}"
-                    else:
-                        row = sub.iloc[0]
-
-                        def find_col(contains):
-                            for nk, orig in colmap.items():
-                                ok = True
-                                for kw in contains:
-                                    if kw not in nk:
-                                        ok = False
-                                        break
-                                if ok:
-                                    return orig
-                            return None
-
-                        # 優先抓「餘額」「增減」
-                        m_bal_col = find_col(["融資", "餘額"]) or find_col(["資", "餘額"])
-                        m_chg_col = find_col(["融資", "增減"]) or find_col(["資", "增減"])
-
-                        s_bal_col = find_col(["融券", "餘額"]) or find_col(["券", "餘額"])
-                        s_chg_col = find_col(["融券", "增減"]) or find_col(["券", "增減"])
-
-                        # 若沒有增減，退回用 今日-前日
-                        m_today_col = find_col(["融資", "今日", "餘額"]) or m_bal_col
-                        m_prev_col = find_col(["融資", "前日", "餘額"]) or find_col(["融資", "前一日", "餘額"])
-
-                        s_today_col = find_col(["融券", "今日", "餘額"]) or s_bal_col
-                        s_prev_col = find_col(["融券", "前日", "餘額"]) or find_col(["融券", "前一日", "餘額"])
-
-                        m_bal = _safe_int(row[m_bal_col]) if m_bal_col else None
-                        s_bal = _safe_int(row[s_bal_col]) if s_bal_col else None
-
-                        m_chg = _safe_int(row[m_chg_col]) if m_chg_col else None
-                        s_chg = _safe_int(row[s_chg_col]) if s_chg_col else None
-
-                        if m_chg is None:
-                            m_today = _safe_int(row[m_today_col]) if m_today_col else None
-                            m_prev = _safe_int(row[m_prev_col]) if m_prev_col else None
-                            if m_today is not None and m_prev is not None:
-                                m_chg = m_today - m_prev
-                                if m_bal is None:
-                                    m_bal = m_today
-
-                        if s_chg is None:
-                            s_today = _safe_int(row[s_today_col]) if s_today_col else None
-                            s_prev = _safe_int(row[s_prev_col]) if s_prev_col else None
-                            if s_today is not None and s_prev is not None:
-                                s_chg = s_today - s_prev
-                                if s_bal is None:
-                                    s_bal = s_today
-
-                        # TWSE 這張報表通常單位就是「張」
-                        return {
-                            "id": f"{stock_no}.TW",
-                            "date": d.strftime("%Y-%m-%d"),
-                            "margin_balance": m_bal,
-                            "margin_change": m_chg,
-                            "short_balance": s_bal,
-                            "short_change": s_chg,
-                            "error": None,
-                        }
-
-        # ---------- TPEx (.TWO) ----------
-        else:
-            roc_year = d.year - 1911
-            roc_date = f"{roc_year:03d}/{d.month:02d}/{d.day:02d}"
-
-            url_csv = (
-                "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
-                f"?l=zh-tw&d={roc_date}&o=csv&s=0,asc"
-            )
-            url_htm = (
-                "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
-                f"?l=zh-tw&d={roc_date}&o=htm&s=0,asc"
-            )
-
-            try:
-                r = requests.get(url_csv, headers=headers, timeout=15)
-                df = _parse_tpex_margin_csv(r.text) if (r.status_code == 200 and r.text and len(r.text) > 200) else None
-
-                if df is None or df.empty:
-                    r2 = requests.get(url_htm, headers=headers, timeout=15)
-                    if r2.status_code == 200 and r2.text and len(r2.text) > 200:
-                        try:
-                            tables = pd.read_html(r2.text)
-                            df = tables[0] if tables else None
-                        except Exception:
-                            df = None
-
-                if df is None or df.empty:
-                    last_error = f"TPEx 無資料/解析失敗（{roc_date}）"
-                    continue
-
-                colmap = {norm(c): c for c in df.columns}
-                code_col = colmap.get("代號") or colmap.get("股票代號") or colmap.get("證券代號")
-                if not code_col:
-                    last_error = "TPEx 欄位找不到代號欄"
-                    continue
-
-                sub = df[df[code_col].astype(str).str.strip() == stock_no]
-                if sub.empty:
-                    last_error = f"TPEx 找不到 {stock_no}"
-                    continue
-                row = sub.iloc[0]
-
-                def find_col_contains(*contains):
-                    for nk, orig in colmap.items():
-                        ok = True
-                        for kw in contains:
-                            if kw not in nk:
-                                ok = False
-                                break
-                        if ok:
-                            return orig
-                    return None
-
-                # 先抓「餘額」「增減」
-                m_bal_col = (
-                    colmap.get("資餘額(張)")
-                    or colmap.get("資餘額")
-                    or find_col_contains("資", "餘額")
-                    or find_col_contains("融資", "餘額")
-                )
-                m_chg_col = colmap.get("資餘額增減(張)") or colmap.get("資餘額增減") or find_col_contains("資", "增減")
-
-                s_bal_col = (
-                    colmap.get("券餘額(張)")
-                    or colmap.get("券餘額")
-                    or find_col_contains("券", "餘額")
-                    or find_col_contains("融券", "餘額")
-                )
-                s_chg_col = colmap.get("券餘額增減(張)") or colmap.get("券餘額增減") or find_col_contains("券", "增減")
-
-                # 沒增減時，用今日-前日
-                m_prev_col = colmap.get("前資餘額(張)") or colmap.get("前資餘額") or find_col_contains("前資", "餘額")
-                s_prev_col = colmap.get("前券餘額(張)") or colmap.get("前券餘額") or find_col_contains("前券", "餘額")
-
-                m_bal = _safe_int(row[m_bal_col]) if m_bal_col else None
-                s_bal = _safe_int(row[s_bal_col]) if s_bal_col else None
-                m_chg = _safe_int(row[m_chg_col]) if m_chg_col else None
-                s_chg = _safe_int(row[s_chg_col]) if s_chg_col else None
-
-                if m_chg is None:
-                    m_prev = _safe_int(row[m_prev_col]) if m_prev_col else None
-                    if m_bal is not None and m_prev is not None:
-                        m_chg = m_bal - m_prev
-
-                if s_chg is None:
-                    s_prev = _safe_int(row[s_prev_col]) if s_prev_col else None
-                    if s_bal is not None and s_prev is not None:
-                        s_chg = s_bal - s_prev
-
-                return {
-                    "id": f"{stock_no}.TWO",
-                    "date": d.strftime("%Y-%m-%d"),
-                    "margin_balance": m_bal,
-                    "margin_change": m_chg,
-                    "short_balance": s_bal,
-                    "short_change": s_chg,
-                    "error": None,
-                }
-
-            except Exception as e:
-                last_error = f"TPEx 取資料失敗: {e}"
                 continue
+
+            colmap = {_norm_col(c): c for c in df.columns}
+            code_col = (
+                colmap.get("股票代號")
+                or colmap.get("證券代號")
+                or colmap.get("證券代碼")
+                or colmap.get("SecuritiesCode")
+                or colmap.get("SecurityCode")
+                or colmap.get("Code")
+            )
+            if not code_col:
+                last_error = "TWSE 欄位找不到代號欄"
+                continue
+
+            sub = df[df[code_col].astype(str).str.strip() == stock_no]
+            if sub.empty:
+                last_error = f"TWSE 找不到 {stock_no}"
+                continue
+
+            row = sub.iloc[0]
+            m_bal_col = find_col(colmap, ["融資", "餘額"]) or find_col(colmap, ["資", "餘額"])
+            m_chg_col = find_col(colmap, ["融資", "增減"]) or find_col(colmap, ["資", "增減"])
+            s_bal_col = find_col(colmap, ["融券", "餘額"]) or find_col(colmap, ["券", "餘額"])
+            s_chg_col = find_col(colmap, ["融券", "增減"]) or find_col(colmap, ["券", "增減"])
+
+            m_bal = _safe_int(row[m_bal_col]) if m_bal_col else None
+            s_bal = _safe_int(row[s_bal_col]) if s_bal_col else None
+            m_chg = _safe_int(row[m_chg_col]) if m_chg_col else None
+            s_chg = _safe_int(row[s_chg_col]) if s_chg_col else None
+
+            return {
+                "id": f"{stock_no}.TW",
+                "date": d.strftime("%Y-%m-%d"),
+                "margin_balance": m_bal,
+                "margin_change": m_chg,
+                "short_balance": s_bal,
+                "short_change": s_chg,
+                "error": None,
+            }
+
+        # ---- TPEx ----
+        roc_year = d.year - 1911
+        roc_date = f"{roc_year:03d}/{d.month:02d}/{d.day:02d}"
+        url_csv = (
+            "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
+            f"?l=zh-tw&d={roc_date}&o=csv&s=0,asc"
+        )
+        url_htm = (
+            "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
+            f"?l=zh-tw&d={roc_date}&o=htm&s=0,asc"
+        )
+
+        try:
+            r = requests.get(url_csv, headers=headers, timeout=15)
+            df = _parse_tpex_margin_csv(r.text) if (r.status_code == 200 and r.text and len(r.text) > 200) else None
+
+            if df is None or df.empty:
+                r2 = requests.get(url_htm, headers=headers, timeout=15)
+                if r2.status_code == 200 and r2.text and len(r2.text) > 200:
+                    try:
+                        tables = pd.read_html(r2.text)
+                        df = tables[0] if tables else None
+                    except Exception:
+                        df = None
+
+            if df is None or df.empty:
+                last_error = f"TPEx 無資料/解析失敗（{roc_date}）"
+                continue
+
+            colmap = {_norm_col(c): c for c in df.columns}
+            code_col = colmap.get("代號") or colmap.get("股票代號") or colmap.get("證券代號")
+            if not code_col:
+                last_error = "TPEx 欄位找不到代號欄"
+                continue
+
+            sub = df[df[code_col].astype(str).str.strip() == stock_no]
+            if sub.empty:
+                last_error = f"TPEx 找不到 {stock_no}"
+                continue
+            row = sub.iloc[0]
+
+            m_bal_col = colmap.get("資餘額(張)") or colmap.get("資餘額") or find_col(colmap, ["資", "餘額"])
+            m_chg_col = colmap.get("資餘額增減(張)") or colmap.get("資餘額增減") or find_col(colmap, ["資", "增減"])
+            s_bal_col = colmap.get("券餘額(張)") or colmap.get("券餘額") or find_col(colmap, ["券", "餘額"])
+            s_chg_col = colmap.get("券餘額增減(張)") or colmap.get("券餘額增減") or find_col(colmap, ["券", "增減"])
+
+            m_bal = _safe_int(row[m_bal_col]) if m_bal_col else None
+            s_bal = _safe_int(row[s_bal_col]) if s_bal_col else None
+            m_chg = _safe_int(row[m_chg_col]) if m_chg_col else None
+            s_chg = _safe_int(row[s_chg_col]) if s_chg_col else None
+
+            return {
+                "id": f"{stock_no}.TWO",
+                "date": d.strftime("%Y-%m-%d"),
+                "margin_balance": m_bal,
+                "margin_change": m_chg,
+                "short_balance": s_bal,
+                "short_change": s_chg,
+                "error": None,
+            }
+
+        except Exception as e:
+            last_error = f"TPEx 取資料失敗: {e}"
+            continue
 
     return {"error": last_error or "未知錯誤"}
 
 
-# ---------------------------
+# =========================
 # Indicators
-# ---------------------------
+# =========================
 def calculate_rsi(series, period):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(period).mean()
@@ -706,9 +621,9 @@ def calculate_avwap(df, anchor_date):
     return cum_pv / cum_v
 
 
-# ---------------------------
+# =========================
 # Pattern detection (no chart)
-# ---------------------------
+# =========================
 def _find_pivots(df: pd.DataFrame, left: int = 3, right: int = 3):
     if df is None or df.empty or len(df) < (left + right + 5):
         return [], []
@@ -949,9 +864,9 @@ def detect_patterns(df: pd.DataFrame):
     return res
 
 
-# ---------------------------
-# Main analysis (returns string for Streamlit)
-# ---------------------------
+# =========================
+# Main analysis
+# =========================
 def analyze_stock_technical(stock_id: str) -> str:
     stock_id = stock_id.strip().upper()
     if not stock_id:
@@ -1010,13 +925,13 @@ def analyze_stock_technical(stock_id: str) -> str:
         )
     out.append("-" * 50)
 
-    # Candle pattern
+    # Candle shape
     out.append(
         f"🕯 當日K棒型態: {describe_candle(latest_daily['Open'], latest_daily['High'], latest_daily['Low'], latest_daily['Close'])}"
     )
     out.append("-" * 50)
 
-    # Chips (shares -> lots)
+    # Chips
     out.append("💰 籌碼面 (三大法人):")
     if isinstance(chips, dict) and chips.get("error") is None:
 
@@ -1039,7 +954,7 @@ def analyze_stock_technical(stock_id: str) -> str:
         out.append(f"⚠️ 無法抓取三大法人數據 ({chips.get('error') if isinstance(chips, dict) else '未知錯誤'})")
     out.append("-" * 50)
 
-    # Margin Trading (already in lots)
+    # Margin / short
     out.append("💸 融資融券（散戶槓桿指標）:")
     if isinstance(margin, dict) and margin.get("error") is None:
 
@@ -1054,7 +969,7 @@ def analyze_stock_technical(stock_id: str) -> str:
             return f"{b:,} 張（較前日 {sign}{c:,} 張）"
 
         out.append(f"• 融資餘額: {fmt_bal_chg(margin.get('margin_balance'), margin.get('margin_change'))}")
-        out.append(f"• 融券餘額: {fmt_bal_chg(margin.get('short_balance'),  margin.get('short_change'))}")
+        out.append(f"• 融券餘額: {fmt_bal_chg(margin.get('short_balance'), margin.get('short_change'))}")
         out.append(f"  (日期: {margin.get('date')}, 市場代碼推定: {margin.get('id')})")
     else:
         out.append(f"⚠️ 無法抓取融資融券數據 ({margin.get('error') if isinstance(margin, dict) else '未知錯誤'})")
@@ -1076,7 +991,7 @@ def analyze_stock_technical(stock_id: str) -> str:
     ma60 = df_daily["Close"].rolling(60).mean().iloc[-1]
     out.append(f"• 均線: MA5={float(ma5):.2f}, MA20={float(ma20):.2f}, MA60={float(ma60):.2f}")
 
-    # Volume fallback
+    # Volume fallback (show in 張)
     vol_today = float(latest_daily["Volume"]) if "Volume" in latest_daily else float("nan")
     vol_yesterday = float(prev_daily["Volume"]) if "Volume" in prev_daily else float("nan")
 
@@ -1127,15 +1042,15 @@ def analyze_stock_technical(stock_id: str) -> str:
 
     current_year = datetime.now().year
     avwap = calculate_avwap(df_daily, f"{current_year}-01-01")
-    if avwap is not None and not avwap.empty and np.isfinite(float(avwap.iloc[-1])):
+    if avwap is not None and (not avwap.empty) and np.isfinite(float(avwap.iloc[-1])):
         dist = (float(latest_daily["Close"]) - float(avwap.iloc[-1])) / float(avwap.iloc[-1]) * 100
         out.append(f"• AVWAP (YTD): {float(avwap.iloc[-1]):.2f} (乖離: {dist:+.2f}%)")
     else:
         out.append("• AVWAP (YTD): 資料不足")
     out.append("-" * 50)
 
-    # Pattern detection (no chart)
-try:
+    # Pattern detection
+    try:
         patterns = detect_patterns(df_daily)
         out.append("🧠 型態辨識（M頭 / W底 / 收斂三角）:")
         if not patterns:
@@ -1162,3 +1077,5 @@ try:
         out.append("🧠 型態辨識：計算失敗（資料不足或格式異常）")
         out.append("-" * 50)
 
+    out.append("=" * 50)
+    return "\n".join(out)
