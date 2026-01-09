@@ -1135,7 +1135,7 @@ def analyze_stock_technical(stock_id: str) -> str:
     out.append("-" * 50)
 
     # Pattern detection (no chart)
-    try:
+try:
         patterns = detect_patterns(df_daily)
         out.append("🧠 型態辨識（M頭 / W底 / 收斂三角）:")
         if not patterns:
@@ -1145,7 +1145,7 @@ def analyze_stock_technical(stock_id: str) -> str:
                 if p["pattern"].startswith("M頭"):
                     out.append(
                         f"• {p['pattern']}：{p['status']} | 頸線 {p['neckline']:.2f} | 目標 {p['target']:.2f} "
-                        f"(頭1 {p['peak1_date']} {p['peak1']:.2f}, 頭2 {p['peak2_date']} {p['peak2']:.2f)"
+                        f"(頭1 {p['peak1_date']} {p['peak1']:.2f}, 頭2 {p['peak2_date']} {p['peak2']:.2f})"
                     )
                 elif p["pattern"].startswith("W底"):
                     out.append(
@@ -1162,5 +1162,3 @@ def analyze_stock_technical(stock_id: str) -> str:
         out.append("🧠 型態辨識：計算失敗（資料不足或格式異常）")
         out.append("-" * 50)
 
-    out.append("=" * 50)
-    return "\n".join(out)
