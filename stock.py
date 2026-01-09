@@ -1,5 +1,7 @@
+# stock.py
 import io
 import re
+import time
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -10,6 +12,7 @@ import yfinance as yf
 # Optional: helps some SSL envs
 try:
     import truststore
+
     truststore.inject_into_ssl()
 except Exception:
     pass
@@ -275,8 +278,9 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
             )
 
             # 投信
-            trust_col = find_first(colmap, lambda nk: ("投信" in nk) and ("買賣超" in nk)) \
-                        or find_first(colmap, lambda nk: "投信" in nk)
+            trust_col = find_first(colmap, lambda nk: ("投信" in nk) and ("買賣超" in nk)) or find_first(
+                colmap, lambda nk: "投信" in nk
+            )
 
             # 自營商（總）
             dealer_total_col = find_first(
@@ -289,11 +293,11 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
             )
             dealer_self_col = find_first(
                 colmap,
-                lambda nk: ("自營商" in nk) and ("自行買賣" in nk) and ("買賣超" in nk) and ("外資" not in nk)
+                lambda nk: ("自營商" in nk) and ("自行買賣" in nk) and ("買賣超" in nk) and ("外資" not in nk),
             )
             dealer_hedge_col = find_first(
                 colmap,
-                lambda nk: ("自營商" in nk) and ("避險" in nk) and ("買賣超" in nk) and ("外資" not in nk)
+                lambda nk: ("自營商" in nk) and ("避險" in nk) and ("買賣超" in nk) and ("外資" not in nk),
             )
 
             foreign = _safe_int(row.iloc[0][foreign_col]) if foreign_col else None
@@ -311,15 +315,11 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
             if foreign is None:
                 buy_col = find_first(
                     colmap,
-                    lambda nk: is_foreign_usable(nk)
-                    and (("買進" in nk) or ("買入" in nk))
-                    and ("買賣超" not in nk),
+                    lambda nk: is_foreign_usable(nk) and (("買進" in nk) or ("買入" in nk)) and ("買賣超" not in nk),
                 )
                 sell_col = find_first(
                     colmap,
-                    lambda nk: is_foreign_usable(nk)
-                    and ("賣出" in nk)
-                    and ("買賣超" not in nk),
+                    lambda nk: is_foreign_usable(nk) and ("賣出" in nk) and ("買賣超" not in nk),
                 )
                 buy_v = _safe_int(row.iloc[0][buy_col]) if buy_col else None
                 sell_v = _safe_int(row.iloc[0][sell_col]) if sell_col else None
@@ -331,12 +331,309 @@ def get_institutional_data(stock_id, trade_date, market_hint=None):
                 "id": f"{stock_no}{yf_suffix}",
                 "date": d.strftime("%Y-%m-%d"),
                 "foreign": foreign,  # 股
-                "trust": trust,      # 股
-                "dealer": dealer,    # 股
+                "trust": trust,  # 股
+                "dealer": dealer,  # 股
                 "error": None,
             }
 
     return {"error": last_error or "未知錯誤", "id": f"{stock_no}.TW"}
+
+
+# ---------------------------
+# Margin Trading (融資融券) - TWSE / TPEx
+# ---------------------------
+def _parse_twse_json_table(obj):
+    if not isinstance(obj, dict):
+        return None
+    fields = obj.get("fields")
+    data = obj.get("data")
+    if not fields or not data:
+        return None
+    try:
+        return pd.DataFrame(data, columns=fields)
+    except Exception:
+        return None
+
+
+def _twse_margin_json(date_yyyymmdd: str, headers: dict):
+    urls = [
+        f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
+        f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
+        f"https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN?date={date_yyyymmdd}&selectType=ALL",
+    ]
+    last_err = None
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code != 200 or not r.text:
+                last_err = f"TWSE HTTP {r.status_code}"
+                continue
+            try:
+                j = r.json()
+            except Exception:
+                last_err = "TWSE JSON 解析失敗"
+                continue
+
+            if isinstance(j, list):
+                df = pd.DataFrame(j)
+                if df is not None and not df.empty:
+                    return df, None
+                last_err = "TWSE list 回傳空資料"
+                continue
+
+            df = _parse_twse_json_table(j)
+            if df is not None and not df.empty:
+                return df, None
+
+            last_err = "TWSE 回傳格式不支援/空資料"
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return None, last_err or "TWSE 取資料失敗"
+
+
+def _parse_tpex_margin_csv(text: str):
+    if not text:
+        return None
+    text = text.replace("\ufeff", "").replace("\r", "")
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    start = None
+    for i, ln in enumerate(lines):
+        if ("代號" in ln) and ("名稱" in ln) and ("資" in ln or "融資" in ln):
+            start = i
+            break
+    if start is None:
+        return None
+
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("*****") or lines[j].startswith("說明") or lines[j].startswith("備註"):
+            end = j
+            break
+
+    csv_text = "\n".join(lines[start:end])
+    try:
+        return pd.read_csv(io.StringIO(csv_text))
+    except Exception:
+        return None
+
+
+def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None):
+    """
+    回傳單位：張
+      margin_balance, margin_change, short_balance, short_change
+    """
+    stock_no = stock_id.strip().upper().replace(".TW", "").replace(".TWO", "")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
+    prefer_twse = True
+    if isinstance(market_hint, str) and market_hint.upper().endswith(".TWO"):
+        prefer_twse = False
+
+    def norm(s):
+        s = str(s).replace("\ufeff", "")
+        s = s.replace("（", "(").replace("）", ")")
+        s = re.sub(r"\s+", "", s)
+        return s
+
+    last_error = None
+
+    for back in range(0, 10):
+        d = trade_date - timedelta(days=back)
+
+        # ---------- TWSE ----------
+        if prefer_twse:
+            ymd = d.strftime("%Y%m%d")
+            df, err = _twse_margin_json(ymd, headers=headers)
+            if df is None or df.empty:
+                last_error = err
+            else:
+                colmap = {norm(c): c for c in df.columns}
+
+                code_col = (
+                    colmap.get("股票代號")
+                    or colmap.get("證券代號")
+                    or colmap.get("證券代碼")
+                    or colmap.get("SecuritiesCode")
+                    or colmap.get("SecurityCode")
+                    or colmap.get("Code")
+                )
+                if not code_col:
+                    last_error = "TWSE 欄位找不到代號欄"
+                else:
+                    sub = df[df[code_col].astype(str).str.strip() == stock_no]
+                    if sub.empty:
+                        last_error = f"TWSE 找不到 {stock_no}"
+                    else:
+                        row = sub.iloc[0]
+
+                        def find_col(contains):
+                            for nk, orig in colmap.items():
+                                ok = True
+                                for kw in contains:
+                                    if kw not in nk:
+                                        ok = False
+                                        break
+                                if ok:
+                                    return orig
+                            return None
+
+                        # 優先抓「餘額」「增減」
+                        m_bal_col = find_col(["融資", "餘額"]) or find_col(["資", "餘額"])
+                        m_chg_col = find_col(["融資", "增減"]) or find_col(["資", "增減"])
+
+                        s_bal_col = find_col(["融券", "餘額"]) or find_col(["券", "餘額"])
+                        s_chg_col = find_col(["融券", "增減"]) or find_col(["券", "增減"])
+
+                        # 若沒有增減，退回用 今日-前日
+                        m_today_col = find_col(["融資", "今日", "餘額"]) or m_bal_col
+                        m_prev_col = find_col(["融資", "前日", "餘額"]) or find_col(["融資", "前一日", "餘額"])
+
+                        s_today_col = find_col(["融券", "今日", "餘額"]) or s_bal_col
+                        s_prev_col = find_col(["融券", "前日", "餘額"]) or find_col(["融券", "前一日", "餘額"])
+
+                        m_bal = _safe_int(row[m_bal_col]) if m_bal_col else None
+                        s_bal = _safe_int(row[s_bal_col]) if s_bal_col else None
+
+                        m_chg = _safe_int(row[m_chg_col]) if m_chg_col else None
+                        s_chg = _safe_int(row[s_chg_col]) if s_chg_col else None
+
+                        if m_chg is None:
+                            m_today = _safe_int(row[m_today_col]) if m_today_col else None
+                            m_prev = _safe_int(row[m_prev_col]) if m_prev_col else None
+                            if m_today is not None and m_prev is not None:
+                                m_chg = m_today - m_prev
+                                if m_bal is None:
+                                    m_bal = m_today
+
+                        if s_chg is None:
+                            s_today = _safe_int(row[s_today_col]) if s_today_col else None
+                            s_prev = _safe_int(row[s_prev_col]) if s_prev_col else None
+                            if s_today is not None and s_prev is not None:
+                                s_chg = s_today - s_prev
+                                if s_bal is None:
+                                    s_bal = s_today
+
+                        # TWSE 這張報表通常單位就是「張」
+                        return {
+                            "id": f"{stock_no}.TW",
+                            "date": d.strftime("%Y-%m-%d"),
+                            "margin_balance": m_bal,
+                            "margin_change": m_chg,
+                            "short_balance": s_bal,
+                            "short_change": s_chg,
+                            "error": None,
+                        }
+
+        # ---------- TPEx (.TWO) ----------
+        else:
+            roc_year = d.year - 1911
+            roc_date = f"{roc_year:03d}/{d.month:02d}/{d.day:02d}"
+
+            url_csv = (
+                "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
+                f"?l=zh-tw&d={roc_date}&o=csv&s=0,asc"
+            )
+            url_htm = (
+                "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
+                f"?l=zh-tw&d={roc_date}&o=htm&s=0,asc"
+            )
+
+            try:
+                r = requests.get(url_csv, headers=headers, timeout=15)
+                df = _parse_tpex_margin_csv(r.text) if (r.status_code == 200 and r.text and len(r.text) > 200) else None
+
+                if df is None or df.empty:
+                    r2 = requests.get(url_htm, headers=headers, timeout=15)
+                    if r2.status_code == 200 and r2.text and len(r2.text) > 200:
+                        try:
+                            tables = pd.read_html(r2.text)
+                            df = tables[0] if tables else None
+                        except Exception:
+                            df = None
+
+                if df is None or df.empty:
+                    last_error = f"TPEx 無資料/解析失敗（{roc_date}）"
+                    continue
+
+                colmap = {norm(c): c for c in df.columns}
+                code_col = colmap.get("代號") or colmap.get("股票代號") or colmap.get("證券代號")
+                if not code_col:
+                    last_error = "TPEx 欄位找不到代號欄"
+                    continue
+
+                sub = df[df[code_col].astype(str).str.strip() == stock_no]
+                if sub.empty:
+                    last_error = f"TPEx 找不到 {stock_no}"
+                    continue
+                row = sub.iloc[0]
+
+                def find_col_contains(*contains):
+                    for nk, orig in colmap.items():
+                        ok = True
+                        for kw in contains:
+                            if kw not in nk:
+                                ok = False
+                                break
+                        if ok:
+                            return orig
+                    return None
+
+                # 先抓「餘額」「增減」
+                m_bal_col = (
+                    colmap.get("資餘額(張)")
+                    or colmap.get("資餘額")
+                    or find_col_contains("資", "餘額")
+                    or find_col_contains("融資", "餘額")
+                )
+                m_chg_col = colmap.get("資餘額增減(張)") or colmap.get("資餘額增減") or find_col_contains("資", "增減")
+
+                s_bal_col = (
+                    colmap.get("券餘額(張)")
+                    or colmap.get("券餘額")
+                    or find_col_contains("券", "餘額")
+                    or find_col_contains("融券", "餘額")
+                )
+                s_chg_col = colmap.get("券餘額增減(張)") or colmap.get("券餘額增減") or find_col_contains("券", "增減")
+
+                # 沒增減時，用今日-前日
+                m_prev_col = colmap.get("前資餘額(張)") or colmap.get("前資餘額") or find_col_contains("前資", "餘額")
+                s_prev_col = colmap.get("前券餘額(張)") or colmap.get("前券餘額") or find_col_contains("前券", "餘額")
+
+                m_bal = _safe_int(row[m_bal_col]) if m_bal_col else None
+                s_bal = _safe_int(row[s_bal_col]) if s_bal_col else None
+                m_chg = _safe_int(row[m_chg_col]) if m_chg_col else None
+                s_chg = _safe_int(row[s_chg_col]) if s_chg_col else None
+
+                if m_chg is None:
+                    m_prev = _safe_int(row[m_prev_col]) if m_prev_col else None
+                    if m_bal is not None and m_prev is not None:
+                        m_chg = m_bal - m_prev
+
+                if s_chg is None:
+                    s_prev = _safe_int(row[s_prev_col]) if s_prev_col else None
+                    if s_bal is not None and s_prev is not None:
+                        s_chg = s_bal - s_prev
+
+                return {
+                    "id": f"{stock_no}.TWO",
+                    "date": d.strftime("%Y-%m-%d"),
+                    "margin_balance": m_bal,
+                    "margin_change": m_chg,
+                    "short_balance": s_bal,
+                    "short_change": s_chg,
+                    "error": None,
+                }
+
+            except Exception as e:
+                last_error = f"TPEx 取資料失敗: {e}"
+                continue
+
+    return {"error": last_error or "未知錯誤"}
 
 
 # ---------------------------
@@ -441,7 +738,7 @@ def _find_pivots(df: pd.DataFrame, left: int = 3, right: int = 3):
 def _between(df, a_pos: int, b_pos: int) -> pd.DataFrame:
     lo = min(a_pos, b_pos)
     hi = max(a_pos, b_pos)
-    return df.iloc[lo:hi+1]
+    return df.iloc[lo : hi + 1]
 
 
 def _pct_diff(a: float, b: float) -> float:
@@ -450,13 +747,15 @@ def _pct_diff(a: float, b: float) -> float:
     return abs(a - b) / abs(a)
 
 
-def detect_double_top(df: pd.DataFrame,
-                      lookback: int = 120,
-                      pivot_lr: int = 3,
-                      peak_tol: float = 0.018,
-                      min_gap: int = 8,
-                      max_gap: int = 60,
-                      confirm_margin: float = 0.003):
+def detect_double_top(
+    df: pd.DataFrame,
+    lookback: int = 120,
+    pivot_lr: int = 3,
+    peak_tol: float = 0.018,
+    min_gap: int = 8,
+    max_gap: int = 60,
+    confirm_margin: float = 0.003,
+):
     if df is None or df.empty:
         return None
 
@@ -502,17 +801,19 @@ def detect_double_top(df: pd.DataFrame,
         "peak1": peak1,
         "peak2": peak2,
         "neckline": neckline,
-        "target": target
+        "target": target,
     }
 
 
-def detect_double_bottom(df: pd.DataFrame,
-                         lookback: int = 160,
-                         pivot_lr: int = 3,
-                         trough_tol: float = 0.020,
-                         min_gap: int = 8,
-                         max_gap: int = 80,
-                         confirm_margin: float = 0.003):
+def detect_double_bottom(
+    df: pd.DataFrame,
+    lookback: int = 160,
+    pivot_lr: int = 3,
+    trough_tol: float = 0.020,
+    min_gap: int = 8,
+    max_gap: int = 80,
+    confirm_margin: float = 0.003,
+):
     if df is None or df.empty:
         return None
 
@@ -558,16 +859,18 @@ def detect_double_bottom(df: pd.DataFrame,
         "trough1": trough1,
         "trough2": trough2,
         "neckline": neckline,
-        "target": target
+        "target": target,
     }
 
 
-def detect_sym_triangle(df: pd.DataFrame,
-                        lookback: int = 180,
-                        pivot_lr: int = 3,
-                        need_points: int = 3,
-                        tighten_ratio: float = 0.65,
-                        breakout_margin: float = 0.003):
+def detect_sym_triangle(
+    df: pd.DataFrame,
+    lookback: int = 180,
+    pivot_lr: int = 3,
+    need_points: int = 3,
+    tighten_ratio: float = 0.65,
+    breakout_margin: float = 0.003,
+):
     if df is None or df.empty:
         return None
 
@@ -598,8 +901,8 @@ def detect_sym_triangle(df: pd.DataFrame,
     if not (ah < 0 and al > 0):
         return None
 
-    early = sub.iloc[: max(30, len(sub)//3)]
-    late = sub.iloc[-max(30, len(sub)//3):]
+    early = sub.iloc[: max(30, len(sub) // 3)]
+    late = sub.iloc[-max(30, len(sub) // 3) :]
     early_range = float(early["High"].max() - early["Low"].min())
     late_range = float(late["High"].max() - late["Low"].min())
 
@@ -628,7 +931,7 @@ def detect_sym_triangle(df: pd.DataFrame,
         "lower_now": float(lower_now),
         "high_pivots": [(str(p[1].date()), float(p[2])) for p in highs],
         "low_pivots": [(str(p[1].date()), float(p[2])) for p in lows],
-        "range_shrink": float(late_range / early_range)
+        "range_shrink": float(late_range / early_range),
     }
 
 
@@ -681,6 +984,7 @@ def analyze_stock_technical(stock_id: str) -> str:
     latest_trade_date = df_daily.index[-1].date()
 
     chips = get_institutional_data(stock_id, trade_date=latest_trade_date, market_hint=yf_ticker)
+    margin = get_margin_short_data(stock_id, trade_date=latest_trade_date, market_hint=yf_ticker)
 
     out.append("")
     out.append("=" * 50)
@@ -701,16 +1005,21 @@ def analyze_stock_technical(stock_id: str) -> str:
         low_p = float(row["Low"])
         loc = df_daily.index.get_loc(idx)
         change = close_p - float(df_daily.iloc[loc - 1]["Close"]) if loc > 0 else 0.0
-        out.append(f"{date_str:<12} {close_p:<12.2f} {change:<+12.2f} {get_k_status(open_p, close_p, high_p, low_p)}")
+        out.append(
+            f"{date_str:<12} {close_p:<12.2f} {change:<+12.2f} {get_k_status(open_p, close_p, high_p, low_p)}"
+        )
     out.append("-" * 50)
 
     # Candle pattern
-    out.append(f"🕯 當日K棒型態: {describe_candle(latest_daily['Open'], latest_daily['High'], latest_daily['Low'], latest_daily['Close'])}")
+    out.append(
+        f"🕯 當日K棒型態: {describe_candle(latest_daily['Open'], latest_daily['High'], latest_daily['Low'], latest_daily['Close'])}"
+    )
     out.append("-" * 50)
 
     # Chips (shares -> lots)
     out.append("💰 籌碼面 (三大法人):")
     if isinstance(chips, dict) and chips.get("error") is None:
+
         def fmt_to_lots(v_shares):
             v = _safe_int(v_shares)
             if v is None:
@@ -728,6 +1037,27 @@ def analyze_stock_technical(stock_id: str) -> str:
         out.append(f"  (日期: {chips.get('date')}, 市場代碼推定: {chips.get('id')})")
     else:
         out.append(f"⚠️ 無法抓取三大法人數據 ({chips.get('error') if isinstance(chips, dict) else '未知錯誤'})")
+    out.append("-" * 50)
+
+    # Margin Trading (already in lots)
+    out.append("💸 融資融券（散戶槓桿指標）:")
+    if isinstance(margin, dict) and margin.get("error") is None:
+
+        def fmt_bal_chg(bal, chg):
+            b = _safe_int(bal)
+            c = _safe_int(chg)
+            if b is None:
+                return "n/a"
+            if c is None:
+                return f"{b:,} 張"
+            sign = "+" if c > 0 else ""
+            return f"{b:,} 張（較前日 {sign}{c:,} 張）"
+
+        out.append(f"• 融資餘額: {fmt_bal_chg(margin.get('margin_balance'), margin.get('margin_change'))}")
+        out.append(f"• 融券餘額: {fmt_bal_chg(margin.get('short_balance'),  margin.get('short_change'))}")
+        out.append(f"  (日期: {margin.get('date')}, 市場代碼推定: {margin.get('id')})")
+    else:
+        out.append(f"⚠️ 無法抓取融資融券數據 ({margin.get('error') if isinstance(margin, dict) else '未知錯誤'})")
     out.append("-" * 50)
 
     # Long trend
@@ -815,7 +1145,7 @@ def analyze_stock_technical(stock_id: str) -> str:
                 if p["pattern"].startswith("M頭"):
                     out.append(
                         f"• {p['pattern']}：{p['status']} | 頸線 {p['neckline']:.2f} | 目標 {p['target']:.2f} "
-                        f"(頭1 {p['peak1_date']} {p['peak1']:.2f}, 頭2 {p['peak2_date']} {p['peak2']:.2f})"
+                        f"(頭1 {p['peak1_date']} {p['peak1']:.2f}, 頭2 {p['peak2_date']} {p['peak2']:.2f)"
                     )
                 elif p["pattern"].startswith("W底"):
                     out.append(
