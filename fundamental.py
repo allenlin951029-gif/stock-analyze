@@ -2,6 +2,7 @@
 import io
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
@@ -98,16 +99,20 @@ def _mops_monthly_revenue_latest(stock_no: str):
 
     ym = rec.get(ym_col) if ym_col else None
     yoy = _safe_float(rec.get(yoy_col)) if yoy_col else None
-
     return {"ym": ym, "yoy": yoy}
 
 
 def _nearest_trading_date(df: pd.DataFrame, dt: datetime):
+    """
+    找 df.index 中距離 dt 最近的交易日
+    ✅ 修正：不使用 TimedeltaIndex.abs()，改用 numpy.abs()
+    """
     if df is None or df.empty:
         return None
     idx = pd.to_datetime(df.index)
     target = pd.to_datetime(dt)
-    pos = (idx - target).abs().argmin()
+    diffs = (idx - target).to_numpy(dtype="timedelta64[ns]")
+    pos = int(np.abs(diffs).argmin())
     return idx[pos].to_pydatetime()
 
 
