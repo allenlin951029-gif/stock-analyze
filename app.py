@@ -11,7 +11,7 @@ from streamlit_cookies_manager import EncryptedCookieManager
 from stock import analyze_stock_technical, analyze_sector_performance, SECTOR_DICT
 
 st.set_page_config(page_title="Stock Analyze", layout="wide")
-st.title("Stock Analyze (翻頁紀錄版)")
+st.title("Stock Analyze")
 
 # -------------------------
 # Cookies (保留原本儲存 代號歷史 的功能)
@@ -192,7 +192,7 @@ with st.sidebar:
         st.caption("尚無歷史紀錄")
     
     st.divider()
-    st.info("💡 下方主畫面可翻頁查看最近 10 次的分析結果。")
+
 
 # -------------------------
 # Main Input Area (Tabs)
@@ -318,3 +318,4 @@ if archive_len > 0:
 
 else:
     st.info("尚未分析或目前沒有紀錄。請在上方選擇「個股」或「族群」並開始分析。")
+
