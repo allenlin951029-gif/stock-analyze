@@ -1177,14 +1177,18 @@ SECTOR_DICT = {
     "手機與 IC 設計": ["QCOM"]
 }
 
-def analyze_sector_performance(sector_key: str):
+def analyze_sector_performance(sector_key: str, as_of_date=None):
     tickers = SECTOR_DICT.get(sector_key, [])
     if not tickers:
         return f"❌ 無效的族群名稱：{sector_key}"
     
+    # 預設為今天
+    if as_of_date is None:
+        as_of_date = datetime.now().date()
+    
     out = []
     out.append(f"📊 {sector_key} 族群行情快篩")
-    out.append(f"📅 抓取最新收盤價 (Last Market Close)")
+    out.append(f"📅 資料日期: {as_of_date}")
     out.append("=" * 45)
     
     total_pct = 0.0
@@ -1193,16 +1197,28 @@ def analyze_sector_performance(sector_key: str):
     
     for t in tickers:
         try:
-            # 抓取最近 5 天資料，確保計算出漲跌幅
-            df = yf.Ticker(t).history(period="5d")
+            # 抓取過去 1 年資料，以便涵蓋選定日期
+            df = yf.Ticker(t).history(period="1y")
             df = _ensure_naive_index(df)
             
-            if len(df) < 2:
-                results.append((t, None, None, "資料不足"))
+            # 找出最近交易日
+            ts = _nearest_trading_ts(df, as_of_date)
+            
+            if ts is None:
+                 results.append((t, None, None, f"日期 {as_of_date} 附近無資料"))
+                 continue
+                 
+            # 取得該日期的位置
+            loc = df.index.get_loc(ts)
+            
+            if loc < 1:
+                # 無前一日資料，無法計算漲跌
+                val = float(df.iloc[loc]['Close'])
+                results.append((t, val, None, "資料不足(無前日)"))
                 continue
             
-            latest = df.iloc[-1]
-            prev = df.iloc[-2]
+            latest = df.iloc[loc]
+            prev = df.iloc[loc-1]
             
             price = float(latest["Close"])
             prev_price = float(prev["Close"])
@@ -1225,21 +1241,20 @@ def analyze_sector_performance(sector_key: str):
     out.append("-" * 45)
     
     # 列表 Header
-    out.append(f"{'代號':<10} {'最新收盤':<12} {'漲跌幅':<10}")
+    out.append(f"{'代號':<10} {'收盤價':<12} {'漲跌幅':<10}")
     out.append("-" * 45)
     
     for res in results:
         t, price, pct, err = res
         if err:
-            out.append(f"{t:<10} {'N/A':<12} {err}")
+            p_s = f"{price:.2f}" if price is not None else "N/A"
+            out.append(f"{t:<10} {p_s:<12} {err}")
         else:
-            # 判斷顏色符號 (美股習慣: 綠漲紅跌? 台股: 紅漲綠跌。這裡維持 App 原本邏輯: 紅=漲)
-            # 但其實 yfinance 主要是美股。為了統一體驗，假設使用者習慣台股顏色 (紅=漲)
             pct_s = f"{pct:+.2f}%"
             p_s = f"{price:.2f}"
             out.append(f"{t:<10} {p_s:<12} {pct_s}")
             
     out.append("-" * 45)
-    out.append("註：漲跌幅為 (最新收盤 - 前日收盤) / 前日收盤")
+    out.append("註：漲跌幅為 (選定日收盤 - 前一交易日收盤) / 前一交易日收盤")
     
     return "\n".join(out)
