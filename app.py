@@ -184,7 +184,7 @@ with st.sidebar:
         st.caption("尚無歷史紀錄")
     
     st.divider()
-    st.info("")
+
 
 # -------------------------
 # Main
@@ -283,5 +283,6 @@ if archive_len > 0:
 
 else:
     st.info("尚未分析或目前沒有紀錄。請輸入代號並按「開始分析」。")
+
 
 
