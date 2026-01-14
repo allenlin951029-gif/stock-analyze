@@ -11,7 +11,7 @@ from streamlit_cookies_manager import EncryptedCookieManager
 from stock import analyze_stock_technical
 
 st.set_page_config(page_title="Stock Analyze", layout="wide")
-st.title("Stock Analyze ")
+st.title("Stock Analyze (翻頁紀錄版)")
 
 # -------------------------
 # Cookies (保留原本儲存 代號歷史 的功能)
@@ -96,7 +96,6 @@ def push_history_cookie(stock_id: str):
 def run_analysis(stock_id: str, as_of_date, write_history: bool):
     sid = stock_id.strip().upper()
     if not sid:
-        # 如果是空的，不做任何存檔動作，直接返回
         return
 
     st.session_state.current_id = sid
@@ -115,13 +114,7 @@ def run_analysis(stock_id: str, as_of_date, write_history: bool):
             ret = analyze_stock_technical(sid, as_of_date=as_of_date)
 
         stdout_text = buf.getvalue()
-        ret_len = len(ret) if isinstance(ret, str) else -1
-
-        st.session_state._last_debug = (
-            f"ret_type={type(ret).__name__}, ret_len={ret_len}, "
-            f"ret_is_none={ret is None}, stdout_len={len(stdout_text)}"
-        )
-
+        
         if isinstance(ret, str) and ret.strip():
             final_report = ret
         elif stdout_text.strip():
@@ -146,11 +139,11 @@ def run_analysis(stock_id: str, as_of_date, write_history: bool):
     # 加入列表尾端
     st.session_state.results_archive.append(record)
     
-    # 限制最多 10 筆 (先進先出)
+    # 限制最多 10 筆
     if len(st.session_state.results_archive) > 10:
         st.session_state.results_archive.pop(0)
     
-    # 自動跳轉到最新一頁 (最後一筆)
+    # 自動跳轉到最新一頁
     st.session_state.view_index = len(st.session_state.results_archive) - 1
 
 
@@ -164,7 +157,6 @@ with st.sidebar:
     if auto:
         tick = st_autorefresh(interval=10_000, key="autorefresh_10s")
         st.caption(f"autorefresh tick = {tick}")
-    st.caption(f"debug: {st.session_state._last_debug}")
 
     st.divider()
     st.subheader("搜尋歷史（前 5 筆）")
@@ -184,7 +176,7 @@ with st.sidebar:
         st.caption("尚無歷史紀錄")
     
     st.divider()
-
+    st.info("💡 下方主畫面可翻頁查看最近 10 次的分析結果。")
 
 # -------------------------
 # Main
@@ -215,10 +207,9 @@ with col2:
 if search:
     with st.spinner(f"正在分析 {stock_id.strip().upper()} ..."):
         run_analysis(stock_id, st.session_state.as_of_date, write_history=True)
-        # 分析完需要 rerun 讓下方的 view_index 更新生效
         st.rerun()
 
-# 2) 自動刷新：只在 tick 有變化時跑一次（不寫歷史）
+# 2) 自動刷新
 if auto:
     if tick != st.session_state.last_tick:
         st.session_state.last_tick = tick
@@ -229,7 +220,7 @@ if auto:
 st.divider()
 
 # -------------------------
-# Pagination Display (翻頁顯示)
+# Pagination Display (並排按鈕版)
 # -------------------------
 archive_len = len(st.session_state.results_archive)
 
@@ -243,46 +234,41 @@ if archive_len > 0:
     current_idx = st.session_state.view_index
     record = st.session_state.results_archive[current_idx]
     
-    # 建立控制列：上一頁 | 資訊 | 下一頁
-    nav_c1, nav_c2, nav_c3 = st.columns([1, 2, 1])
+    # 1. 資訊卡片 (上方)
+    st.markdown(
+        f"""
+        <div style="text-align: center; background-color: #262730; padding: 10px; border-radius: 5px; border: 1px solid #464b5c; margin-bottom: 10px;">
+            <span style="font-size: 1.2em; font-weight: bold; color: #ffffff;">
+                {record['id']}
+            </span>
+            <span style="color: #cccccc; font-size: 0.9em; margin-left: 10px;">
+                ({record['date']})
+            </span>
+            <br>
+            <span style="font-size: 0.8em; color: #aaaaaa;">
+                第 {current_idx + 1} / {archive_len} 筆紀錄 (分析時間: {record['created_at']})
+            </span>
+        </div>
+        """, 
+        unsafe_allow_html=True
+    )
+
+    # 2. 按鈕並排 (下方置中)
+    # 版面配置: [空白] [上一頁] [下一頁] [空白]
+    c_space_l, c_prev, c_next, c_space_r = st.columns([2, 1, 1, 2])
     
-    with nav_c1:
-        # 第一頁時禁用上一頁
+    with c_prev:
         if st.button("⬅️ 上一頁", disabled=(current_idx == 0), use_container_width=True):
             st.session_state.view_index -= 1
             st.rerun()
             
-    with nav_c3:
-        # 最後一頁時禁用下一頁
+    with c_next:
         if st.button("下一頁 ➡️", disabled=(current_idx == archive_len - 1), use_container_width=True):
             st.session_state.view_index += 1
             st.rerun()
 
-    with nav_c2:
-        st.markdown(
-            f"""
-            <div style="text-align: center; background-color: #262730; padding: 10px; border-radius: 5px; border: 1px solid #464b5c;">
-                <span style="font-size: 1.2em; font-weight: bold; color: #ffffff;">
-                    {record['id']}
-                </span>
-                <br>
-                <span style="color: #cccccc; font-size: 0.9em;">
-                    資料日期: {record['date']} | 分析時間: {record['created_at']}
-                </span>
-                <br>
-                <span style="font-size: 0.8em; color: #aaaaaa;">
-                    (第 {current_idx + 1} / {archive_len} 筆紀錄)
-                </span>
-            </div>
-            """, 
-            unsafe_allow_html=True
-        )
-
-    # 顯示報告內容
+    # 3. 顯示報告內容
     st.code(record['content'], language="text")
 
 else:
     st.info("尚未分析或目前沒有紀錄。請輸入代號並按「開始分析」。")
-
-
-
