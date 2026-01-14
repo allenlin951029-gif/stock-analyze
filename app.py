@@ -11,7 +11,7 @@ from streamlit_cookies_manager import EncryptedCookieManager
 from stock import analyze_stock_technical
 
 st.set_page_config(page_title="Stock Analyze", layout="wide")
-st.title("Stock Analyze (翻頁紀錄版)")
+st.title("Stock Analyze ")
 
 # -------------------------
 # Cookies (保留原本儲存 代號歷史 的功能)
@@ -283,3 +283,4 @@ if archive_len > 0:
 
 else:
     st.info("尚未分析或目前沒有紀錄。請輸入代號並按「開始分析」。")
+
