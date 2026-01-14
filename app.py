@@ -7,11 +7,11 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from streamlit_cookies_manager import EncryptedCookieManager
 
-# 假設 stock.py 在同一目錄下，且未更動
-from stock import analyze_stock_technical
+# 引入 stock.py 中的函式與變數
+from stock import analyze_stock_technical, analyze_sector_performance, SECTOR_DICT
 
 st.set_page_config(page_title="Stock Analyze", layout="wide")
-st.title("Stock Analyze ")
+st.title("Stock Analyze (翻頁紀錄版)")
 
 # -------------------------
 # Cookies (保留原本儲存 代號歷史 的功能)
@@ -93,7 +93,26 @@ def push_history_cookie(stock_id: str):
     st.session_state.history = st.session_state.history[:5]
     save_history_to_cookie(st.session_state.history)
 
+def save_to_archive(display_title, display_date, content):
+    """將結果存入 Archive 並跳轉"""
+    record = {
+        "id": display_title,
+        "date": str(display_date),
+        "content": content,
+        "created_at": datetime.now().strftime("%H:%M:%S")
+    }
+    
+    st.session_state.results_archive.append(record)
+    
+    # 限制最多 10 筆
+    if len(st.session_state.results_archive) > 10:
+        st.session_state.results_archive.pop(0)
+    
+    # 自動跳轉到最新一頁
+    st.session_state.view_index = len(st.session_state.results_archive) - 1
+
 def run_analysis(stock_id: str, as_of_date, write_history: bool):
+    """個股分析 (寫 Cookie 歷史 + 寫 Archive)"""
     sid = stock_id.strip().upper()
     if not sid:
         return
@@ -128,23 +147,19 @@ def run_analysis(stock_id: str, as_of_date, write_history: bool):
         final_report = f"⚠️ 分析失敗：{type(e).__name__}: {e}"
         st.session_state._last_debug = f"exception={type(e).__name__}"
 
-    # [新增] 將結果存入 Archive
-    record = {
-        "id": sid,
-        "date": str(as_of_date),
-        "content": final_report,
-        "created_at": datetime.now().strftime("%H:%M:%S")
-    }
+    save_to_archive(sid, as_of_date, final_report)
+
+def run_sector_analysis(sector_name: str):
+    """族群分析 (不寫 Cookie 歷史，只寫 Archive)"""
+    final_report = ""
+    try:
+        final_report = analyze_sector_performance(sector_name)
+    except Exception as e:
+        final_report = f"⚠️ 族群分析失敗：{e}"
     
-    # 加入列表尾端
-    st.session_state.results_archive.append(record)
-    
-    # 限制最多 10 筆
-    if len(st.session_state.results_archive) > 10:
-        st.session_state.results_archive.pop(0)
-    
-    # 自動跳轉到最新一頁
-    st.session_state.view_index = len(st.session_state.results_archive) - 1
+    # 日期顯示為 "Latest" 或今天
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    save_to_archive(f"族群: {sector_name}", today_str, final_report)
 
 
 # -------------------------
@@ -159,7 +174,7 @@ with st.sidebar:
         st.caption(f"autorefresh tick = {tick}")
 
     st.divider()
-    st.subheader("搜尋歷史（前 5 筆）")
+    st.subheader("個股搜尋歷史（前 5 筆）")
 
     if st.session_state.history:
         picked = st.selectbox("點選回查", st.session_state.history, index=0, key="history_pick")
@@ -168,6 +183,7 @@ with st.sidebar:
             if st.button("回查這筆", use_container_width=True, key="history_run"):
                 with st.spinner(f"正在分析 {picked} ..."):
                     run_analysis(picked, st.session_state.as_of_date, write_history=False)
+                    st.rerun()
         with col_b:
             if st.button("清除歷史", use_container_width=True, key="history_clear"):
                 st.session_state.history = []
@@ -179,48 +195,68 @@ with st.sidebar:
     st.info("💡 下方主畫面可翻頁查看最近 10 次的分析結果。")
 
 # -------------------------
-# Main
+# Main Input Area (Tabs)
 # -------------------------
-col1, col_mid, col2 = st.columns([2.0, 1.1, 1.0])
+tab1, tab2 = st.tabs(["📊 個股技術分析", "📈 族群漲跌快篩"])
 
-with col1:
-    stock_id = st.text_input(
-        "輸入股票代號（例：0050 / 2330 / 2330.TW / 6223.TWO）",
-        value=st.session_state.current_id,
-        key="stock_id_input",
-    )
+with tab1:
+    col1, col_mid, col2 = st.columns([2.0, 1.1, 1.0])
 
-with col_mid:
-    as_of = st.date_input(
-        "資料日期（預設今天）",
-        value=st.session_state.as_of_date,
-        key="as_of_date_input",
-    )
-    st.session_state.as_of_date = as_of
+    with col1:
+        stock_id = st.text_input(
+            "輸入股票代號（例：0050 / 2330 / 2330.TW / 6223.TWO）",
+            value=st.session_state.current_id,
+            key="stock_id_input",
+        )
 
-with col2:
-    st.write("")
-    st.write("")
-    search = st.button("開始分析", use_container_width=True, key="run_btn")
+    with col_mid:
+        as_of = st.date_input(
+            "資料日期（預設今天）",
+            value=st.session_state.as_of_date,
+            key="as_of_date_input",
+        )
+        st.session_state.as_of_date = as_of
 
-# 1) 手動分析（會寫歷史）
-if search:
-    with st.spinner(f"正在分析 {stock_id.strip().upper()} ..."):
-        run_analysis(stock_id, st.session_state.as_of_date, write_history=True)
-        st.rerun()
+    with col2:
+        st.write("")
+        st.write("")
+        search = st.button("開始分析個股", use_container_width=True, key="run_btn")
 
-# 2) 自動刷新
-if auto:
-    if tick != st.session_state.last_tick:
-        st.session_state.last_tick = tick
-        with st.spinner(f"自動更新中：{st.session_state.current_id} ..."):
-            run_analysis(st.session_state.current_id, st.session_state.as_of_date, write_history=False)
+    # 手動分析
+    if search:
+        with st.spinner(f"正在分析 {stock_id.strip().upper()} ..."):
+            run_analysis(stock_id, st.session_state.as_of_date, write_history=True)
             st.rerun()
+
+with tab2:
+    st.write("選擇四大類群，快速檢視最新收盤價與整體平均漲跌幅。")
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        # 直接從 SECTOR_DICT 取 keys
+        sector_opts = list(SECTOR_DICT.keys())
+        selected_sector = st.selectbox("選擇族群", sector_opts, key="sector_select")
+    with c2:
+        st.write("")
+        st.write("")
+        run_sector = st.button("分析族群", use_container_width=True, key="run_sector_btn")
+    
+    if run_sector:
+        with st.spinner(f"正在抓取 {selected_sector} 最新報價 ..."):
+            run_sector_analysis(selected_sector)
+            st.rerun()
+
+# 自動刷新邏輯 (只對個股有效，且簡單起見，只在 auto 開啟且 tick 變動時執行當前 ID)
+if auto and tick != st.session_state.last_tick:
+    st.session_state.last_tick = tick
+    # 自動刷新僅針對「個股」做更新，避免干擾族群分析
+    with st.spinner(f"自動更新中：{st.session_state.current_id} ..."):
+        run_analysis(st.session_state.current_id, st.session_state.as_of_date, write_history=False)
+        st.rerun()
 
 st.divider()
 
 # -------------------------
-# Pagination Display (並排按鈕版)
+# Pagination Display (共用顯示區)
 # -------------------------
 archive_len = len(st.session_state.results_archive)
 
@@ -234,7 +270,7 @@ if archive_len > 0:
     current_idx = st.session_state.view_index
     record = st.session_state.results_archive[current_idx]
     
-    # 1. 資訊卡片 (上方)
+    # 1. 資訊卡片
     st.markdown(
         f"""
         <div style="text-align: center; background-color: #262730; padding: 10px; border-radius: 5px; border: 1px solid #464b5c; margin-bottom: 10px;">
@@ -254,7 +290,6 @@ if archive_len > 0:
     )
 
     # 2. 按鈕並排 (下方置中)
-    # 版面配置: [空白] [上一頁] [下一頁] [空白]
     c_space_l, c_prev, c_next, c_space_r = st.columns([2, 1, 1, 2])
     
     with c_prev:
@@ -271,5 +306,4 @@ if archive_len > 0:
     st.code(record['content'], language="text")
 
 else:
-    st.info("尚未分析或目前沒有紀錄。請輸入代號並按「開始分析」。")
-
+    st.info("尚未分析或目前沒有紀錄。請在上方選擇「個股」或「族群」並開始分析。")
