@@ -1171,10 +1171,10 @@ def analyze_stock_technical(stock_id: str, as_of_date=None) -> str:
 # Sector Analysis (New)
 # =========================
 SECTOR_DICT = {
-    "記憶體族群": ["MU", "WDC"],
-    "被動元件族群": ["VSH", "6981.T"],
-    "AI 與伺服器族群": ["NVDA", "SMCI", "TSM"],
-    "手機與 IC 設計": ["QCOM"]
+    "記憶體族群": ["MU", "WDC", "000660.KS"],
+    "被動元件族群": ["VSH", "6981.T", "6976.T"],
+    "AI 與伺服器族群": ["NVDA", "SMCI", "TSM", "VRT"],
+    "手機與 IC 設計": ["QCOM", "ARM", "1810.HK"]
 }
 
 def analyze_sector_performance(sector_key: str, as_of_date=None):
@@ -1258,3 +1258,4 @@ def analyze_sector_performance(sector_key: str, as_of_date=None):
     out.append("註：漲跌幅為 (選定日收盤 - 前一交易日收盤) / 前一交易日收盤")
     
     return "\n".join(out)
+
