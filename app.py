@@ -79,6 +79,8 @@ if "last_tick" not in st.session_state:
     st.session_state.last_tick = 0
 if "as_of_date" not in st.session_state:
     st.session_state.as_of_date = datetime.now().date()
+if "sector_as_of_date" not in st.session_state:
+    st.session_state.sector_as_of_date = datetime.now().date()
 
 # -------------------------
 # Helpers
@@ -149,17 +151,15 @@ def run_analysis(stock_id: str, as_of_date, write_history: bool):
 
     save_to_archive(sid, as_of_date, final_report)
 
-def run_sector_analysis(sector_name: str):
+def run_sector_analysis(sector_name: str, as_of_date):
     """族群分析 (不寫 Cookie 歷史，只寫 Archive)"""
     final_report = ""
     try:
-        final_report = analyze_sector_performance(sector_name)
+        final_report = analyze_sector_performance(sector_name, as_of_date=as_of_date)
     except Exception as e:
         final_report = f"⚠️ 族群分析失敗：{e}"
     
-    # 日期顯示為 "Latest" 或今天
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    save_to_archive(f"族群: {sector_name}", today_str, final_report)
+    save_to_archive(f"族群: {sector_name}", as_of_date, final_report)
 
 
 # -------------------------
@@ -229,20 +229,31 @@ with tab1:
             st.rerun()
 
 with tab2:
-    st.write("選擇四大類群，快速檢視最新收盤價與整體平均漲跌幅。")
-    c1, c2 = st.columns([3, 1])
+    st.write("選擇四大類群與日期，快速檢視收盤價與整體平均漲跌幅。")
+    # 將版面分為 3 欄：族群選擇 | 日期選擇 | 按鈕
+    c1, c2, c3 = st.columns([2, 1, 1])
+    
     with c1:
         # 直接從 SECTOR_DICT 取 keys
         sector_opts = list(SECTOR_DICT.keys())
         selected_sector = st.selectbox("選擇族群", sector_opts, key="sector_select")
+    
     with c2:
+        sector_date_input = st.date_input(
+            "選擇日期",
+            value=st.session_state.sector_as_of_date,
+            key="sector_date_input"
+        )
+        st.session_state.sector_as_of_date = sector_date_input
+
+    with c3:
         st.write("")
         st.write("")
         run_sector = st.button("分析族群", use_container_width=True, key="run_sector_btn")
     
     if run_sector:
-        with st.spinner(f"正在抓取 {selected_sector} 最新報價 ..."):
-            run_sector_analysis(selected_sector)
+        with st.spinner(f"正在抓取 {selected_sector} 於 {sector_date_input} 的報價 ..."):
+            run_sector_analysis(selected_sector, sector_date_input)
             st.rerun()
 
 # 自動刷新邏輯 (只對個股有效，且簡單起見，只在 auto 開啟且 tick 變動時執行當前 ID)
