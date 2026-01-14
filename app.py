@@ -7,13 +7,14 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from streamlit_cookies_manager import EncryptedCookieManager
 
+# 假設 stock.py 在同一目錄下，且未更動
 from stock import analyze_stock_technical
 
 st.set_page_config(page_title="Stock Analyze", layout="wide")
-st.title("Stock Analyze")
+st.title("Stock Analyze (翻頁紀錄版)")
 
 # -------------------------
-# Cookies
+# Cookies (保留原本儲存 代號歷史 的功能)
 # -------------------------
 cookies = EncryptedCookieManager(
     prefix="stock_analyze_",
@@ -63,8 +64,15 @@ if "history" not in st.session_state:
     st.session_state.history = load_history_from_cookie()
 if "current_id" not in st.session_state:
     st.session_state.current_id = load_current_from_cookie()
-if "report" not in st.session_state:
-    st.session_state.report = ""
+
+# [新增] 用來儲存完整分析結果的列表 (List of dict)
+if "results_archive" not in st.session_state:
+    st.session_state.results_archive = []
+
+# [新增] 目前觀看的頁籤索引
+if "view_index" not in st.session_state:
+    st.session_state.view_index = 0
+
 if "_last_debug" not in st.session_state:
     st.session_state._last_debug = ""
 if "last_tick" not in st.session_state:
@@ -75,7 +83,8 @@ if "as_of_date" not in st.session_state:
 # -------------------------
 # Helpers
 # -------------------------
-def push_history(stock_id: str):
+def push_history_cookie(stock_id: str):
+    """只更新 Cookie 中的代號列表，不涉及報告內容"""
     sid = stock_id.strip().upper()
     if not sid:
         return
@@ -87,17 +96,20 @@ def push_history(stock_id: str):
 def run_analysis(stock_id: str, as_of_date, write_history: bool):
     sid = stock_id.strip().upper()
     if not sid:
-        st.session_state.report = "請輸入股票代號"
+        # 如果是空的，不做任何存檔動作，直接返回
         return
 
     st.session_state.current_id = sid
     save_current_to_cookie(sid)
 
     if write_history:
-        push_history(sid)
+        push_history_cookie(sid)
 
+    # 執行分析
     buf = io.StringIO()
     ret = None
+    final_report = ""
+    
     try:
         with redirect_stdout(buf):
             ret = analyze_stock_technical(sid, as_of_date=as_of_date)
@@ -111,17 +123,36 @@ def run_analysis(stock_id: str, as_of_date, write_history: bool):
         )
 
         if isinstance(ret, str) and ret.strip():
-            st.session_state.report = ret
+            final_report = ret
         elif stdout_text.strip():
-            st.session_state.report = stdout_text
+            final_report = stdout_text
         elif isinstance(ret, str):
-            st.session_state.report = "（函式回傳字串但只有空白）"
+            final_report = "（函式回傳字串但只有空白）"
         else:
-            st.session_state.report = "（函式沒有有效輸出）"
+            final_report = "（函式沒有有效輸出）"
 
     except Exception as e:
-        st.session_state.report = f"⚠️ 分析失敗：{type(e).__name__}: {e}"
+        final_report = f"⚠️ 分析失敗：{type(e).__name__}: {e}"
         st.session_state._last_debug = f"exception={type(e).__name__}"
+
+    # [新增] 將結果存入 Archive
+    record = {
+        "id": sid,
+        "date": str(as_of_date),
+        "content": final_report,
+        "created_at": datetime.now().strftime("%H:%M:%S")
+    }
+    
+    # 加入列表尾端
+    st.session_state.results_archive.append(record)
+    
+    # 限制最多 10 筆 (先進先出)
+    if len(st.session_state.results_archive) > 10:
+        st.session_state.results_archive.pop(0)
+    
+    # 自動跳轉到最新一頁 (最後一筆)
+    st.session_state.view_index = len(st.session_state.results_archive) - 1
+
 
 # -------------------------
 # Sidebar
@@ -151,6 +182,9 @@ with st.sidebar:
                 save_history_to_cookie([])
     else:
         st.caption("尚無歷史紀錄")
+    
+    st.divider()
+    st.info("💡 下方主畫面可左右翻頁查看最近 10 次的分析結果。")
 
 # -------------------------
 # Main
@@ -181,6 +215,8 @@ with col2:
 if search:
     with st.spinner(f"正在分析 {stock_id.strip().upper()} ..."):
         run_analysis(stock_id, st.session_state.as_of_date, write_history=True)
+        # 分析完需要 rerun 讓下方的 view_index 更新生效
+        st.rerun()
 
 # 2) 自動刷新：只在 tick 有變化時跑一次（不寫歷史）
 if auto:
@@ -188,11 +224,62 @@ if auto:
         st.session_state.last_tick = tick
         with st.spinner(f"自動更新中：{st.session_state.current_id} ..."):
             run_analysis(st.session_state.current_id, st.session_state.as_of_date, write_history=False)
+            st.rerun()
 
 st.divider()
 
-report = st.session_state.report
-if isinstance(report, str) and report.strip():
-    st.code(report, language="text")
+# -------------------------
+# Pagination Display (翻頁顯示)
+# -------------------------
+archive_len = len(st.session_state.results_archive)
+
+if archive_len > 0:
+    # 確保索引不越界
+    if st.session_state.view_index < 0:
+        st.session_state.view_index = 0
+    if st.session_state.view_index >= archive_len:
+        st.session_state.view_index = archive_len - 1
+    
+    current_idx = st.session_state.view_index
+    record = st.session_state.results_archive[current_idx]
+    
+    # 建立控制列：上一頁 | 資訊 | 下一頁
+    nav_c1, nav_c2, nav_c3 = st.columns([1, 2, 1])
+    
+    with nav_c1:
+        # 第一頁時禁用上一頁
+        if st.button("⬅️ 上一頁", disabled=(current_idx == 0), use_container_width=True):
+            st.session_state.view_index -= 1
+            st.rerun()
+            
+    with nav_c3:
+        # 最後一頁時禁用下一頁
+        if st.button("下一頁 ➡️", disabled=(current_idx == archive_len - 1), use_container_width=True):
+            st.session_state.view_index += 1
+            st.rerun()
+
+    with nav_c2:
+        st.markdown(
+            f"""
+            <div style="text-align: center; background-color: #262730; padding: 10px; border-radius: 5px; border: 1px solid #464b5c;">
+                <span style="font-size: 1.2em; font-weight: bold; color: #ffffff;">
+                    {record['id']}
+                </span>
+                <br>
+                <span style="color: #cccccc; font-size: 0.9em;">
+                    資料日期: {record['date']} | 分析時間: {record['created_at']}
+                </span>
+                <br>
+                <span style="font-size: 0.8em; color: #aaaaaa;">
+                    (第 {current_idx + 1} / {archive_len} 筆紀錄)
+                </span>
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
+
+    # 顯示報告內容
+    st.code(record['content'], language="text")
+
 else:
-    st.info("尚未分析或目前沒有輸出。請按「開始分析」。")
+    st.info("尚未分析或目前沒有紀錄。請輸入代號並按「開始分析」。")
