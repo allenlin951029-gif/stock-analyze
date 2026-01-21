@@ -45,13 +45,15 @@ def _safe_int(x):
 
 def _resolve_yf_ticker(stock_id: str) -> str:
     s = stock_id.strip().upper()
-    if s.endswith(".TW") or s.endswith(".TWO"):
+    if s.isdigit():
+        return f"{s}.TW"
+    if s.endswith(".TW") or s.endswith(".TWO") or s.endswith(".KS") or s.endswith(".T") or s.endswith(".HK"):
         return s
-    return f"{s}.TW"
+    return s
 
 
 def _strip_suffix(stock_id: str) -> str:
-    return stock_id.strip().upper().replace(".TW", "").replace(".TWO", "")
+    return stock_id.strip().upper().replace(".TW", "").replace(".TWO", "").replace(".KS", "").replace(".T", "").replace(".HK", "")
 
 
 def _norm_col(s: str) -> str:
@@ -1167,6 +1169,8 @@ def analyze_stock_technical(stock_id: str, as_of_date=None) -> str:
 
     out.append("=" * 50)
     return "\n".join(out)
+
+
 # =========================
 # Sector Analysis (New)
 # =========================
@@ -1178,17 +1182,24 @@ SECTOR_DICT = {
     "太空組": ["ARKX", "UFO"]
 }
 
-def analyze_sector_performance(sector_key: str, as_of_date=None):
-    tickers = SECTOR_DICT.get(sector_key, [])
+def analyze_sector_performance(sector_key: str, as_of_date=None, custom_tickers: list = None):
+    # 如果有傳入 custom_tickers，直接使用；否則從預設字典取
+    if custom_tickers:
+        tickers = custom_tickers
+        display_title = sector_key  # 用使用者傳入的名稱
+    else:
+        tickers = SECTOR_DICT.get(sector_key, [])
+        display_title = sector_key
+
     if not tickers:
-        return f"❌ 無效的族群名稱：{sector_key}"
+        return f"❌ 無效的族群名稱或空白清單：{sector_key}"
     
     # 預設為今天
     if as_of_date is None:
         as_of_date = datetime.now().date()
     
     out = []
-    out.append(f"📊 {sector_key} 族群行情快篩")
+    out.append(f"📊 {display_title} 族群行情快篩")
     out.append(f"📅 資料日期: {as_of_date}")
     out.append("=" * 45)
     
@@ -1198,8 +1209,10 @@ def analyze_sector_performance(sector_key: str, as_of_date=None):
     
     for t in tickers:
         try:
+            resolved_t = _resolve_yf_ticker(t)
             # 抓取過去 1 年資料，以便涵蓋選定日期
-            df = yf.Ticker(t).history(period="1y")
+            df = yf.download(resolved_t, period="1y", interval="1d", progress=False, auto_adjust=False)
+            df = clean_yf_columns(df)
             df = _ensure_naive_index(df)
             
             # 找出最近交易日
@@ -1210,6 +1223,12 @@ def analyze_sector_performance(sector_key: str, as_of_date=None):
                  continue
                  
             # 取得該日期的位置
+            if ts not in df.index:
+                 # 理論上 _nearest_trading_ts 回傳的是 df 的 index，應該存在
+                 # 但防呆一下
+                 results.append((t, None, None, "索引對應失敗"))
+                 continue
+
             loc = df.index.get_loc(ts)
             
             if loc < 1:
