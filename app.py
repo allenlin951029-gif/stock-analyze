@@ -13,7 +13,7 @@ from streamlit_cookies_manager import EncryptedCookieManager
 from stock import analyze_stock_technical, analyze_sector_performance, SECTOR_DICT
 
 st.set_page_config(page_title="Stock Analyze", layout="wide")
-st.title("Stock Analyze (翻頁紀錄版)")
+st.title("Stock Analyze")
 
 # -------------------------
 # Cookies (只保留歷史搜尋，不存自選股)
@@ -307,7 +307,7 @@ with tab2:
 
 # --- Tab 3: 自選族群管理 (後台) ---
 with tab3:
-    st.header("📂 自選族群管理 (存檔於 sectors.json)")
+    st.header("📂 自選族群管理")
     st.info("您可以在此新增、編輯自選的股票組合。資料會儲存在伺服器端的檔案中。")
     
     col_mgmt_1, col_mgmt_2 = st.columns(2)
@@ -439,3 +439,4 @@ if archive_len > 0:
 
 else:
     st.info("尚未分析或目前沒有紀錄。請在上方選擇「個股」或「族群」並開始分析。")
+
