@@ -45,10 +45,17 @@ def _safe_int(x):
 
 def _resolve_yf_ticker(stock_id: str) -> str:
     s = stock_id.strip().upper()
-    if s.isdigit():
-        return f"{s}.TW"
-    if s.endswith(".TW") or s.endswith(".TWO") or s.endswith(".KS") or s.endswith(".T") or s.endswith(".HK"):
+    
+    # 1. 若已經有指定後綴 (TW, TWO, HK, etc.)，直接回傳
+    if any(s.endswith(suffix) for suffix in [".TW", ".TWO", ".KS", ".T", ".HK"]):
         return s
+        
+    # 2. 若是數字開頭 (台股常見代號: 2330, 0050, 00635U)，預設加上 .TW
+    #    修正：原本只用 isdigit() 會漏掉 00635U 這種帶字母的 ETF
+    if len(s) > 0 and s[0].isdigit():
+        return f"{s}.TW"
+        
+    # 3. 剩下的假設是美股 (如 NVDA, AAPL, ARKK)
     return s
 
 
