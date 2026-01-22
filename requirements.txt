@@ -1,11 +1,12 @@
-pandas
-requests
-lxml
-html5lib
-plotly
+streamlit>=1.30.0
+protobuf==3.20.3
 yfinance
+pandas
+numpy
+requests
 streamlit-autorefresh
 streamlit-cookies-manager
-numpy
 truststore
+
+
 
