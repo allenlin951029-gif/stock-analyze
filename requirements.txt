@@ -7,6 +7,4 @@ requests
 streamlit-autorefresh
 streamlit-cookies-manager
 truststore
-
-
-
+google-cloud-firestore
