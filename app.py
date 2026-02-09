@@ -7,13 +7,70 @@ from datetime import datetime
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from streamlit_cookies_manager import EncryptedCookieManager
+from google.oauth2 import service_account
+from google.cloud import firestore
 
 # 引入 stock.py 中的函式與變數
-# 請確保您的 stock.py 已經更新（支援 custom_tickers 參數）
 from stock import analyze_stock_technical, analyze_sector_performance, SECTOR_DICT
 
 st.set_page_config(page_title="Stock Analyze", layout="wide")
-st.title("Stock Analyze")
+st.title("Stock Analyze (雲端資料庫版)")
+
+# -------------------------
+# Firestore Configuration (雲端資料庫設定)
+# -------------------------
+# 我們將資料存在集合: "stock_app_data" -> 文件: "config" -> 欄位: "custom_sectors"
+FS_COLLECTION = "stock_app_data"
+FS_DOCUMENT = "config"
+
+@st.cache_resource
+def get_db():
+    """初始化 Firestore 連線"""
+    if "firebase" in st.secrets:
+        try:
+            # 從 Streamlit Secrets 讀取 JSON 設定
+            key_dict = json.loads(st.secrets["firebase"]["text_key"])
+            creds = service_account.Credentials.from_service_account_info(key_dict)
+            db = firestore.Client(credentials=creds, project=key_dict["project_id"])
+            return db
+        except Exception as e:
+            st.error(f"Firebase 連線失敗: {e}")
+            return None
+    return None
+
+def load_sectors_from_db():
+    """從 Firestore 讀取自選設定"""
+    db = get_db()
+    if db:
+        try:
+            doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
+            doc = doc_ref.get()
+            if doc.exists:
+                data = doc.to_dict()
+                return data.get("custom_sectors", {})
+            else:
+                return {}
+        except Exception as e:
+            st.warning(f"讀取資料庫失敗 (暫用空白設定): {e}")
+            return {}
+    else:
+        # 如果沒有設定 Secrets，回傳空字典 (本地暫存)
+        return st.session_state.get("_temp_local_sectors", {})
+
+def save_sectors_to_db(data):
+    """將自選設定寫入 Firestore"""
+    db = get_db()
+    if db:
+        try:
+            doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
+            # 使用 set(merge=True) 可以保留文件中的其他欄位
+            doc_ref.set({"custom_sectors": data}, merge=True)
+        except Exception as e:
+            st.error(f"寫入資料庫失敗: {e}")
+    else:
+        # 如果沒有 DB，暫存在 Session State (重啟會消失)
+        st.session_state["_temp_local_sectors"] = data
+        st.warning("⚠️ 未設定 Firebase，資料僅暫存於記憶體，App 休眠後將消失。")
 
 # -------------------------
 # Cookies (只保留歷史搜尋，不存自選股)
@@ -60,29 +117,6 @@ def save_current_to_cookie(sid):
     commit_cookies_once()
 
 # -------------------------
-# Local File Storage for Custom Sectors (本地檔案儲存)
-# -------------------------
-SECTORS_FILE = "sectors.json"
-
-def load_sectors_file():
-    """從 sectors.json 讀取自選設定"""
-    if not os.path.exists(SECTORS_FILE):
-        return {}
-    try:
-        with open(SECTORS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_sectors_file(data):
-    """將自選設定寫入 sectors.json"""
-    try:
-        with open(SECTORS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        st.error(f"存檔失敗: {e}")
-
-# -------------------------
 # Session init
 # -------------------------
 if "history" not in st.session_state:
@@ -90,9 +124,9 @@ if "history" not in st.session_state:
 if "current_id" not in st.session_state:
     st.session_state.current_id = load_current_from_cookie()
 
-# 載入自定義族群 (從檔案)
+# 載入自定義族群 (優先從 DB 載入)
 if "custom_sectors" not in st.session_state:
-    st.session_state.custom_sectors = load_sectors_file()
+    st.session_state.custom_sectors = load_sectors_from_db()
 
 if "results_archive" not in st.session_state:
     st.session_state.results_archive = []
@@ -106,6 +140,8 @@ if "as_of_date" not in st.session_state:
     st.session_state.as_of_date = datetime.now().date()
 if "sector_as_of_date" not in st.session_state:
     st.session_state.sector_as_of_date = datetime.now().date()
+if "custom_as_of_date" not in st.session_state:
+    st.session_state.custom_as_of_date = datetime.now().date()
 
 # -------------------------
 # Helpers
@@ -166,14 +202,13 @@ def run_sector_analysis(sector_name: str, as_of_date, custom_list=None):
     """族群漲跌快篩 (表格模式)"""
     final_report = ""
     try:
-        # 呼叫 stock.py，若有 custom_list 則優先使用
         final_report = analyze_sector_performance(sector_name, as_of_date=as_of_date, custom_tickers=custom_list)
     except Exception as e:
         final_report = f"⚠️ 族群分析失敗：{e}"
     save_to_archive(f"快篩: {sector_name}", as_of_date, final_report)
 
 def run_full_sector_report(sector_name: str, as_of_date, custom_list=None):
-    """族群完整分析 (連發模式) - 針對清單內每一檔做完整分析"""
+    """族群完整分析 (連發模式)"""
     target_list = custom_list if custom_list else SECTOR_DICT.get(sector_name, [])
     
     if not target_list:
@@ -192,7 +227,7 @@ def run_full_sector_report(sector_name: str, as_of_date, custom_list=None):
             res = analyze_stock_technical(stock, as_of_date=as_of_date)
             full_content.append(res)
             full_content.append("")
-            full_content.append("=" * 60) # 分隔線
+            full_content.append("=" * 60)
             full_content.append("")
         except Exception as e:
             full_content.append(f"❌ {stock} 分析失敗: {e}")
@@ -228,6 +263,15 @@ with st.sidebar:
                 save_history_to_cookie([])
     else:
         st.caption("尚無歷史紀錄")
+    
+    st.divider()
+    
+    # 顯示資料庫連線狀態
+    if "firebase" in st.secrets:
+        st.success("🟢 已連接雲端資料庫 (Firebase)")
+    else:
+        st.warning("🔴 未連接雲端資料庫 (資料休眠後消失)")
+    
     st.divider()
     st.info("💡 下方主畫面可翻頁查看最近 10 次的分析結果。")
 
@@ -294,7 +338,6 @@ with tab2:
         with b1:
             if st.button("📊 生成「漲跌快篩表」", use_container_width=True):
                 with st.spinner(f"正在分析 {selected_sector} ..."):
-                    # 如果是自選，傳入 custom_list
                     clist = target_list if source_type == "自選族群 (我的最愛)" else None
                     run_sector_analysis(selected_sector, sector_date, custom_list=clist)
                     st.rerun()
@@ -307,9 +350,10 @@ with tab2:
 
 # --- Tab 3: 自選族群管理 (後台) ---
 with tab3:
-    st.header("📂 自選族群管理")
-    st.info("您可以在此新增、編輯自選的股票組合。資料會儲存在伺服器端的檔案中。")
-    
+    st.header("📂 自選族群管理 (資料庫後台)")
+    if "firebase" not in st.secrets:
+        st.error("⚠️ 請先設定 Firebase Secrets，否則資料無法永久保存。")
+        
     col_mgmt_1, col_mgmt_2 = st.columns(2)
     
     # 1. 新增族群
@@ -324,7 +368,7 @@ with tab3:
                     st.error("名稱已存在")
                 else:
                     st.session_state.custom_sectors[new_group] = []
-                    save_sectors_file(st.session_state.custom_sectors)
+                    save_sectors_to_db(st.session_state.custom_sectors)
                     st.success(f"已建立 {new_group}")
                     st.rerun()
     
@@ -349,7 +393,7 @@ with tab3:
                         if val:
                             if val not in current_list:
                                 current_list.append(val)
-                                save_sectors_file(st.session_state.custom_sectors)
+                                save_sectors_to_db(st.session_state.custom_sectors)
                                 st.success(f"已加入 {val}")
                                 st.rerun()
                             else:
@@ -358,7 +402,6 @@ with tab3:
                 st.divider()
                 st.write(f"**{edit_group}** 成分股:")
                 
-                # List & Remove
                 if not current_list:
                     st.caption("(空)")
                 else:
@@ -369,13 +412,13 @@ with tab3:
                         with cr2:
                             if st.button("移除", key=f"del_{edit_group}_{s}"):
                                 current_list.remove(s)
-                                save_sectors_file(st.session_state.custom_sectors)
+                                save_sectors_to_db(st.session_state.custom_sectors)
                                 st.rerun()
                 
                 st.divider()
                 if st.button("🗑️ 刪除此族群", type="primary"):
                     del st.session_state.custom_sectors[edit_group]
-                    save_sectors_file(st.session_state.custom_sectors)
+                    save_sectors_to_db(st.session_state.custom_sectors)
                     st.warning(f"已刪除 {edit_group}")
                     st.rerun()
 
@@ -384,7 +427,6 @@ with tab3:
 # -------------------------
 if auto and tick != st.session_state.last_tick:
     st.session_state.last_tick = tick
-    # 自動刷新只針對 Tab 1 的個股
     with st.spinner(f"自動更新中：{st.session_state.current_id} ..."):
         run_analysis(st.session_state.current_id, st.session_state.as_of_date, write_history=False)
         st.rerun()
@@ -439,4 +481,3 @@ if archive_len > 0:
 
 else:
     st.info("尚未分析或目前沒有紀錄。請在上方選擇「個股」或「族群」並開始分析。")
-
