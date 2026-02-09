@@ -1,10 +1,10 @@
-streamlit>=1.30.0
-protobuf==3.20.3
+streamlit
+streamlit-autorefresh
+streamlit-cookies-manager
 yfinance
 pandas
 numpy
 requests
-streamlit-autorefresh
-streamlit-cookies-manager
 truststore
 google-cloud-firestore
+protobuf==3.20.3
