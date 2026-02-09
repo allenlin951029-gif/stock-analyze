@@ -29,7 +29,8 @@ def get_db():
     if "firebase" in st.secrets:
         try:
             # 從 Streamlit Secrets 讀取 JSON 設定
-            key_dict = json.loads(st.secrets["firebase"]["text_key"])
+            # 修正: 加入 strict=False 以容許 TOML 字串中可能出現的控制字元 (如 \n)
+            key_dict = json.loads(st.secrets["firebase"]["text_key"], strict=False)
             creds = service_account.Credentials.from_service_account_info(key_dict)
             db = firestore.Client(credentials=creds, project=key_dict["project_id"])
             return db
