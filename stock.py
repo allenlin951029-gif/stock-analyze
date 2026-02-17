@@ -94,13 +94,13 @@ def _nearest_trading_ts(df: pd.DataFrame, target_date):
 def _parse_roc_date(date_str: str) -> str:
     """將民國年字串 '114/05/13' 轉為西元年 '2025-05-13'"""
     try:
-        parts = date_str.split('/')
+        parts = str(date_str).split('/')
         if len(parts) == 3:
             year = int(parts[0]) + 1911
             return f"{year}-{parts[1]}-{parts[2]}"
-        return date_str
+        return str(date_str)
     except Exception:
-        return date_str
+        return str(date_str)
 
 
 # ── AI 分析用工具函數 ──
@@ -325,17 +325,18 @@ def get_foreign_holding_ratio(stock_no: str) -> dict:
         if not data:
             return {"ratio": None, "date": None, "error": "無資料"}
         
-        # 修正：解析最後一筆資料，並處理日期與數值格式
         last = data[-1]
         if not last:
             return {"ratio": None, "date": None, "error": "空資料行"}
             
-        # 假設最後一個欄位是比率，第一個是日期
         date_str = _parse_roc_date(str(last[0])) # 轉西元年
         
-        # 嘗試解析比率，去除 '%' 和 ',' 並轉 float
+        # 修正：更安全的數值解析，並明確抓取 ValueError
         try:
             raw_ratio = str(last[-1]).replace("%", "").replace(",", "").strip()
+            # 防止空字串或非數字字串導致 crash
+            if not raw_ratio or not re.match(r"^-?\d+(\.\d+)?$", raw_ratio):
+                 return {"ratio": None, "date": date_str, "error": f"格式不符: {last[-1]}"}
             ratio = float(raw_ratio)
         except ValueError:
             return {"ratio": None, "date": date_str, "error": f"數值解析失敗: {last[-1]}"}
