@@ -369,22 +369,35 @@ def _parse_twse_json_table(obj):
     
     # 2. 嘗試從 tables 抓 (RWD 格式)
     if "tables" in obj and isinstance(obj["tables"], list):
+        # 修正：優先尋找欄位中明確包含「代號」的表格
+        # TWSE RWD API 會回傳多個表格，第一個通常是統計摘要（沒有代號），第二個才是個股明細
+        for tbl in obj["tables"]:
+            fields = tbl.get("fields", [])
+            # 關鍵修正：只要欄位中有 "代號" 兩個字，就認為是正確的表
+            if any("代號" in f for f in fields):
+                return pd.DataFrame(tbl["data"], columns=fields)
+        
+        # 備用方案：如果上面沒抓到，嘗試抓欄位數最多的（通常個股明細欄位最多）
+        best_table = None
+        max_cols = 0
         for tbl in obj["tables"]:
             if "fields" in tbl and "data" in tbl:
-                # 簡單判定：欄位夠多才像是主表，避免抓到備註表
-                if len(tbl["fields"]) > 5:
-                    return pd.DataFrame(tbl["data"], columns=tbl["fields"])
+                if len(tbl["fields"]) > max_cols:
+                    max_cols = len(tbl["fields"])
+                    best_table = tbl
+        
+        if best_table and max_cols > 5:
+             return pd.DataFrame(best_table["data"], columns=best_table["fields"])
+
     return None
 
 
 def _twse_margin_json(date_yyyymmdd: str, headers: dict):
-    # RWD 新版連結優先，舊版 exchangeReport 為輔
     urls = [
         f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
         f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
     ]
     
-    # 加 Referer 避免 RWD 接口擋人
     h2 = headers.copy()
     h2["Referer"] = "https://www.twse.com.tw/zh/page/trading/exchange/MI_MARGN.html"
 
@@ -395,16 +408,12 @@ def _twse_margin_json(date_yyyymmdd: str, headers: dict):
             if r.status_code != 200:
                 last_err = f"HTTP {r.status_code}"; continue
             j = r.json()
-            
-            # 部分舊 API 可能直接回傳 list
             df = pd.DataFrame(j) if isinstance(j, list) else _parse_twse_json_table(j)
-            
             if df is not None and not df.empty:
                 return df, None
             last_err = "空資料/格式不符"
         except Exception as e:
             last_err = str(e)
-            
     return None, last_err or "取資料失敗"
 
 
@@ -442,8 +451,9 @@ def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, ma
                 last_error = err; continue
             
             colmap   = {_norm_col(c): c for c in df.columns}
+            # 修正：加入 "代號" 這個關鍵字，因為有時欄位名只有 "代號" 而非 "股票代號"
             code_col = next((v for k, v in colmap.items()
-                             if k in ("股票代號", "證券代號", "證券代碼", "Code")), None)
+                             if k in ("股票代號", "證券代號", "證券代碼", "Code", "代號")), None)
             if not code_col:
                 last_error = "TWSE 找不到代號欄"; continue
             
