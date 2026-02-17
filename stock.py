@@ -331,10 +331,8 @@ def get_foreign_holding_ratio(stock_no: str) -> dict:
             
         date_str = _parse_roc_date(str(last[0])) # 轉西元年
         
-        # 修正：更安全的數值解析，並明確抓取 ValueError
         try:
             raw_ratio = str(last[-1]).replace("%", "").replace(",", "").strip()
-            # 防止空字串或非數字字串導致 crash
             if not raw_ratio or not re.match(r"^-?\d+(\.\d+)?$", raw_ratio):
                  return {"ratio": None, "date": date_str, "error": f"格式不符: {last[-1]}"}
             ratio = float(raw_ratio)
@@ -364,32 +362,49 @@ def _consecutive_direction(daily_list, key):
 # =========================
 def _parse_twse_json_table(obj):
     if not isinstance(obj, dict): return None
-    fields, data = obj.get("fields"), obj.get("data")
-    if not fields or not data: return None
-    try:
-        return pd.DataFrame(data, columns=fields)
-    except Exception:
-        return None
+    
+    # 1. 嘗試直接從 root 抓 (exchangeReport 格式)
+    if "fields" in obj and "data" in obj:
+        return pd.DataFrame(obj["data"], columns=obj["fields"])
+    
+    # 2. 嘗試從 tables 抓 (RWD 格式)
+    if "tables" in obj and isinstance(obj["tables"], list):
+        for tbl in obj["tables"]:
+            if "fields" in tbl and "data" in tbl:
+                # 簡單判定：欄位夠多才像是主表，避免抓到備註表
+                if len(tbl["fields"]) > 5:
+                    return pd.DataFrame(tbl["data"], columns=tbl["fields"])
+    return None
 
 
 def _twse_margin_json(date_yyyymmdd: str, headers: dict):
+    # RWD 新版連結優先，舊版 exchangeReport 為輔
     urls = [
         f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
         f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
     ]
+    
+    # 加 Referer 避免 RWD 接口擋人
+    h2 = headers.copy()
+    h2["Referer"] = "https://www.twse.com.tw/zh/page/trading/exchange/MI_MARGN.html"
+
     last_err = None
     for url in urls:
         try:
-            r = requests.get(url, headers=headers, timeout=15)
+            r = requests.get(url, headers=h2, timeout=15)
             if r.status_code != 200:
                 last_err = f"HTTP {r.status_code}"; continue
             j = r.json()
+            
+            # 部分舊 API 可能直接回傳 list
             df = pd.DataFrame(j) if isinstance(j, list) else _parse_twse_json_table(j)
+            
             if df is not None and not df.empty:
                 return df, None
-            last_err = "空資料"
+            last_err = "空資料/格式不符"
         except Exception as e:
             last_err = str(e)
+            
     return None, last_err or "取資料失敗"
 
 
@@ -425,14 +440,17 @@ def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, ma
             df, err = _twse_margin_json(d.strftime("%Y%m%d"), headers=headers)
             if df is None or df.empty:
                 last_error = err; continue
+            
             colmap   = {_norm_col(c): c for c in df.columns}
             code_col = next((v for k, v in colmap.items()
                              if k in ("股票代號", "證券代號", "證券代碼", "Code")), None)
             if not code_col:
                 last_error = "TWSE 找不到代號欄"; continue
+            
             sub = df[df[code_col].astype(str).str.strip() == stock_no]
             if sub.empty:
                 last_error = f"TWSE 找不到 {stock_no}"; continue
+                
             row     = sub.iloc[0]
             m_bal_c = find_col(colmap, ["融資", "餘額"]) or find_col(colmap, ["資", "餘額"])
             m_chg_c = find_col(colmap, ["融資", "增減"]) or find_col(colmap, ["資", "增減"])
