@@ -35,7 +35,7 @@ def clean_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
 def _safe_int(x):
     try:
         s = str(x).strip().replace(",", "")
-        if s in ("", "--", "NaN", "nan", "None"):
+        if s in ("", "--", "—", "NaN", "nan", "None"):
             return None
         return int(float(s))
     except Exception:
@@ -89,6 +89,18 @@ def _nearest_trading_ts(df: pd.DataFrame, target_date):
         pass
     pos = idx.searchsorted(target + pd.Timedelta(days=1)) - 1
     return None if pos < 0 else idx[pos]
+
+
+def _parse_roc_date(date_str: str) -> str:
+    """將民國年字串 '114/05/13' 轉為西元年 '2025-05-13'"""
+    try:
+        parts = date_str.split('/')
+        if len(parts) == 3:
+            year = int(parts[0]) + 1911
+            return f"{year}-{parts[1]}-{parts[2]}"
+        return date_str
+    except Exception:
+        return date_str
 
 
 # ── AI 分析用工具函數 ──
@@ -312,9 +324,23 @@ def get_foreign_holding_ratio(stock_no: str) -> dict:
         data = r.json().get("data", [])
         if not data:
             return {"ratio": None, "date": None, "error": "無資料"}
+        
+        # 修正：解析最後一筆資料，並處理日期與數值格式
         last = data[-1]
-        ratio = float(str(last[-1]).replace("%", "").strip())
-        return {"ratio": ratio, "date": str(last[0]), "error": None}
+        if not last:
+            return {"ratio": None, "date": None, "error": "空資料行"}
+            
+        # 假設最後一個欄位是比率，第一個是日期
+        date_str = _parse_roc_date(str(last[0])) # 轉西元年
+        
+        # 嘗試解析比率，去除 '%' 和 ',' 並轉 float
+        try:
+            raw_ratio = str(last[-1]).replace("%", "").replace(",", "").strip()
+            ratio = float(raw_ratio)
+        except ValueError:
+            return {"ratio": None, "date": date_str, "error": f"數值解析失敗: {last[-1]}"}
+            
+        return {"ratio": ratio, "date": date_str, "error": None}
     except Exception as e:
         return {"ratio": None, "date": None, "error": str(e)}
 
@@ -858,8 +884,7 @@ def analyze_sector_performance(sector_key: str, as_of_date=None, custom_tickers:
         else:   out.append(f"{t:<10}{price:>10.2f}{pct:>+10.2f}%")
     out.append("-" * 45)
     return "\n".join(out)
-# 這是完整的 analyze_stock_technical 函數，替換原本 stock.py 中的同名函數
-# 同時包含所有新增的 helper functions，貼在原本 detect_patterns 之後即可
+
 
 def analyze_stock_technical(stock_id: str, as_of_date=None) -> str:
     stock_id = stock_id.strip().upper()
@@ -1293,6 +1318,14 @@ def analyze_stock_technical(stock_id: str, as_of_date=None) -> str:
         d_cum = sum(v for v in d_vals if v is not None)
         out.append(f"  ▸ 5日累計: 外資 {f_cum:+,} 張 / 投信 {t_cum:+,} 張 / 自營 {d_cum:+,} 張")
 
+        # 籌碼背離判斷 (新增)
+        c_5d_ago = float(df_upto["Close"].iloc[-5]) if len(df_upto) >= 5 else c_now
+        price_is_up_5d = c_now > c_5d_ago
+        
+        divergence_msg = ""
+        if price_is_up_5d and f_cum < 0:
+            divergence_msg = "  ⚠️ 警示：籌碼背離（股價上漲，但外資趁高調節賣出）"
+        
         if f_cum > 0 and t_cum > 0:
             consensus = "外資＋投信同步買超（強多頭信號，法人積極布局）"
         elif f_cum < 0 and t_cum < 0:
@@ -1304,6 +1337,10 @@ def analyze_stock_technical(stock_id: str, as_of_date=None) -> str:
         else:
             consensus = "外資/投信無明顯方向"
         out.append(f"  ▸ 籌碼方向研判: {consensus}")
+        
+        if divergence_msg:
+            out.append(divergence_msg)
+
     else:
         out.append("  ▸ 無法取得三大法人資料（TWSE/TPEx 可能休市或網路問題）")
 
