@@ -11,15 +11,15 @@ from google.oauth2 import service_account
 from google.cloud import firestore
 
 # 引入 stock.py 中的函式與變數
+# 注意：請確保 stock.py 已包含 analyze_sector_performance 與 SECTOR_DICT
 from stock import analyze_stock_technical, analyze_sector_performance, SECTOR_DICT
 
 st.set_page_config(page_title="Stock Analyze", layout="wide")
-st.title("Stock Analyze (雲端資料庫版)")
+st.title("Stock Analyze (雲端資料庫 + AI 雙模式版)")
 
 # -------------------------
 # Firestore Configuration (雲端資料庫設定)
 # -------------------------
-# 我們將資料存在集合: "stock_app_data" -> 文件: "config" -> 欄位: "custom_sectors"
 FS_COLLECTION = "stock_app_data"
 FS_DOCUMENT = "config"
 
@@ -28,8 +28,7 @@ def get_db():
     """初始化 Firestore 連線"""
     if "firebase" in st.secrets:
         try:
-            # 從 Streamlit Secrets 讀取 JSON 設定
-            # 修正: 加入 strict=False 以容許 TOML 字串中可能出現的控制字元 (如 \n)
+            # 加入 strict=False 以容許 TOML 字串中可能出現的控制字元
             key_dict = json.loads(st.secrets["firebase"]["text_key"], strict=False)
             creds = service_account.Credentials.from_service_account_info(key_dict)
             db = firestore.Client(credentials=creds, project=key_dict["project_id"])
@@ -55,7 +54,6 @@ def load_sectors_from_db():
             st.warning(f"讀取資料庫失敗 (暫用空白設定): {e}")
             return {}
     else:
-        # 如果沒有設定 Secrets，回傳空字典 (本地暫存)
         return st.session_state.get("_temp_local_sectors", {})
 
 def save_sectors_to_db(data):
@@ -64,12 +62,10 @@ def save_sectors_to_db(data):
     if db:
         try:
             doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
-            # 使用 set(merge=True) 可以保留文件中的其他欄位
             doc_ref.set({"custom_sectors": data}, merge=True)
         except Exception as e:
             st.error(f"寫入資料庫失敗: {e}")
     else:
-        # 如果沒有 DB，暫存在 Session State (重啟會消失)
         st.session_state["_temp_local_sectors"] = data
         st.warning("⚠️ 未設定 Firebase，資料僅暫存於記憶體，App 休眠後將消失。")
 
@@ -102,7 +98,6 @@ def load_current_from_cookie():
     v = cookies.get(CUR_KEY)
     return (v or "0050").strip().upper()
 
-# ✅ 同一個 rerun 只存一次，避免 DuplicateElementKey
 st.session_state["_cookie_saved_this_run"] = False
 def commit_cookies_once():
     if not st.session_state.get("_cookie_saved_this_run", False):
@@ -125,7 +120,6 @@ if "history" not in st.session_state:
 if "current_id" not in st.session_state:
     st.session_state.current_id = load_current_from_cookie()
 
-# 載入自定義族群 (優先從 DB 載入)
 if "custom_sectors" not in st.session_state:
     st.session_state.custom_sectors = load_sectors_from_db()
 
@@ -141,8 +135,6 @@ if "as_of_date" not in st.session_state:
     st.session_state.as_of_date = datetime.now().date()
 if "sector_as_of_date" not in st.session_state:
     st.session_state.sector_as_of_date = datetime.now().date()
-if "custom_as_of_date" not in st.session_state:
-    st.session_state.custom_as_of_date = datetime.now().date()
 
 # -------------------------
 # Helpers
@@ -160,7 +152,7 @@ def save_to_archive(display_title, display_date, content):
     record = {
         "id": display_title,
         "date": str(display_date),
-        "content": content,
+        "content": content,  # 這可能是一個字串(舊版/錯誤) 或 字典(新版)
         "created_at": datetime.now().strftime("%H:%M:%S")
     }
     st.session_state.results_archive.append(record)
@@ -169,7 +161,7 @@ def save_to_archive(display_title, display_date, content):
     st.session_state.view_index = len(st.session_state.results_archive) - 1
 
 def run_analysis(stock_id: str, as_of_date, write_history: bool):
-    """個股分析"""
+    """個股分析 (支援 Human/AI 雙模式回傳)"""
     sid = stock_id.strip().upper()
     if not sid:
         return
@@ -180,36 +172,32 @@ def run_analysis(stock_id: str, as_of_date, write_history: bool):
     if write_history:
         push_history_cookie(sid)
     
-    buf = io.StringIO()
-    ret = None
-    final_report = ""
+    final_result = None
     try:
-        with redirect_stdout(buf):
-            ret = analyze_stock_technical(sid, as_of_date=as_of_date)
-        stdout_text = buf.getvalue()
-        if isinstance(ret, str) and ret.strip():
-            final_report = ret
-        elif stdout_text.strip():
-            final_report = stdout_text
-        else:
-            final_report = "（函式沒有有效輸出）"
+        # stock.py 若更新過，這裡會回傳 {"human_report": str, "ai_report": dict}
+        final_result = analyze_stock_technical(sid, as_of_date=as_of_date)
     except Exception as e:
-        final_report = f"⚠️ 分析失敗：{type(e).__name__}: {e}"
+        err_msg = f"⚠️ 分析失敗：{type(e).__name__}: {e}"
+        final_result = {
+            "human_report": err_msg,
+            "ai_report": {"error": str(e)}
+        }
         st.session_state._last_debug = f"exception={type(e).__name__}"
     
-    save_to_archive(sid, as_of_date, final_report)
+    save_to_archive(sid, as_of_date, final_result)
 
 def run_sector_analysis(sector_name: str, as_of_date, custom_list=None):
     """族群漲跌快篩 (表格模式)"""
     final_report = ""
     try:
+        # 回傳的是 Markdown 字串
         final_report = analyze_sector_performance(sector_name, as_of_date=as_of_date, custom_tickers=custom_list)
     except Exception as e:
         final_report = f"⚠️ 族群分析失敗：{e}"
     save_to_archive(f"快篩: {sector_name}", as_of_date, final_report)
 
 def run_full_sector_report(sector_name: str, as_of_date, custom_list=None):
-    """族群完整分析 (連發模式)"""
+    """族群完整分析 (連發模式，僅擷取 Human Report)"""
     target_list = custom_list if custom_list else SECTOR_DICT.get(sector_name, [])
     
     if not target_list:
@@ -225,8 +213,15 @@ def run_full_sector_report(sector_name: str, as_of_date, custom_list=None):
 
     for stock in target_list:
         try:
+            # 取得結果字典
             res = analyze_stock_technical(stock, as_of_date=as_of_date)
-            full_content.append(res)
+            
+            # 只取 Human Report 加入大報告
+            if isinstance(res, dict):
+                full_content.append(res.get("human_report", str(res)))
+            else:
+                full_content.append(str(res))
+                
             full_content.append("")
             full_content.append("=" * 60)
             full_content.append("")
@@ -249,44 +244,42 @@ with st.sidebar:
         st.caption(f"autorefresh tick = {tick}")
 
     st.divider()
-    st.subheader("個股搜尋歷史（前 5 筆）")
+    st.subheader("個股搜尋歷史")
     if st.session_state.history:
         picked = st.selectbox("點選回查", st.session_state.history, index=0, key="history_pick")
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("回查這筆", use_container_width=True, key="history_run"):
+            if st.button("回查", use_container_width=True, key="history_run"):
                 with st.spinner(f"正在分析 {picked} ..."):
                     run_analysis(picked, st.session_state.as_of_date, write_history=False)
                     st.rerun()
         with col_b:
-            if st.button("清除歷史", use_container_width=True, key="history_clear"):
+            if st.button("清除", use_container_width=True, key="history_clear"):
                 st.session_state.history = []
                 save_history_to_cookie([])
+                st.rerun()
     else:
         st.caption("尚無歷史紀錄")
     
     st.divider()
-    
-    # 顯示資料庫連線狀態
     if "firebase" in st.secrets:
-        st.success("🟢 已連接雲端資料庫 (Firebase)")
+        st.success("🟢 已連接雲端資料庫")
     else:
-        st.warning("🔴 未連接雲端資料庫 (資料休眠後消失)")
+        st.warning("🔴 未連接雲端資料庫")
     
-    st.divider()
-    st.info("💡 下方主畫面可翻頁查看最近 10 次的分析結果。")
+    st.info("💡 下方主畫面可翻頁查看分析結果。")
 
 # -------------------------
 # Main Content
 # -------------------------
-tab1, tab2, tab3 = st.tabs(["📊 個股技術分析", "📈 族群分析 (內建/自選)", "📂 自選族群管理"])
+tab1, tab2, tab3 = st.tabs(["📊 個股技術分析", "📈 族群分析", "📂 自選管理"])
 
 # --- Tab 1: 個股 ---
 with tab1:
     col1, col_mid, col2 = st.columns([2.0, 1.1, 1.0])
     with col1:
         stock_id = st.text_input(
-            "輸入股票代號（例：0050 / 2330 / 2330.TW / 6223.TWO）",
+            "輸入股票代號（例：2330 / 0050 / 6531.TW）",
             value=st.session_state.current_id,
             key="stock_id_input",
         )
@@ -304,10 +297,7 @@ with tab1:
 
 # --- Tab 2: 族群分析 ---
 with tab2:
-    st.write("選擇「內建族群」或「自選族群」，產生快篩表或完整報告。")
-    
-    source_type = st.radio("選擇來源:", ["內建族群", "自選族群 (我的最愛)"], horizontal=True)
-    
+    source_type = st.radio("選擇來源:", ["內建族群", "自選族群"], horizontal=True)
     c1, c2 = st.columns([2, 1])
     
     selected_sector = None
@@ -316,13 +306,13 @@ with tab2:
     with c1:
         if source_type == "內建族群":
             opts = list(SECTOR_DICT.keys())
-            selected_sector = st.selectbox("選擇內建族群", opts, key="sector_select_builtin")
+            selected_sector = st.selectbox("選擇族群", opts, key="sector_select_builtin")
             if selected_sector:
                 target_list = SECTOR_DICT[selected_sector]
         else:
             custom_opts = list(st.session_state.custom_sectors.keys())
             if not custom_opts:
-                st.warning("目前沒有自選族群，請至「自選族群管理」分頁新增。")
+                st.warning("目前沒有自選族群。")
             else:
                 selected_sector = st.selectbox("選擇自選族群", custom_opts, key="sector_select_custom")
                 if selected_sector:
@@ -333,36 +323,32 @@ with tab2:
         st.session_state.sector_as_of_date = sector_date
 
     if selected_sector:
-        st.markdown(f"**目前包含股票**: `{', '.join(target_list) if target_list else '(無)'}`")
-        
+        st.markdown(f"**包含股票**: `{', '.join(target_list) if target_list else '(無)'}`")
         b1, b2 = st.columns(2)
         with b1:
             if st.button("📊 生成「漲跌快篩表」", use_container_width=True):
                 with st.spinner(f"正在分析 {selected_sector} ..."):
-                    clist = target_list if source_type == "自選族群 (我的最愛)" else None
+                    clist = target_list if source_type == "自選族群" else None
                     run_sector_analysis(selected_sector, sector_date, custom_list=clist)
                     st.rerun()
         with b2:
-            if st.button("📑 生成「完整分析報告」", use_container_width=True, help="會針對清單內每一檔股票跑一次完整分析"):
-                with st.spinner(f"正在生成 {selected_sector} 完整報告 (需時較久) ..."):
-                    clist = target_list if source_type == "自選族群 (我的最愛)" else None
+            if st.button("📑 生成「完整分析報告」", use_container_width=True):
+                with st.spinner(f"正在生成 {selected_sector} 完整報告 ..."):
+                    clist = target_list if source_type == "自選族群" else None
                     run_full_sector_report(selected_sector, sector_date, custom_list=clist)
                     st.rerun()
 
-# --- Tab 3: 自選族群管理 (後台) ---
+# --- Tab 3: 自選管理 ---
 with tab3:
-    st.header("📂 自選族群管理 (資料庫後台)")
-    if "firebase" not in st.secrets:
-        st.error("⚠️ 請先設定 Firebase Secrets，否則資料無法永久保存。")
-        
+    st.header("📂 自選族群管理")
     col_mgmt_1, col_mgmt_2 = st.columns(2)
     
-    # 1. 新增族群
+    # 1. 新增
     with col_mgmt_1:
         with st.container(border=True):
-            st.subheader("1. 新增族群")
-            new_group = st.text_input("輸入新族群名稱 (例: 觀察名單)")
-            if st.button("建立族群"):
+            st.subheader("新增族群")
+            new_group = st.text_input("輸入新族群名稱")
+            if st.button("建立"):
                 if not new_group.strip():
                     st.error("名稱不能為空")
                 elif new_group in st.session_state.custom_sectors:
@@ -373,43 +359,36 @@ with tab3:
                     st.success(f"已建立 {new_group}")
                     st.rerun()
     
-    # 2. 編輯族群
+    # 2. 編輯
     with col_mgmt_2:
         with st.container(border=True):
-            st.subheader("2. 編輯族群")
+            st.subheader("編輯族群")
             if not st.session_state.custom_sectors:
-                st.info("暫無資料，請先新增族群")
+                st.info("暫無資料")
             else:
-                edit_group = st.selectbox("選擇要編輯的族群", list(st.session_state.custom_sectors.keys()), key="mgmt_select")
+                edit_group = st.selectbox("選擇族群", list(st.session_state.custom_sectors.keys()), key="mgmt_select")
                 current_list = st.session_state.custom_sectors[edit_group]
                 
-                # Add Stock
                 c_add1, c_add2 = st.columns([3, 1])
                 with c_add1:
-                    stock_to_add = st.text_input("輸入股票代號 (例: 2330)", key="mgmt_add_input")
+                    stock_to_add = st.text_input("輸入股票代號", key="mgmt_add_input")
                 with c_add2:
                     st.write(""), st.write("")
                     if st.button("➕ 加入"):
                         val = stock_to_add.strip().upper()
-                        if val:
-                            if val not in current_list:
-                                current_list.append(val)
-                                save_sectors_to_db(st.session_state.custom_sectors)
-                                st.success(f"已加入 {val}")
-                                st.rerun()
-                            else:
-                                st.warning("已存在清單中")
+                        if val and val not in current_list:
+                            current_list.append(val)
+                            save_sectors_to_db(st.session_state.custom_sectors)
+                            st.success(f"已加入 {val}")
+                            st.rerun()
                 
                 st.divider()
-                st.write(f"**{edit_group}** 成分股:")
-                
                 if not current_list:
                     st.caption("(空)")
                 else:
                     for s in current_list:
                         cr1, cr2 = st.columns([4, 1])
-                        with cr1:
-                            st.text(f"• {s}")
+                        with cr1: st.text(f"• {s}")
                         with cr2:
                             if st.button("移除", key=f"del_{edit_group}_{s}"):
                                 current_list.remove(s)
@@ -420,7 +399,6 @@ with tab3:
                 if st.button("🗑️ 刪除此族群", type="primary"):
                     del st.session_state.custom_sectors[edit_group]
                     save_sectors_to_db(st.session_state.custom_sectors)
-                    st.warning(f"已刪除 {edit_group}")
                     st.rerun()
 
 # -------------------------
@@ -435,7 +413,7 @@ if auto and tick != st.session_state.last_tick:
 st.divider()
 
 # -------------------------
-# Pagination Display
+# Pagination Display (Human / AI Mode)
 # -------------------------
 archive_len = len(st.session_state.results_archive)
 
@@ -448,37 +426,62 @@ if archive_len > 0:
     current_idx = st.session_state.view_index
     record = st.session_state.results_archive[current_idx]
     
+    # 標題區塊
     st.markdown(
         f"""
         <div style="text-align: center; background-color: #262730; padding: 10px; border-radius: 5px; border: 1px solid #464b5c; margin-bottom: 10px;">
-            <span style="font-size: 1.2em; font-weight: bold; color: #ffffff;">
-                {record['id']}
-            </span>
-            <span style="color: #cccccc; font-size: 0.9em; margin-left: 10px;">
-                ({record['date']})
-            </span>
+            <span style="font-size: 1.2em; font-weight: bold; color: #ffffff;">{record['id']}</span>
+            <span style="color: #cccccc; font-size: 0.9em; margin-left: 10px;">({record['date']})</span>
             <br>
-            <span style="font-size: 0.8em; color: #aaaaaa;">
-                第 {current_idx + 1} / {archive_len} 筆紀錄 (分析時間: {record['created_at']})
-            </span>
+            <span style="font-size: 0.8em; color: #aaaaaa;">第 {current_idx + 1} / {archive_len} 筆紀錄 ({record['created_at']})</span>
         </div>
         """, 
         unsafe_allow_html=True
     )
 
-    c_space_l, c_prev, c_next, c_space_r = st.columns([2, 1, 1, 2])
-    
+    # 翻頁按鈕
+    c_prev, c_next = st.columns(2)
     with c_prev:
         if st.button("⬅️ 上一頁", disabled=(current_idx == 0), use_container_width=True):
             st.session_state.view_index -= 1
             st.rerun()
-            
     with c_next:
         if st.button("下一頁 ➡️", disabled=(current_idx == archive_len - 1), use_container_width=True):
             st.session_state.view_index += 1
             st.rerun()
 
-    st.code(record['content'], language="text")
+    # 內容顯示 (支援切換模式)
+    content = record['content']
+
+    # 檢查內容是否為字典格式 (新版 Human/AI)
+    if isinstance(content, dict) and "human_report" in content:
+        st.write("---")
+        # 切換按鈕
+        mode = st.radio(
+            "選擇報告視角:", 
+            ["Human-Report (閱讀版)", "AI-Report (JSON 數據版)"], 
+            horizontal=True,
+            key=f"view_mode_{current_idx}"
+        )
+
+        if mode == "Human-Report (閱讀版)":
+            st.code(content["human_report"], language="text")
+        else:
+            st.markdown("### 🤖 AI Features JSON Data")
+            st.json(content["ai_report"])
+            
+            # JSON 下載按鈕
+            json_str = json.dumps(content["ai_report"], indent=2, default=str)
+            st.download_button(
+                label="📥 下載 JSON 檔案",
+                data=json_str,
+                file_name=f"{record['id']}_{record['date']}_ai_features.json",
+                mime="application/json",
+                key=f"dl_json_{current_idx}"
+            )
+    else:
+        # 舊版資料或純文字報告 (例如族群快篩表)
+        st.code(str(content), language="text")
 
 else:
     st.info("尚未分析或目前沒有紀錄。請在上方選擇「個股」或「族群」並開始分析。")
