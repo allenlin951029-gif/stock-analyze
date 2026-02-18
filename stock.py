@@ -1766,19 +1766,26 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
 # 17.  CLI ENTRY POINT
 # ═══════════════════════════════════════════════════════════
 
-def analyze_stock_technical(stock_id: str, as_of_date=None) -> str:
+def analyze_stock_technical(stock_id: str, as_of_date=None) -> dict:
     """
-    向後相容的主入口
-    回傳: (text_report, ai_features_json)
+    修改版主入口：回傳 Dictionary 包含兩種報告格式
     """
+    # 1. 計算所有數值與指標 (AI Data)
     feat = build_ai_features(stock_id, as_of_date)
+    
+    # 2. 產生文字報告 (Human Data)
     text = format_text_report(feat)
-    # 這裡為了配合 streamlit，讓它同時可以當 string 輸出，也可以回傳 json
-    # 但 app.py 似乎只接一個回傳值並印出
-    return text
+    
+    # 3. 回傳包含兩者的字典
+    return {
+        "human_report": text,
+        "ai_report": feat
+    }
 
 if __name__ == "__main__":
     import sys
     sid = sys.argv[1] if len(sys.argv) > 1 else "2330"
-    text_report = analyze_stock_technical(sid)
-    print(text_report)
+    result = analyze_stock_technical(sid)
+    print(result["human_report"])
+    print("\n=== AI JSON Data ===")
+    print(json.dumps(result["ai_report"], default=str))
