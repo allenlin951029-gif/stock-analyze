@@ -1759,14 +1759,6 @@ def analyze_stock_technical(stock_id: str, as_of_date=None) -> str:
 feat = build_ai_features(stock_id, as_of_date)
 text = format_text_report(feat)
 return text, json.dumps(feat, ensure_ascii=False, indent=2, default=str)
-
-if **name** == “**main**”:
-import sys
-sid = sys.argv[1] if len(sys.argv) > 1 else “2330”
-text_report, json_str = analyze_stock_technical(sid)
-print(text_report)
-print(”\n\n=== AI Features JSON ===”)
-print(json_str)
 # ═══════════════════════════════════════════════════════════
 # 17. SECTOR ANALYSIS (補足 app.py 所需功能)
 # ═══════════════════════════════════════════════════════════
@@ -1863,3 +1855,12 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
     
     return "\n".join(lines)
 
+
+
+if **name** == “**main**”:
+import sys
+sid = sys.argv[1] if len(sys.argv) > 1 else “2330”
+text_report, json_str = analyze_stock_technical(sid)
+print(text_report)
+print(”\n\n=== AI Features JSON ===”)
+print(json_str)
