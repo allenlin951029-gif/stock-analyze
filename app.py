@@ -164,6 +164,7 @@ def save_to_archive(display_title, display_date, content):
     st.session_state.view_index = len(st.session_state.results_archive) - 1
 
 def run_analysis(stock_id, as_of_date, write_history):
+    # 1. 處理輸入與 Cookie
     sid = stock_id.strip().upper()
     if not sid:
         return
@@ -172,6 +173,7 @@ def run_analysis(stock_id, as_of_date, write_history):
     if write_history:
         push_history_cookie(sid)
 
+    # 2. 執行分析 (縮排修正重點)
     final_result = None
     try:
         final_result = analyze_stock_technical(sid, as_of_date=as_of_date)
@@ -183,6 +185,7 @@ def run_analysis(stock_id, as_of_date, write_history):
         }
         st.session_state._last_debug = "exception={}".format(type(e).__name__)
 
+    # 3. 存檔 (縮排修正重點)
     save_to_archive(sid, as_of_date, final_result)
 
 def run_sector_analysis(sector_name, as_of_date, custom_list=None):
@@ -201,6 +204,7 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
         save_to_archive("Full: {}".format(sector_name), as_of_date, "No stocks.")
         return
 
+    # 縮排修正重點：if/else 必須在函式內
     if is_ai_mode():
         all_reports = {}
         for stock in target_list:
@@ -258,7 +262,6 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("#### Report Mode")
     
-    # 這裡的選項要小心 index error，確保 index 0 或 1
     idx = 0 if st.session_state.report_mode == "human" else 1
     mode_choice = st.radio(
         "Select output mode:",
