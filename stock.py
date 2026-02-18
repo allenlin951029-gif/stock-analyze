@@ -1767,3 +1767,99 @@ text_report, json_str = analyze_stock_technical(sid)
 print(text_report)
 print(”\n\n=== AI Features JSON ===”)
 print(json_str)
+# ═══════════════════════════════════════════════════════════
+# 17. SECTOR ANALYSIS (補足 app.py 所需功能)
+# ═══════════════════════════════════════════════════════════
+
+# 內建族群清單
+SECTOR_DICT = {
+    "半導體權值": ["2330.TW", "2454.TW", "3711.TW", "3034.TW", "2303.TW"],
+    "AI 伺服器": ["2382.TW", "3231.TW", "6669.TW", "2356.TW", "2376.TW"],
+    "IC 設計高價": ["3661.TW", "3443.TW", "3529.TW", "3035.TW", "4966.TW"],
+    "金融保險": ["2881.TW", "2882.TW", "2886.TW", "2891.TW", "5880.TW"],
+    "航運貨櫃": ["2603.TW", "2609.TW", "2615.TW", "2637.TW", "2618.TW"],
+    "重電綠能": ["1513.TW", "1519.TW", "1503.TW", "1514.TW", "6806.TW"],
+    "散熱模組": ["3017.TW", "3324.TW", "3338.TW", "6230.TW", "2421.TW"],
+}
+
+def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers=None) -> str:
+    """
+    族群漲跌快篩：讀取族群內股票，產出表格摘要
+    """
+    target_list = custom_tickers if custom_tickers else SECTOR_DICT.get(sector_name, [])
+    
+    if not target_list:
+        return f"❌ 族群 {sector_name} 無股票清單。"
+
+    results = []
+    
+    # 批次抓取並建立摘要
+    for stock_id in target_list:
+        try:
+            # 使用既有的 build_ai_features 取得數據 (不需重新寫邏輯)
+            feat = build_ai_features(stock_id, as_of_date=as_of_date)
+            
+            if feat.get("error"):
+                results.append({
+                    "Symbol": _strip_suffix(stock_id), 
+                    "Close": "-", "Chg": "-", "Trend": "Error", "Vol_Ratio": "-"
+                })
+                continue
+
+            # 計算漲跌幅 (需要前一日收盤，這裡簡化用 Close 與 MA5/20 判斷，或是若 build_ai_features 有漲跌幅欄位更好)
+            # 在 stock_v2 中，我們有 ma20_dev_pct, rs_vs_bench_20d 等，但沒有單日漲跌幅
+            # 我們可以簡單計算 (Close - Open) 或用既有欄位呈現
+            
+            # 這裡簡單呈現：代號、價格、趨勢、MA20乖離、量比、KD
+            summary = {
+                "Symbol": _strip_suffix(feat["symbol"]),
+                "Price": feat["close"],
+                "Trend": feat["trend_state"],
+                "MA20_Dev%": f"{feat['ma20_dev_pct']:+.2f}",
+                "Vol_R": feat.get("vol_ratio_5d", "-"),
+                "KD": f"{feat.get('kd_k',0):.0f}/{feat.get('kd_d',0):.0f}",
+                "Score": 0 # 簡單評分
+            }
+            
+            # 簡單加分邏輯 (多頭+1, 量增+1, KD金叉+1)
+            score = 0
+            if feat["trend_state"] == "uptrend": score += 2
+            if feat.get("flag_price_up_vol_up"): score += 1
+            if feat.get("flag_kd_golden_cross"): score += 1
+            if feat.get("flag_macd_golden_cross"): score += 1
+            if feat.get("flag_inst_consensus_buy"): score += 2
+            summary["Score"] = score
+            
+            results.append(summary)
+
+        except Exception as e:
+            results.append({"Symbol": stock_id, "Trend": "Exception"})
+
+    # 轉為文字表格輸出 (Markdown 格式，配合 Streamlit)
+    if not results:
+        return "無有效數據。"
+
+    # 排序：分數高到低
+    results.sort(key=lambda x: x.get("Score", 0), reverse=True)
+
+    # 建構表格字串
+    lines = []
+    lines.append(f"### 📊 族群快篩：{sector_name}")
+    lines.append(f"日期: {as_of_date if as_of_date else datetime.now().date()}")
+    lines.append("")
+    
+    # 表頭
+    header = "| 代號 | 價格 | 趨勢 | MA20乖離% | 量比 | KD | 訊號分 |"
+    sep = "|---|---|---|---|---|---|---|"
+    lines.append(header)
+    lines.append(sep)
+
+    for r in results:
+        line = f"| {r['Symbol']} | {r['Price']} | {r['Trend']} | {r['MA20_Dev%']} | {r['Vol_R']} | {r['KD']} | {r.get('Score')} |"
+        lines.append(line)
+    
+    lines.append("")
+    lines.append("> 訊號分：趨勢多頭(+2), 價漲量增(+1), KD金叉(+1), MACD金叉(+1), 土洋合買(+2)")
+    
+    return "\n".join(lines)
+
