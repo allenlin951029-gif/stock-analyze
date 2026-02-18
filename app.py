@@ -10,7 +10,7 @@ from streamlit_cookies_manager import EncryptedCookieManager
 from google.oauth2 import service_account
 from google.cloud import firestore
 
-# 確保 stock.py 位於同一目錄下
+# [span_0](start_span)確保 stock.py 位於同一目錄下[span_0](end_span)
 from stock import (
     analyze_stock_technical,
     analyze_sector_performance,
@@ -185,25 +185,25 @@ def run_analysis(stock_id, as_of_date, write_history):
     current_mode = st.session_state.report_mode  # 'human' or 'ai'
 
     try:
-        # [span_0](start_span)呼叫 stock.py，傳入對應的 mode[span_0](end_span)
-        # mode="human" -> 只回傳文字，速度快
-        # mode="ai"    -> 回傳完整 JSON，速度慢
+        # [span_1](start_span)呼叫 stock.py，傳入對應的 mode[span_1](end_span)
+        # mode="human" -> 只回傳文字，速度快 (Quick Screen)
+        # mode="ai"    -> 回傳完整 JSON，速度慢 (Deep Dive)
         raw_result = analyze_stock_technical(sid, as_of_date=as_of_date, mode=current_mode)
         
         if current_mode == "human":
-            # Human 模式：省時間，不產生 AI 數據
+            # Quick Screen 模式：省時間，不產生 AI 數據
             final_result["human_report"] = raw_result.get("human_report", "No report generated.")
             final_result["ai_report"] = None 
         else:
-            # AI 模式：取得完整數據，並順便產生文字報告
+            # Deep Dive 模式：取得完整數據，並順便產生文字報告
             feat_data = raw_result.get("ai_report", {})
             final_result["ai_report"] = feat_data
             
-            # [span_1](start_span)手動產生文字報告，這樣使用者切換回 Human View 時也能看到內容[span_1](end_span)
+            # 手動產生文字報告，這樣使用者切換回 Quick Screen View 時也能看到內容
             if feat_data:
                 final_result["human_report"] = format_text_report(feat_data)
             else:
-                final_result["human_report"] = "AI Analysis failed (no data)."
+                final_result["human_report"] = "Deep Dive Analysis failed (no data)."
 
     except Exception as e:
         err_msg = f"Error: {type(e).__name__}: {e}"
@@ -218,11 +218,11 @@ def run_analysis(stock_id, as_of_date, write_history):
 
 def run_sector_analysis(sector_name, as_of_date, custom_list=None):
     """
-    類股快速掃描 (通常用 Human mode 顯示列表)
+    類股快速掃描 (通常用 Quick Screen 模式顯示列表)
     """
     final_report = ""
     try:
-        # [span_2](start_span)Sector Scan 固定輸出文字列表[span_2](end_span)
+        # [span_2](start_span)Sector Scan 固定輸出文字列表 (Human mode)[span_2](end_span)
         final_report = analyze_sector_performance(
             sector_name, as_of_date=as_of_date, custom_tickers=custom_list, mode="human"
         )
@@ -241,7 +241,7 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
 
     mode = st.session_state.report_mode # 'human' or 'ai'
 
-    if mode == "ai":
+    if mode == "ai": # Deep Dive
         all_reports = {}
         for stock in target_list:
             try:
@@ -255,7 +255,7 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
                 all_reports[stock] = {"error": str(e)}
 
         combined = {
-            "human_report": f"Sector [{sector_name}] AI report ({len(target_list)} stocks)\nDate: {as_of_date}",
+            "human_report": f"Sector [{sector_name}] Deep Dive report ({len(target_list)} stocks)\nDate: {as_of_date}",
             "ai_report": {
                 "sector": sector_name,
                 "date": str(as_of_date),
@@ -264,9 +264,9 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
         }
         save_to_archive(f"Full: {sector_name}", as_of_date, combined)
     else:
-        # Human Mode
+        # Quick Screen (Human Mode)
         full_content = []
-        full_content.append(f"Sector [{sector_name}] Full Report")
+        full_content.append(f"Sector [{sector_name}] Quick Screen Report")
         full_content.append(f"Date: {as_of_date}")
         full_content.append(f"Stocks: {', '.join(target_list)}")
         full_content.append("=" * 60)
@@ -303,21 +303,22 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("#### Report Mode")
     
+    # 邏輯映射：Quick Screen -> Human mode, Deep Dive -> AI mode
     idx = 0 if st.session_state.report_mode == "human" else 1
     mode_choice = st.radio(
         "Select output mode:",
-        ["Human (readable)", "AI (JSON data)"],
+        ["Quick Screen", "Deep Dive"],
         index=idx,
         key="report_mode_radio",
-        help="Human: Fast, text summary.\nAI: Slow, full JSON with all indicators.",
+        help="Quick Screen: Fast, text summary.\nDeep Dive: Slow, full JSON with all indicators.",
     )
     # 更新 session state
-    st.session_state.report_mode = "human" if mode_choice == "Human (readable)" else "ai"
+    st.session_state.report_mode = "human" if mode_choice == "Quick Screen" else "ai"
 
     if is_ai_mode():
-        st.info("AI mode: 完整數據分析 (較慢，含籌碼/營收/JSON)。")
+        st.info("Deep Dive mode: 完整數據分析 (較慢，含籌碼/營收/JSON)。")
     else:
-        st.success("Human mode: 快速文字摘要 (較快，僅技術面)。")
+        st.success("Quick Screen mode: 快速文字摘要 (較快，僅技術面)。")
 
     st.markdown("---")
     auto = st.toggle("Auto-refresh (10s)", value=False, key="auto_refresh")
@@ -372,11 +373,11 @@ with tab1:
     with col2:
         st.write("")
         st.write("")
-        btn_label = "AI Analyze" if is_ai_mode() else "Analyze"
+        btn_label = "Deep Dive" if is_ai_mode() else "Quick Screen"
         search = st.button(btn_label, use_container_width=True, key="run_btn")
 
     if search:
-        mode_str = "AI" if is_ai_mode() else "Human"
+        mode_str = "Deep Dive" if is_ai_mode() else "Quick Screen"
         with st.spinner(f"Analyzing {stock_id.strip().upper()} ({mode_str}) ..."):
             run_analysis(stock_id, st.session_state.as_of_date, write_history=True)
             st.rerun()
@@ -417,9 +418,9 @@ with tab2:
             st.markdown("**Stocks**: (none)")
 
         if is_ai_mode():
-            st.caption("AI mode - full report outputs JSON")
+            st.caption("Deep Dive mode - full report outputs JSON")
         else:
-            st.caption("Human mode - full report outputs text summary")
+            st.caption("Quick Screen mode - full report outputs text summary")
 
         b1, b2 = st.columns(2)
         with b1:
@@ -430,7 +431,7 @@ with tab2:
                     st.rerun()
         with b2:
             if st.button("Full Report", use_container_width=True):
-                mode_str = "AI" if is_ai_mode() else "Human"
+                mode_str = "Deep Dive" if is_ai_mode() else "Quick Screen"
                 with st.spinner(f"Generating {selected_sector} full report ({mode_str}) ..."):
                     clist = target_list if source_type == "Custom" else None
                     run_full_sector_report(selected_sector, sector_date, custom_list=clist)
@@ -528,8 +529,8 @@ if archive_len > 0:
     current_idx = st.session_state.view_index
     record = st.session_state.results_archive[current_idx]
 
-    # 顯示頂部的狀態 Bar
-    mode_badge = "AI" if is_ai_mode() else "Human"
+    # 顯示頂部的狀態 Bar (更新標籤)
+    mode_badge = "Deep Dive" if is_ai_mode() else "Quick Screen"
     badge_color = "#1a73e8" if is_ai_mode() else "#2e7d32"
     
     st.markdown(
@@ -552,8 +553,8 @@ if archive_len > 0:
             st.rerun()
             
     with c_switch:
-        # 切換按鈕
-        switch_label = "Switch to Human" if is_ai_mode() else "Switch to AI"
+        # 切換按鈕 (更新標籤)
+        switch_label = "Switch to Quick Screen" if is_ai_mode() else "Switch to Deep Dive"
         if st.button(switch_label, use_container_width=True, key="inline_mode_switch"):
             if is_ai_mode():
                 st.session_state.report_mode = "human"
@@ -574,13 +575,13 @@ if archive_len > 0:
     if isinstance(content, dict) and "human_report" in content and "ai_report" in content:
         
         if is_ai_mode():
-            st.markdown("### AI Features JSON Data")
+            st.markdown("### Deep Dive Data")
             ai_data = content["ai_report"]
             
-            # [修正重點] 檢查 AI 資料是否存在
+            # 檢查 Deep Dive (AI) 資料是否存在
             if ai_data is None:
-                st.warning("⚠️ 此筆紀錄為 Human 模式生成 (快速)，無 AI 詳細數據。")
-                st.info("若需查看詳細籌碼/指標數據，請將左側模式切換為 'AI (JSON data)' 並重新按 Analyze。")
+                st.warning("⚠️ 此筆紀錄為 Quick Screen 模式生成 (快速)，無 Deep Dive 詳細數據。")
+                st.info("若需查看詳細籌碼/指標數據，請將左側模式切換為 'Deep Dive' 並重新按 Analyze。")
             else:
                 # 正常顯示 AI 數據
                 if isinstance(ai_data, dict) and "stocks" in ai_data:
@@ -607,13 +608,13 @@ if archive_len > 0:
                     st.download_button(
                         label="Download JSON",
                         data=json_str,
-                        file_name=f"{record['id']}_{record['date']}_ai.json",
+                        file_name=f"{record['id']}_{record['date']}_deep_dive.json",
                         mime="application/json",
                         key=f"dl_json_{current_idx}",
                     )
         else:
             # Human Mode 顯示
-            st.markdown("### Human Report")
+            st.markdown("### Quick Screen Report")
             st.code(content["human_report"], language="text")
     else:
         # 非標準格式 (例如舊資料或錯誤訊息)
