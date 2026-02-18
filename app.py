@@ -10,7 +10,7 @@ from streamlit_cookies_manager import EncryptedCookieManager
 from google.oauth2 import service_account
 from google.cloud import firestore
 
-# 確保 stock.py 裡有這些函式與變數
+# 確保 stock.py 位於同一目錄下
 from stock import (
     analyze_stock_technical,
     analyze_sector_performance,
@@ -23,7 +23,7 @@ st.set_page_config(page_title="Stock Analyze", layout="wide")
 st.title("Stock Analyze")
 
 # -------------------------
-# Firestore
+# Firestore Configuration
 # -------------------------
 FS_COLLECTION = "stock_app_data"
 FS_DOCUMENT = "config"
@@ -69,7 +69,7 @@ def save_sectors_to_db(data):
         st.warning("No Firebase. Data is temporary.")
 
 # -------------------------
-# Cookies
+# Cookies Configuration
 # -------------------------
 cookies = EncryptedCookieManager(
     prefix="stock_analyze_",
@@ -113,7 +113,7 @@ def save_current_to_cookie(sid):
     commit_cookies_once()
 
 # -------------------------
-# Session init
+# Session Initialization
 # -------------------------
 if "history" not in st.session_state:
     st.session_state.history = load_history_from_cookie()
@@ -137,7 +137,7 @@ if "report_mode" not in st.session_state:
     st.session_state.report_mode = "human"
 
 # -------------------------
-# Helpers
+# Helper Functions
 # -------------------------
 def is_ai_mode():
     return st.session_state.report_mode == "ai"
@@ -157,6 +157,8 @@ def save_to_archive(display_title, display_date, content):
         "date": str(display_date),
         "content": content,
         "created_at": datetime.now().strftime("%H:%M:%S"),
+        # 紀錄當時生成的模式，方便後續除錯或顯示
+        "generated_mode": st.session_state.report_mode
     }
     st.session_state.results_archive.append(record)
     if len(st.session_state.results_archive) > 10:
@@ -164,52 +166,87 @@ def save_to_archive(display_title, display_date, content):
     st.session_state.view_index = len(st.session_state.results_archive) - 1
 
 def run_analysis(stock_id, as_of_date, write_history):
-    # 1. 處理輸入與 Cookie
+    """
+    執行個股分析的核心函式。
+    根據 session_state.report_mode 決定跑 'human' (快) 還是 'ai' (慢)。
+    """
     sid = stock_id.strip().upper()
     if not sid:
         return
+    
+    # 1. 更新 Cookie 與 Session
     st.session_state.current_id = sid
     save_current_to_cookie(sid)
     if write_history:
         push_history_cookie(sid)
 
-    # 2. 執行分析 (縮排修正重點)
-    final_result = None
+    # 2. 執行分析
+    final_result = {}
+    current_mode = st.session_state.report_mode  # 'human' or 'ai'
+
     try:
-        final_result = analyze_stock_technical(sid, as_of_date=as_of_date)
+        # [span_0](start_span)呼叫 stock.py，傳入對應的 mode[span_0](end_span)
+        # mode="human" -> 只回傳文字，速度快
+        # mode="ai"    -> 回傳完整 JSON，速度慢
+        raw_result = analyze_stock_technical(sid, as_of_date=as_of_date, mode=current_mode)
+        
+        if current_mode == "human":
+            # Human 模式：省時間，不產生 AI 數據
+            final_result["human_report"] = raw_result.get("human_report", "No report generated.")
+            final_result["ai_report"] = None 
+        else:
+            # AI 模式：取得完整數據，並順便產生文字報告
+            feat_data = raw_result.get("ai_report", {})
+            final_result["ai_report"] = feat_data
+            
+            # [span_1](start_span)手動產生文字報告，這樣使用者切換回 Human View 時也能看到內容[span_1](end_span)
+            if feat_data:
+                final_result["human_report"] = format_text_report(feat_data)
+            else:
+                final_result["human_report"] = "AI Analysis failed (no data)."
+
     except Exception as e:
-        err_msg = "Error: {}: {}".format(type(e).__name__, e)
+        err_msg = f"Error: {type(e).__name__}: {e}"
         final_result = {
             "human_report": err_msg,
             "ai_report": {"error": str(e)},
         }
-        st.session_state._last_debug = "exception={}".format(type(e).__name__)
+        st.session_state._last_debug = f"exception={type(e).__name__}"
 
-    # 3. 存檔 (縮排修正重點)
+    # 3. 存檔
     save_to_archive(sid, as_of_date, final_result)
 
 def run_sector_analysis(sector_name, as_of_date, custom_list=None):
+    """
+    類股快速掃描 (通常用 Human mode 顯示列表)
+    """
     final_report = ""
     try:
+        # [span_2](start_span)Sector Scan 固定輸出文字列表[span_2](end_span)
         final_report = analyze_sector_performance(
-            sector_name, as_of_date=as_of_date, custom_tickers=custom_list
+            sector_name, as_of_date=as_of_date, custom_tickers=custom_list, mode="human"
         )
     except Exception as e:
-        final_report = "Sector analysis failed: {}".format(e)
-    save_to_archive("Quick: {}".format(sector_name), as_of_date, final_report)
+        final_report = f"Sector analysis failed: {e}"
+    save_to_archive(f"Quick: {sector_name}", as_of_date, final_report)
 
 def run_full_sector_report(sector_name, as_of_date, custom_list=None):
+    """
+    類股完整報告 (根據當前模式跑迴圈)
+    """
     target_list = custom_list if custom_list else SECTOR_DICT.get(sector_name, [])
     if not target_list:
-        save_to_archive("Full: {}".format(sector_name), as_of_date, "No stocks.")
+        save_to_archive(f"Full: {sector_name}", as_of_date, "No stocks.")
         return
 
-    # 縮排修正重點：if/else 必須在函式內
-    if is_ai_mode():
+    mode = st.session_state.report_mode # 'human' or 'ai'
+
+    if mode == "ai":
         all_reports = {}
         for stock in target_list:
             try:
-                res = analyze_stock_technical(stock, as_of_date=as_of_date)
+                # 強制跑 AI 模式收集數據
+                res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="ai")
                 if isinstance(res, dict):
                     all_reports[stock] = res.get("ai_report", {})
                 else:
@@ -218,27 +255,27 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
                 all_reports[stock] = {"error": str(e)}
 
         combined = {
-            "human_report": "Sector [{}] AI report ({} stocks)\nDate: {}".format(
-                sector_name, len(target_list), as_of_date
-            ),
+            "human_report": f"Sector [{sector_name}] AI report ({len(target_list)} stocks)\nDate: {as_of_date}",
             "ai_report": {
                 "sector": sector_name,
                 "date": str(as_of_date),
                 "stocks": all_reports,
             },
         }
-        save_to_archive("Full: {}".format(sector_name), as_of_date, combined)
+        save_to_archive(f"Full: {sector_name}", as_of_date, combined)
     else:
+        # Human Mode
         full_content = []
-        full_content.append("Sector [{}] Full Report".format(sector_name))
-        full_content.append("Date: {}".format(as_of_date))
-        full_content.append("Stocks: {}".format(", ".join(target_list)))
+        full_content.append(f"Sector [{sector_name}] Full Report")
+        full_content.append(f"Date: {as_of_date}")
+        full_content.append(f"Stocks: {', '.join(target_list)}")
         full_content.append("=" * 60)
         full_content.append("")
 
         for stock in target_list:
             try:
-                res = analyze_stock_technical(stock, as_of_date=as_of_date)
+                # 跑 Human 模式 (快)
+                res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="human")
                 if isinstance(res, dict):
                     full_content.append(res.get("human_report", str(res)))
                 else:
@@ -247,18 +284,22 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
                 full_content.append("=" * 60)
                 full_content.append("")
             except Exception as e:
-                full_content.append("FAIL {}: {}".format(stock, e))
+                full_content.append(f"FAIL {stock}: {e}")
                 full_content.append("-" * 60)
 
         combined_report = "\n".join(full_content)
-        save_to_archive("Full: {}".format(sector_name), as_of_date, combined_report)
+        # 這裡因為是純文字合併，結構稍微不同，為了統一 UI 顯示，我們包裝一下
+        final_struct = {
+            "human_report": combined_report,
+            "ai_report": None
+        }
+        save_to_archive(f"Full: {sector_name}", as_of_date, final_struct)
 
 # -------------------------
 # Sidebar
 # -------------------------
 with st.sidebar:
     st.subheader("Settings")
-
     st.markdown("---")
     st.markdown("#### Report Mode")
     
@@ -268,21 +309,22 @@ with st.sidebar:
         ["Human (readable)", "AI (JSON data)"],
         index=idx,
         key="report_mode_radio",
-        help="Human: concise text summary.\nAI: full JSON with all indicators.",
+        help="Human: Fast, text summary.\nAI: Slow, full JSON with all indicators.",
     )
+    # 更新 session state
     st.session_state.report_mode = "human" if mode_choice == "Human (readable)" else "ai"
 
     if is_ai_mode():
-        st.info("AI mode: full JSON output with all numeric indicators and flags, downloadable.")
+        st.info("AI mode: 完整數據分析 (較慢，含籌碼/營收/JSON)。")
     else:
-        st.success("Human mode: concise text summary with trend, indicators, and key flags.")
+        st.success("Human mode: 快速文字摘要 (較快，僅技術面)。")
 
     st.markdown("---")
     auto = st.toggle("Auto-refresh (10s)", value=False, key="auto_refresh")
     tick = 0
     if auto:
         tick = st_autorefresh(interval=10_000, key="autorefresh_10s")
-        st.caption("tick = {}".format(tick))
+        st.caption(f"tick = {tick}")
 
     st.divider()
     st.subheader("Search History")
@@ -291,7 +333,7 @@ with st.sidebar:
         col_a, col_b = st.columns(2)
         with col_a:
             if st.button("Recall", use_container_width=True, key="history_run"):
-                with st.spinner("Analyzing {} ...".format(picked)):
+                with st.spinner(f"Analyzing {picked} ..."):
                     run_analysis(picked, st.session_state.as_of_date, write_history=False)
                     st.rerun()
         with col_b:
@@ -307,7 +349,7 @@ with st.sidebar:
         st.success("Cloud DB connected")
     else:
         st.warning("No cloud DB")
-
+    
     st.info("Use pagination below to browse results.")
 
 # -------------------------
@@ -315,7 +357,7 @@ with st.sidebar:
 # -------------------------
 tab1, tab2, tab3 = st.tabs(["Stock Analysis", "Sector Analysis", "Custom Sectors"])
 
-# --- Tab 1 ---
+# --- Tab 1: Stock Analysis ---
 with tab1:
     col1, col_mid, col2 = st.columns([2.0, 1.1, 1.0])
     with col1:
@@ -335,11 +377,11 @@ with tab1:
 
     if search:
         mode_str = "AI" if is_ai_mode() else "Human"
-        with st.spinner("Analyzing {} ({}) ...".format(stock_id.strip().upper(), mode_str)):
+        with st.spinner(f"Analyzing {stock_id.strip().upper()} ({mode_str}) ..."):
             run_analysis(stock_id, st.session_state.as_of_date, write_history=True)
             st.rerun()
 
-# --- Tab 2 ---
+# --- Tab 2: Sector Analysis ---
 with tab2:
     source_type = st.radio("Source:", ["Built-in", "Custom"], horizontal=True)
     c1, c2 = st.columns([2, 1])
@@ -370,7 +412,7 @@ with tab2:
 
     if selected_sector:
         if target_list:
-            st.markdown("**Stocks**: `{}`".format(", ".join(target_list)))
+            st.markdown(f"**Stocks**: `{', '.join(target_list)}`")
         else:
             st.markdown("**Stocks**: (none)")
 
@@ -382,19 +424,19 @@ with tab2:
         b1, b2 = st.columns(2)
         with b1:
             if st.button("Quick Scan", use_container_width=True):
-                with st.spinner("Scanning {} ...".format(selected_sector)):
+                with st.spinner(f"Scanning {selected_sector} ..."):
                     clist = target_list if source_type == "Custom" else None
                     run_sector_analysis(selected_sector, sector_date, custom_list=clist)
                     st.rerun()
         with b2:
             if st.button("Full Report", use_container_width=True):
                 mode_str = "AI" if is_ai_mode() else "Human"
-                with st.spinner("Generating {} full report ({}) ...".format(selected_sector, mode_str)):
+                with st.spinner(f"Generating {selected_sector} full report ({mode_str}) ..."):
                     clist = target_list if source_type == "Custom" else None
                     run_full_sector_report(selected_sector, sector_date, custom_list=clist)
                     st.rerun()
 
-# --- Tab 3 ---
+# --- Tab 3: Custom Sectors ---
 with tab3:
     st.header("Custom Sector Management")
     col_mgmt_1, col_mgmt_2 = st.columns(2)
@@ -411,7 +453,7 @@ with tab3:
                 else:
                     st.session_state.custom_sectors[new_group] = []
                     save_sectors_to_db(st.session_state.custom_sectors)
-                    st.success("Created {}".format(new_group))
+                    st.success(f"Created {new_group}")
                     st.rerun()
 
     with col_mgmt_2:
@@ -438,7 +480,7 @@ with tab3:
                         if val and val not in current_list:
                             current_list.append(val)
                             save_sectors_to_db(st.session_state.custom_sectors)
-                            st.success("Added {}".format(val))
+                            st.success(f"Added {val}")
                             st.rerun()
 
                 st.divider()
@@ -448,9 +490,9 @@ with tab3:
                     for s in current_list:
                         cr1, cr2 = st.columns([4, 1])
                         with cr1:
-                            st.text("  {}".format(s))
+                            st.text(f"  {s}")
                         with cr2:
-                            if st.button("Remove", key="del_{}_{}".format(edit_group, s)):
+                            if st.button("Remove", key=f"del_{edit_group}_{s}"):
                                 current_list.remove(s)
                                 save_sectors_to_db(st.session_state.custom_sectors)
                                 st.rerun()
@@ -462,18 +504,18 @@ with tab3:
                     st.rerun()
 
 # -------------------------
-# Auto Refresh
+# Auto Refresh Logic
 # -------------------------
 if auto and tick != st.session_state.last_tick:
     st.session_state.last_tick = tick
-    with st.spinner("Auto-refreshing {} ...".format(st.session_state.current_id)):
+    with st.spinner(f"Auto-refreshing {st.session_state.current_id} ..."):
         run_analysis(st.session_state.current_id, st.session_state.as_of_date, write_history=False)
         st.rerun()
 
 st.divider()
 
 # -------------------------
-# Pagination Display
+# Pagination & Result Display
 # -------------------------
 archive_len = len(st.session_state.results_archive)
 
@@ -486,93 +528,95 @@ if archive_len > 0:
     current_idx = st.session_state.view_index
     record = st.session_state.results_archive[current_idx]
 
+    # 顯示頂部的狀態 Bar
     mode_badge = "AI" if is_ai_mode() else "Human"
     badge_color = "#1a73e8" if is_ai_mode() else "#2e7d32"
-
+    
     st.markdown(
-        '<div style="text-align:center;background:#262730;padding:10px;border-radius:5px;'
-        'border:1px solid #464b5c;margin-bottom:10px;">'
-        '<span style="font-size:1.2em;font-weight:bold;color:#fff;">{}</span>'
-        '<span style="color:#ccc;font-size:0.9em;margin-left:10px;">({})</span>'
-        '<span style="background:{};color:#fff;padding:2px 8px;border-radius:10px;'
-        'font-size:0.75em;margin-left:8px;">{}</span>'
-        '<br><span style="font-size:0.8em;color:#aaa;">'
-        "{} / {} ({})</span></div>".format(
-            record["id"],
-            record["date"],
-            badge_color,
-            mode_badge,
-            current_idx + 1,
-            archive_len,
-            record["created_at"],
-        ),
+        f'<div style="text-align:center;background:#262730;padding:10px;border-radius:5px;'
+        f'border:1px solid #464b5c;margin-bottom:10px;">'
+        f'<span style="font-size:1.2em;font-weight:bold;color:#fff;">{record["id"]}</span>'
+        f'<span style="color:#ccc;font-size:0.9em;margin-left:10px;">({record["date"]})</span>'
+        f'<span style="background:{badge_color};color:#fff;padding:2px 8px;border-radius:10px;'
+        f'font-size:0.75em;margin-left:8px;">{mode_badge} View</span>'
+        f'<br><span style="font-size:0.8em;color:#aaa;">'
+        f"{current_idx + 1} / {archive_len} ({record['created_at']})</span></div>",
         unsafe_allow_html=True,
     )
 
-    # Pagination + inline mode switch
+    # 導覽按鈕 + 模式切換按鈕
     c_prev, c_switch, c_next = st.columns([1, 1, 1])
     with c_prev:
         if st.button("Prev", disabled=(current_idx == 0), use_container_width=True):
             st.session_state.view_index -= 1
             st.rerun()
+            
     with c_switch:
-        content = record["content"]
-        if isinstance(content, dict) and "human_report" in content and "ai_report" in content:
-            switch_label = "Switch to Human" if is_ai_mode() else "Switch to AI"
-            if st.button(switch_label, use_container_width=True, key="inline_mode_switch"):
-                if is_ai_mode():
-                    st.session_state.report_mode = "human"
-                else:
-                    st.session_state.report_mode = "ai"
-                st.rerun()
+        # 切換按鈕
+        switch_label = "Switch to Human" if is_ai_mode() else "Switch to AI"
+        if st.button(switch_label, use_container_width=True, key="inline_mode_switch"):
+            if is_ai_mode():
+                st.session_state.report_mode = "human"
+            else:
+                st.session_state.report_mode = "ai"
+            st.rerun()
+            
     with c_next:
         if st.button("Next", disabled=(current_idx == archive_len - 1), use_container_width=True):
             st.session_state.view_index += 1
             st.rerun()
 
-    # Content display
+    # 內容顯示邏輯
     content = record["content"]
     st.write("---")
 
+    # 檢查內容是否為我們定義的標準格式 (包含 human_report 與 ai_report)
     if isinstance(content, dict) and "human_report" in content and "ai_report" in content:
+        
         if is_ai_mode():
             st.markdown("### AI Features JSON Data")
             ai_data = content["ai_report"]
-
-            if isinstance(ai_data, dict) and "stocks" in ai_data:
-                st.markdown("**Sector**: {} | **Date**: {}".format(
-                    ai_data.get("sector", "?"), ai_data.get("date", "?")
-                ))
-                st.markdown("**{} stocks**".format(len(ai_data["stocks"])))
-
-                for stock_key, stock_data in ai_data["stocks"].items():
-                    with st.expander(stock_key, expanded=False):
-                        st.json(stock_data)
-
-                json_str = json.dumps(ai_data, indent=2, default=str, ensure_ascii=False)
-                st.download_button(
-                    label="Download JSON",
-                    data=json_str,
-                    file_name="sector_{}_{}.json".format(
-                        ai_data.get("sector", "unknown"), ai_data.get("date", "")
-                    ),
-                    mime="application/json",
-                    key="dl_sector_json_{}".format(current_idx),
-                )
+            
+            # [修正重點] 檢查 AI 資料是否存在
+            if ai_data is None:
+                st.warning("⚠️ 此筆紀錄為 Human 模式生成 (快速)，無 AI 詳細數據。")
+                st.info("若需查看詳細籌碼/指標數據，請將左側模式切換為 'AI (JSON data)' 並重新按 Analyze。")
             else:
-                st.json(ai_data)
-                json_str = json.dumps(ai_data, indent=2, default=str, ensure_ascii=False)
-                st.download_button(
-                    label="Download JSON",
-                    data=json_str,
-                    file_name="{}_{}_ai.json".format(record["id"], record["date"]),
-                    mime="application/json",
-                    key="dl_json_{}".format(current_idx),
-                )
+                # 正常顯示 AI 數據
+                if isinstance(ai_data, dict) and "stocks" in ai_data:
+                    # 這是 Sector Report
+                    st.markdown(f"**Sector**: {ai_data.get('sector', '?')} | **Date**: {ai_data.get('date', '?')}")
+                    st.markdown(f"**{len(ai_data['stocks'])} stocks**")
+
+                    for stock_key, stock_data in ai_data["stocks"].items():
+                        with st.expander(stock_key, expanded=False):
+                            st.json(stock_data)
+
+                    json_str = json.dumps(ai_data, indent=2, default=str, ensure_ascii=False)
+                    st.download_button(
+                        label="Download JSON",
+                        data=json_str,
+                        file_name=f"sector_{ai_data.get('sector', 'unknown')}_{ai_data.get('date', '')}.json",
+                        mime="application/json",
+                        key=f"dl_sector_json_{current_idx}",
+                    )
+                else:
+                    # 這是 Single Stock Report
+                    st.json(ai_data)
+                    json_str = json.dumps(ai_data, indent=2, default=str, ensure_ascii=False)
+                    st.download_button(
+                        label="Download JSON",
+                        data=json_str,
+                        file_name=f"{record['id']}_{record['date']}_ai.json",
+                        mime="application/json",
+                        key=f"dl_json_{current_idx}",
+                    )
         else:
+            # Human Mode 顯示
             st.markdown("### Human Report")
             st.code(content["human_report"], language="text")
     else:
+        # 非標準格式 (例如舊資料或錯誤訊息)
         st.code(str(content), language="text")
 else:
     st.info("No results yet. Use the tabs above to run an analysis.")
