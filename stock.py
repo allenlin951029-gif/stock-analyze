@@ -1,11 +1,13 @@
 # stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON
 # Supports two modes: human (fast, skip network) / ai (full data)
+# *** OPTIMIZED VERSION – key changes marked with # [OPT] ***
 
 import io
 import json
 import math
 import re
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -26,6 +28,26 @@ except Exception:
 # ===================================================================
 # 0. UTILS
 # ===================================================================
+
+# [OPT] Reusable HTTP session for connection pooling across all requests
+_http_session: Optional[requests.Session] = None
+
+
+def _get_session() -> requests.Session:
+    """Return a module-level requests.Session with connection pooling."""
+    global _http_session
+    if _http_session is None:
+        _http_session = requests.Session()
+        _http_session.headers.update(
+            {"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-TW,zh;q=0.9"}
+        )
+        # Increase pool size for concurrent requests
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10, pool_maxsize=20, max_retries=1
+        )
+        _http_session.mount("https://", adapter)
+        _http_session.mount("http://", adapter)
+    return _http_session
 
 
 def clean_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -226,10 +248,27 @@ def detect_momentum_candle_patterns(df: pd.DataFrame, n: int = 5) -> Dict[str, A
         }
 
     tail = df.tail(n)
-    types = [
-        classify_candle(r["Open"], r["High"], r["Low"], r["Close"])
-        for _, r in tail.iterrows()
-    ]
+
+    # [OPT] Vectorised candle classification – no iterrows()
+    o_arr = tail["Open"].values.astype(float)
+    h_arr = tail["High"].values.astype(float)
+    l_arr = tail["Low"].values.astype(float)
+    c_arr = tail["Close"].values.astype(float)
+
+    rng = h_arr - l_arr
+    body = np.abs(c_arr - o_arr)
+    safe_rng = np.where(rng > 0, rng, 1.0)
+    body_r = body / safe_rng
+    bullish = c_arr > o_arr
+
+    types = []
+    for i in range(len(tail)):
+        if rng[i] <= 0 or body_r[i] <= 0.10:
+            types.append("doji")
+        elif body_r[i] >= 0.60:
+            types.append("long_bull" if bullish[i] else "long_bear")
+        else:
+            types.append("small_bull" if bullish[i] else "small_bear")
 
     cons_bull = 0
     for t in reversed(types):
@@ -341,54 +380,70 @@ def calculate_obv(df: pd.DataFrame) -> pd.Series:
     return (np.sign(df["Close"].diff()).fillna(0) * df["Volume"]).cumsum()
 
 
+# [OPT] SuperTrend: use numpy arrays inside the loop to avoid pandas iloc overhead
 def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0):
-    df2 = df.copy()
-    tr = pd.concat(
-        [
-            df2["High"] - df2["Low"],
-            abs(df2["High"] - df2["Close"].shift(1)),
-            abs(df2["Low"] - df2["Close"].shift(1)),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.ewm(span=period, adjust=False).mean()
-    hl2 = (df2["High"] + df2["Low"]) / 2
-    upper_band = (hl2 + multiplier * atr).copy()
-    lower_band = (hl2 - multiplier * atr).copy()
-    supertrend = pd.Series(np.nan, index=df2.index)
-    direction = pd.Series(0, index=df2.index)
+    n = len(df)
+    high = df["High"].values.astype(float)
+    low = df["Low"].values.astype(float)
+    close = df["Close"].values.astype(float)
 
-    for i in range(1, len(df2)):
-        ub_p = upper_band.iloc[i - 1]
-        lb_p = lower_band.iloc[i - 1]
-        c_p = df2["Close"].iloc[i - 1]
-        upper_band.iloc[i] = (
-            min(upper_band.iloc[i], ub_p) if c_p <= ub_p else upper_band.iloc[i]
-        )
-        lower_band.iloc[i] = (
-            max(lower_band.iloc[i], lb_p) if c_p >= lb_p else lower_band.iloc[i]
-        )
-        c_now = df2["Close"].iloc[i]
-        st_p = supertrend.iloc[i - 1]
+    tr = np.maximum(
+        high - low,
+        np.maximum(
+            np.abs(high - np.roll(close, 1)),
+            np.abs(low - np.roll(close, 1)),
+        ),
+    )
+    tr[0] = high[0] - low[0]
 
-        if pd.isna(st_p) or st_p >= ub_p:
-            if c_now > upper_band.iloc[i]:
-                supertrend.iloc[i] = lower_band.iloc[i]
-                direction.iloc[i] = 1
+    # EWM ATR
+    atr = np.empty(n, dtype=float)
+    atr[0] = tr[0]
+    alpha = 2.0 / (period + 1)
+    for i in range(1, n):
+        atr[i] = alpha * tr[i] + (1 - alpha) * atr[i - 1]
+
+    hl2 = (high + low) / 2.0
+    upper_band = hl2 + multiplier * atr
+    lower_band = hl2 - multiplier * atr
+    supertrend = np.full(n, np.nan)
+    direction = np.zeros(n, dtype=int)
+
+    supertrend[0] = upper_band[0]
+    direction[0] = -1
+
+    for i in range(1, n):
+        ub_p = upper_band[i - 1]
+        lb_p = lower_band[i - 1]
+        c_p = close[i - 1]
+
+        if c_p <= ub_p:
+            upper_band[i] = min(upper_band[i], ub_p)
+        if c_p >= lb_p:
+            lower_band[i] = max(lower_band[i], lb_p)
+
+        c_now = close[i]
+        st_p = supertrend[i - 1]
+
+        if np.isnan(st_p) or st_p >= ub_p:
+            if c_now > upper_band[i]:
+                supertrend[i] = lower_band[i]
+                direction[i] = 1
             else:
-                supertrend.iloc[i] = upper_band.iloc[i]
-                direction.iloc[i] = -1
+                supertrend[i] = upper_band[i]
+                direction[i] = -1
         else:
-            if c_now < lower_band.iloc[i]:
-                supertrend.iloc[i] = upper_band.iloc[i]
-                direction.iloc[i] = -1
+            if c_now < lower_band[i]:
+                supertrend[i] = upper_band[i]
+                direction[i] = -1
             else:
-                supertrend.iloc[i] = lower_band.iloc[i]
-                direction.iloc[i] = 1
+                supertrend[i] = lower_band[i]
+                direction[i] = 1
 
-    supertrend.iloc[0] = upper_band.iloc[0]
-    direction.iloc[0] = -1
-    return supertrend, direction
+    return (
+        pd.Series(supertrend, index=df.index),
+        pd.Series(direction, index=df.index),
+    )
 
 
 def calculate_avwap(df: pd.DataFrame, anchor_date) -> Optional[pd.Series]:
@@ -401,14 +456,14 @@ def calculate_avwap(df: pd.DataFrame, anchor_date) -> Optional[pd.Series]:
 
 
 # ===================================================================
-# 3. VOLUME PROFILE (POC)
+# 3. VOLUME PROFILE (POC) – [OPT] fully vectorised with NumPy
 # ===================================================================
 
 
 def calculate_volume_profile(
     df: pd.DataFrame, lookback: int = 60, n_bins: int = 50
 ) -> Dict[str, Any]:
-    sub = df.tail(lookback).copy()
+    sub = df.tail(lookback)
     if sub.empty:
         return {"poc_price": None, "poc_volume_k": None, "price_vs_poc_pct": None}
 
@@ -418,15 +473,38 @@ def calculate_volume_profile(
         return {"poc_price": None, "poc_volume_k": None, "price_vs_poc_pct": None}
 
     bins = np.linspace(lo, hi, n_bins + 1)
-    vol_by_bin = np.zeros(n_bins)
 
-    for _, row in sub.iterrows():
-        r_lo, r_hi, vol = float(row["Low"]), float(row["High"]), float(row["Volume"])
-        if r_hi <= r_lo or vol <= 0:
-            continue
-        for b in range(n_bins):
-            overlap = max(0, min(r_hi, bins[b + 1]) - max(r_lo, bins[b]))
-            vol_by_bin[b] += vol * overlap / (r_hi - r_lo)
+    # [OPT] Vectorised volume distribution – replaces double-nested Python loop
+    row_lo = sub["Low"].values.astype(float)
+    row_hi = sub["High"].values.astype(float)
+    row_vol = sub["Volume"].values.astype(float)
+
+    # Mask out invalid rows
+    valid = (row_hi > row_lo) & (row_vol > 0)
+    row_lo = row_lo[valid]
+    row_hi = row_hi[valid]
+    row_vol = row_vol[valid]
+
+    if len(row_lo) == 0:
+        return {"poc_price": None, "poc_volume_k": None, "price_vs_poc_pct": None}
+
+    row_range = row_hi - row_lo  # (R,)
+
+    # bins_lo[b], bins_hi[b] for each bin
+    bins_lo = bins[:-1]  # (B,)
+    bins_hi = bins[1:]   # (B,)
+
+    # Broadcasting: overlap[row, bin] = max(0, min(row_hi, bin_hi) - max(row_lo, bin_lo))
+    # Shapes: row arrays (R,1), bin arrays (1,B)
+    overlap = np.maximum(
+        0.0,
+        np.minimum(row_hi[:, None], bins_hi[None, :])
+        - np.maximum(row_lo[:, None], bins_lo[None, :]),
+    )  # (R, B)
+
+    # Weighted volume per bin
+    weights = row_vol[:, None] * overlap / row_range[:, None]  # (R, B)
+    vol_by_bin = weights.sum(axis=0)  # (B,)
 
     poc_idx = int(np.argmax(vol_by_bin))
     poc_price = round((bins[poc_idx] + bins[poc_idx + 1]) / 2, 2)
@@ -549,7 +627,7 @@ def calculate_fibonacci_summary(df: pd.DataFrame, lookback: int = 120) -> Dict[s
 
 
 # ===================================================================
-# 7. GAPS
+# 7. GAPS – [OPT] vectorised gap detection
 # ===================================================================
 
 
@@ -557,34 +635,43 @@ def detect_gaps_summary(df: pd.DataFrame, lookback: int = 30) -> List[Dict]:
     if df is None or df.empty or len(df) < 2:
         return []
     sub = df.tail(lookback + 1)
+    if len(sub) < 2:
+        return []
+
+    # [OPT] vectorised: extract arrays once
+    highs = sub["High"].values.astype(float)
+    lows = sub["Low"].values.astype(float)
+    dates = sub.index
+
     gaps = []
     for i in range(1, len(sub)):
-        prev, curr = sub.iloc[i - 1], sub.iloc[i]
-        date_str = sub.index[i].strftime("%Y-%m-%d")
+        date_str = dates[i].strftime("%Y-%m-%d")
 
-        if float(curr["Low"]) > float(prev["High"]):
-            future = sub.iloc[i + 1 :]
-            filled = any(float(r["Low"]) <= float(prev["High"]) for _, r in future.iterrows())
+        if lows[i] > highs[i - 1]:
+            # Gap up – check fill using vectorised comparison
+            future_lows = lows[i + 1:]
+            filled = bool(np.any(future_lows <= highs[i - 1])) if len(future_lows) > 0 else False
             if not filled:
                 gaps.append(
                     {
                         "date": date_str,
                         "type": "up",
-                        "lower": float(prev["High"]),
-                        "upper": float(curr["Low"]),
+                        "lower": float(highs[i - 1]),
+                        "upper": float(lows[i]),
                     }
                 )
 
-        elif float(curr["High"]) < float(prev["Low"]):
-            future = sub.iloc[i + 1 :]
-            filled = any(float(r["High"]) >= float(prev["Low"]) for _, r in future.iterrows())
+        elif highs[i] < lows[i - 1]:
+            # Gap down – check fill using vectorised comparison
+            future_highs = highs[i + 1:]
+            filled = bool(np.any(future_highs >= lows[i - 1])) if len(future_highs) > 0 else False
             if not filled:
                 gaps.append(
                     {
                         "date": date_str,
                         "type": "down",
-                        "lower": float(curr["High"]),
-                        "upper": float(prev["Low"]),
+                        "lower": float(highs[i]),
+                        "upper": float(lows[i - 1]),
                     }
                 )
 
@@ -815,7 +902,7 @@ def _prioritize_patterns(raw_patterns: List[Dict]) -> List[Dict]:
 
 
 # ===================================================================
-# 9. INSTITUTIONAL DATA
+# 9. INSTITUTIONAL DATA – [OPT] uses pooled session
 # ===================================================================
 
 
@@ -868,13 +955,14 @@ def _parse_tpex_csv(text: str):
 
 def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back: int = 10):
     stock_no = _strip_suffix(stock_id)
+    sess = _get_session()  # [OPT] connection pooling
     headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-TW,zh;q=0.9"}
     prefer_twse = not (isinstance(market_hint, str) and market_hint.upper().endswith(".TWO"))
     last_error = None
 
     def try_twse(d_):
         url = f"https://www.twse.com.tw/fund/T86?response=csv&date={d_.strftime('%Y%m%d')}&selectType=ALLBUT0999"
-        r = requests.get(url, headers=headers, timeout=15)
+        r = sess.get(url, headers=headers, timeout=15)
         if r.status_code != 200 or len(r.text) < 200:
             return None, f"TWSE HTTP {r.status_code}"
         if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
@@ -891,7 +979,7 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
         )
         h2 = dict(headers)
         h2["Referer"] = "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge.php"
-        r = requests.get(url, headers=h2, timeout=15)
+        r = sess.get(url, headers=h2, timeout=15)
         if r.status_code != 200 or len(r.text) < 200:
             return None, f"TPEx HTTP {r.status_code}"
         if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
@@ -1051,6 +1139,7 @@ def compute_institutional_features(chips_multi: List[Dict], price_now: float, pr
 
 
 def get_foreign_holding_ratio(stock_no: str) -> dict:
+    sess = _get_session()  # [OPT]
     headers = {"User-Agent": "Mozilla/5.0"}
     urls = [
         f"https://www.twse.com.tw/rwd/zh/fund/MI_QFIIS?response=json&stockNo={stock_no}&queryType=1",
@@ -1059,7 +1148,7 @@ def get_foreign_holding_ratio(stock_no: str) -> dict:
     last_err = None
     for url in urls:
         try:
-            r = requests.get(url, headers=headers, timeout=15)
+            r = sess.get(url, headers=headers, timeout=15)
             if r.status_code != 200:
                 last_err = f"HTTP {r.status_code}"
                 continue
@@ -1106,7 +1195,7 @@ def get_foreign_holding_ratio(stock_no: str) -> dict:
 
 
 # ===================================================================
-# 10. MARGIN TRADING
+# 10. MARGIN TRADING – [OPT] uses pooled session
 # ===================================================================
 
 
@@ -1145,6 +1234,7 @@ def _parse_twse_json_table(obj):
 
 
 def _twse_margin_json(date_yyyymmdd: str, headers: dict):
+    sess = _get_session()  # [OPT]
     urls = [
         f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
         f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
@@ -1154,7 +1244,7 @@ def _twse_margin_json(date_yyyymmdd: str, headers: dict):
     last_err = None
     for url in urls:
         try:
-            r = requests.get(url, headers=h2, timeout=15)
+            r = sess.get(url, headers=h2, timeout=15)
             if r.status_code != 200:
                 last_err = f"HTTP {r.status_code}"
                 continue
@@ -1199,6 +1289,7 @@ def _parse_tpex_margin_csv(text: str):
 
 def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, max_back: int = 10):
     stock_no = _strip_suffix(stock_id)
+    sess = _get_session()  # [OPT]
     headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-TW,zh;q=0.9"}
     is_two = isinstance(market_hint, str) and market_hint.upper().endswith(".TWO")
     last_error = None
@@ -1268,7 +1359,7 @@ def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, ma
             f"?l=zh-tw&d={roc_date}&o=csv&s=0,asc"
         )
         try:
-            r = requests.get(url_csv, headers=headers, timeout=15)
+            r = sess.get(url_csv, headers=headers, timeout=15)
             df = _parse_tpex_margin_csv(r.text) if r.status_code == 200 and len(r.text) > 200 else None
             if df is not None and not df.empty:
                 colmap = {_norm_col(c): c for c in df.columns}
@@ -1299,12 +1390,13 @@ def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, ma
 
 
 # ===================================================================
-# 11. TDCC
+# 11. TDCC – [OPT] uses pooled session
 # ===================================================================
 
 
 def get_tdcc_distribution(stock_no: str, weeks_back: int = 2) -> Dict[str, Any]:
     stock_no = _strip_suffix(stock_no)
+    sess = _get_session()  # [OPT]
     headers = {"User-Agent": "Mozilla/5.0"}
     result = {"error": None, "data": [], "as_of_date": None, "data_lag_days": None}
 
@@ -1314,7 +1406,7 @@ def get_tdcc_distribution(stock_no: str, weeks_back: int = 2) -> Dict[str, Any]:
             "scaDates=&scaDate=&SqlMethod=StockNo&StockNo={}"
             "&radioStockNo=&StockName=&REession_SCA_150=&clession_SCA_150=".format(stock_no)
         )
-        r = requests.get(url, headers=headers, timeout=15)
+        r = sess.get(url, headers=headers, timeout=15)
         if r.status_code != 200:
             result["error"] = f"TDCC HTTP {r.status_code}"
             return result
@@ -1464,6 +1556,23 @@ def calc_relative_strength(stock_df, benchmark_ticker="0050.TW", period=20):
         return None
 
 
+# [OPT] Pre-fetch benchmark with provided df to avoid extra yf.download call
+def _calc_relative_strength_with_bench(stock_df, bench_df, period=20):
+    """Compute relative strength using pre-fetched benchmark data."""
+    try:
+        if bench_df is None or bench_df.empty or len(stock_df) < period:
+            return None
+        s_ret = (float(stock_df["Close"].iloc[-1]) / float(stock_df["Close"].iloc[-period]) - 1) * 100
+        b_ret = (float(bench_df["Close"].iloc[-1]) / float(bench_df["Close"].iloc[-period]) - 1) * 100
+        return {
+            "stock_ret_20d": round(s_ret, 2),
+            "bench_ret_20d": round(b_ret, 2),
+            "rs_20d": round(s_ret - b_ret, 2),
+        }
+    except Exception:
+        return None
+
+
 # ===================================================================
 # 13. DECISION FIELDS
 # ===================================================================
@@ -1512,9 +1621,17 @@ def compute_decision_fields(
 
 # ===================================================================
 # 14. MAIN: BUILD AI FEATURES JSON
-# mode="human" => skip slow network calls
-# mode="ai"    => full data
+# [OPT] Parallel yfinance downloads + parallel external data fetching
 # ===================================================================
+
+
+def _download_yf(ticker: str, period: str, interval: str):
+    """Helper for threaded yf.download."""
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
+        return clean_yf_columns(_ensure_naive_index(df))
+    except Exception:
+        return pd.DataFrame()
 
 
 def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[str, Any]:
@@ -1522,14 +1639,19 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     yf_ticker = _resolve_yf_ticker(stock_id)
     stock_no = _strip_suffix(stock_id)
 
-    # -- download daily --
-    df_daily = yf.download(yf_ticker, period="2y", interval="1d", progress=False, auto_adjust=False)
-    df_daily = clean_yf_columns(_ensure_naive_index(df_daily))
+    # [OPT] Parallel yfinance downloads: daily + weekly + benchmark at once
+    yf_futures = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        yf_futures["daily"] = pool.submit(_download_yf, yf_ticker, "2y", "1d")
+        if mode == "ai":
+            yf_futures["weekly"] = pool.submit(_download_yf, yf_ticker, "2y", "1wk")
+            yf_futures["bench"] = pool.submit(_download_yf, "0050.TW", "3mo", "1d")
+
+    df_daily = yf_futures["daily"].result()
 
     if df_daily.empty and yf_ticker.endswith(".TW"):
         yf_ticker = yf_ticker.replace(".TW", ".TWO")
-        df_daily = yf.download(yf_ticker, period="2y", interval="1d", progress=False, auto_adjust=False)
-        df_daily = clean_yf_columns(_ensure_naive_index(df_daily))
+        df_daily = _download_yf(yf_ticker, "2y", "1d")
 
     if df_daily.empty:
         return {"error": f"not found: {stock_id}", "symbol": stock_id}
@@ -1546,13 +1668,16 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     trade_date = chosen_ts.date()
     query_date = as_of_date if as_of_date else datetime.now().date()
 
-    # -- download weekly (only for AI mode) --
+    # -- weekly data (AI only) --
     df_weekly_upto = None
     if mode == "ai":
-        df_weekly = clean_yf_columns(
-            _ensure_naive_index(yf.download(yf_ticker, period="2y", interval="1wk", progress=False, auto_adjust=False))
-        )
+        df_weekly = yf_futures["weekly"].result()
         df_weekly_upto = df_weekly.loc[:chosen_ts] if df_weekly is not None and not df_weekly.empty else None
+
+    # -- pre-fetched benchmark (AI only) --
+    bench_df = None
+    if mode == "ai":
+        bench_df = yf_futures["bench"].result()
 
     # -- basic price --
     close = df["Close"]
@@ -1626,9 +1751,9 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     else:
         feat["weekly_above_ma20"] = None
 
-    # relative strength (AI only)
+    # [OPT] relative strength using pre-fetched benchmark (no extra download)
     if mode == "ai":
-        rs_data = calc_relative_strength(df, benchmark_ticker="0050.TW", period=20)
+        rs_data = _calc_relative_strength_with_bench(df, bench_df, period=20)
         if rs_data:
             feat["rs_vs_bench_20d"] = rs_data["rs_20d"]
             feat["stock_ret_20d"] = rs_data["stock_ret_20d"]
@@ -1807,67 +1932,74 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         feat["chart_pattern_2_confirmed"] = False
         feat["chart_pattern_2_bias"] = None
 
-    # External data (AI only)
+    # [OPT] External data (AI only) – run all 4 fetches in PARALLEL
     if mode == "ai":
         latest_overall_ts = df_daily.index[-1]
+        price_20d_ago = float(df["Close"].iloc[-20]) if len(df) >= 20 else c_now
 
-        # Institutional (20 days)
-        try:
-            chips_multi = get_institutional_multi_days(stock_id, trade_date, market_hint=yf_ticker, days=20)
-            price_20d_ago = float(df["Close"].iloc[-20]) if len(df) >= 20 else c_now
-            inst_feat = compute_institutional_features(chips_multi, c_now, price_20d_ago)
-            feat.update(inst_feat)
-        except Exception as e:
-            feat["inst_data_available"] = False
-            feat["inst_error"] = str(e)
+        # Define tasks for parallel execution
+        ext_results = {}
 
-        # Foreign holding availability
-        try:
-            if yf_ticker.endswith(".TW"):
-                fh = get_foreign_holding_ratio(stock_no)
-                if fh.get("error") is None and fh.get("ratio") is not None:
-                    feat["foreign_holding_pct"] = fh["ratio"]
-                    feat["foreign_holding_available"] = True
-                else:
-                    feat["foreign_holding_pct"] = None
-                    feat["foreign_holding_available"] = False
-            else:
-                feat["foreign_holding_pct"] = None
-                feat["foreign_holding_available"] = False
-        except Exception:
-            feat["foreign_holding_pct"] = None
-            feat["foreign_holding_available"] = False
+        def _fetch_institutional():
+            try:
+                chips_multi = get_institutional_multi_days(stock_id, trade_date, market_hint=yf_ticker, days=20)
+                return compute_institutional_features(chips_multi, c_now, price_20d_ago)
+            except Exception as e:
+                return {"inst_data_available": False, "inst_error": str(e)}
 
-        # Margin trading
-        try:
-            margin = get_margin_short_data(
-                stock_id,
-                trade_date=latest_overall_ts.date(),
-                market_hint=yf_ticker,
-                max_back=7,
-            )
-            if isinstance(margin, dict) and margin.get("error") is None:
-                feat["margin_balance"] = margin.get("margin_balance")
-                feat["margin_change"] = margin.get("margin_change")
-                feat["margin_usage_rate"] = margin.get("margin_usage_rate")
-                feat["short_balance"] = margin.get("short_balance")
-                feat["short_change"] = margin.get("short_change")
-                m_bal = margin.get("margin_balance")
-                s_bal = margin.get("short_balance")
-                feat["short_margin_ratio"] = round(s_bal / m_bal * 100, 2) if m_bal and s_bal and m_bal > 0 else None
-                feat["margin_data_available"] = True
-            else:
-                feat["margin_data_available"] = False
-        except Exception:
-            feat["margin_data_available"] = False
+        def _fetch_foreign_holding():
+            try:
+                if yf_ticker.endswith(".TW"):
+                    fh = get_foreign_holding_ratio(stock_no)
+                    if fh.get("error") is None and fh.get("ratio") is not None:
+                        return {"foreign_holding_pct": fh["ratio"], "foreign_holding_available": True}
+                return {"foreign_holding_pct": None, "foreign_holding_available": False}
+            except Exception:
+                return {"foreign_holding_pct": None, "foreign_holding_available": False}
 
-        # TDCC
-        try:
-            tdcc = get_tdcc_distribution(stock_no, weeks_back=2)
-            tdcc_feat = compute_tdcc_features(tdcc)
-            feat.update(tdcc_feat)
-        except Exception:
-            feat["tdcc_available"] = False
+        def _fetch_margin():
+            try:
+                margin = get_margin_short_data(
+                    stock_id,
+                    trade_date=latest_overall_ts.date(),
+                    market_hint=yf_ticker,
+                    max_back=7,
+                )
+                if isinstance(margin, dict) and margin.get("error") is None:
+                    m_bal = margin.get("margin_balance")
+                    s_bal = margin.get("short_balance")
+                    return {
+                        "margin_balance": margin.get("margin_balance"),
+                        "margin_change": margin.get("margin_change"),
+                        "margin_usage_rate": margin.get("margin_usage_rate"),
+                        "short_balance": margin.get("short_balance"),
+                        "short_change": margin.get("short_change"),
+                        "short_margin_ratio": round(s_bal / m_bal * 100, 2) if m_bal and s_bal and m_bal > 0 else None,
+                        "margin_data_available": True,
+                    }
+                return {"margin_data_available": False}
+            except Exception:
+                return {"margin_data_available": False}
+
+        def _fetch_tdcc():
+            try:
+                tdcc = get_tdcc_distribution(stock_no, weeks_back=2)
+                return compute_tdcc_features(tdcc)
+            except Exception:
+                return {"tdcc_available": False}
+
+        # [OPT] Run all 4 external data fetches in parallel threads
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            fut_inst = pool.submit(_fetch_institutional)
+            fut_fh = pool.submit(_fetch_foreign_holding)
+            fut_margin = pool.submit(_fetch_margin)
+            fut_tdcc = pool.submit(_fetch_tdcc)
+
+        feat.update(fut_inst.result())
+        feat.update(fut_fh.result())
+        feat.update(fut_margin.result())
+        feat.update(fut_tdcc.result())
+
     else:
         feat["inst_data_available"] = False
         feat["margin_data_available"] = False
@@ -1939,7 +2071,7 @@ def format_text_report(feat: Dict[str, Any]) -> str:
 
 
 # ===================================================================
-# 16. SECTOR ANALYSIS
+# 16. SECTOR ANALYSIS – [OPT] parallel stock analysis
 # ===================================================================
 
 SECTOR_DICT = {
@@ -1953,45 +2085,56 @@ SECTOR_DICT = {
 }
 
 
+def _analyze_one_stock_for_sector(stock_id, as_of_date, mode):
+    """Helper for parallel sector analysis."""
+    try:
+        feat = build_ai_features(stock_id, as_of_date=as_of_date, mode=mode)
+        if feat.get("error"):
+            return {
+                "Symbol": _strip_suffix(stock_id),
+                "Close": "-",
+                "Trend": "Error",
+                "Vol_R": "-",
+                "KD": "-/-",
+                "Score": 0,
+            }
+        score = 0
+        if feat.get("trend_state") == "uptrend":
+            score += 2
+        if feat.get("flag_price_up_vol_up"):
+            score += 1
+        if feat.get("flag_kd_golden_cross"):
+            score += 1
+        if feat.get("flag_inst_consensus_buy"):
+            score += 2
+        return {
+            "Symbol": _strip_suffix(feat.get("symbol", stock_id)),
+            "Close": feat.get("close", "-"),
+            "Trend": feat.get("trend_state", "-"),
+            "MA20_Dev": "{:+.2f}%".format(feat.get("ma20_dev_pct", 0) or 0),
+            "Vol_R": feat.get("vol_ratio_5d", "-"),
+            "KD": "{:.0f}/{:.0f}".format(feat.get("kd_k", 0) or 0, feat.get("kd_d", 0) or 0),
+            "Score": score,
+        }
+    except Exception:
+        return {"Symbol": stock_id, "Trend": "Exception", "Score": -1}
+
+
 def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers=None, mode: str = "human") -> str:
     target_list = custom_tickers if custom_tickers else SECTOR_DICT.get(sector_name, [])
 
     if not target_list:
         return f"No stocks in sector {sector_name}."
 
+    # [OPT] Parallel analysis of all stocks in sector
     results = []
-
-    for stock_id in target_list:
-        try:
-            feat = build_ai_features(stock_id, as_of_date=as_of_date, mode=mode)
-
-            if feat.get("error"):
-                results.append({"Symbol": _strip_suffix(stock_id), "Close": "-", "Trend": "Error", "Vol_R": "-", "KD": "-/-", "Score": 0})
-                continue
-
-            score = 0
-            if feat.get("trend_state") == "uptrend":
-                score += 2
-            if feat.get("flag_price_up_vol_up"):
-                score += 1
-            if feat.get("flag_kd_golden_cross"):
-                score += 1
-            if feat.get("flag_inst_consensus_buy"):
-                score += 2
-
-            summary = {
-                "Symbol": _strip_suffix(feat.get("symbol", stock_id)),
-                "Close": feat.get("close", "-"),
-                "Trend": feat.get("trend_state", "-"),
-                "MA20_Dev": "{:+.2f}%".format(feat.get("ma20_dev_pct", 0) or 0),
-                "Vol_R": feat.get("vol_ratio_5d", "-"),
-                "KD": "{:.0f}/{:.0f}".format(feat.get("kd_k", 0) or 0, feat.get("kd_d", 0) or 0),
-                "Score": score,
-            }
-            results.append(summary)
-
-        except Exception:
-            results.append({"Symbol": stock_id, "Trend": "Exception", "Score": -1})
+    with ThreadPoolExecutor(max_workers=min(len(target_list), 5)) as pool:
+        futures = {
+            pool.submit(_analyze_one_stock_for_sector, sid, as_of_date, mode): sid
+            for sid in target_list
+        }
+        for fut in as_completed(futures):
+            results.append(fut.result())
 
     results.sort(key=lambda x: x.get("Score", 0), reverse=True)
 
