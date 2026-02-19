@@ -1,30 +1,32 @@
+# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON
+# Supports two modes: human (fast, skip network) / ai (full data)
 
-"""
-stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON
-Supports two modes: human (fast, skip network) / ai (full data)
-"""
-
-import io, json, math, re, warnings
+import io
+import json
+import math
+import re
+import warnings
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
 
-# 修正：使用標準引號
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 try:
     import truststore
+
     truststore.inject_into_ssl()
 except Exception:
     pass
 
 # ===================================================================
-# 0.  UTILS
+# 0. UTILS
 # ===================================================================
+
 
 def clean_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -40,14 +42,16 @@ def clean_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
             df.columns = df.columns.droplevel(1)
     return df
 
+
 def _safe_int(x):
     try:
         s = str(x).strip().replace(",", "")
-        if s in ("", "\u2013", "\u2014", "NaN", "nan", "None"):
+        if s in ("", "–", "—", "NaN", "nan", "None"):
             return None
         return int(float(s))
     except Exception:
         return None
+
 
 def _resolve_yf_ticker(stock_id: str) -> str:
     s = stock_id.strip().upper()
@@ -57,15 +61,24 @@ def _resolve_yf_ticker(stock_id: str) -> str:
         return f"{s}.TW"
     return s
 
+
 def _strip_suffix(stock_id: str) -> str:
-    return (stock_id.strip().upper()
-            .replace(".TW", "").replace(".TWO", "")
-            .replace(".KS", "").replace(".T", "").replace(".HK", ""))
+    return (
+        stock_id.strip()
+        .upper()
+        .replace(".TW", "")
+        .replace(".TWO", "")
+        .replace(".KS", "")
+        .replace(".T", "")
+        .replace(".HK", "")
+    )
+
 
 def _norm_col(s: str) -> str:
     s = str(s).replace("\ufeff", "").replace("\u3000", "")
-    s = s.replace("\uff08", "(").replace("\uff09", ")")
+    s = s.replace("（", "(").replace("）", ")")
     return re.sub(r"\s+", "", s)
+
 
 def _ensure_naive_index(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -77,6 +90,7 @@ def _ensure_naive_index(df: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         pass
     return df
+
 
 def _nearest_trading_ts(df: pd.DataFrame, target_date):
     if df is None or df.empty:
@@ -93,6 +107,7 @@ def _nearest_trading_ts(df: pd.DataFrame, target_date):
     pos = idx.searchsorted(target + pd.Timedelta(days=1)) - 1
     return None if pos < 0 else idx[pos]
 
+
 def _parse_roc_date(date_str: str) -> str:
     try:
         parts = str(date_str).split("/")
@@ -103,8 +118,43 @@ def _parse_roc_date(date_str: str) -> str:
     except Exception:
         return str(date_str)
 
-# – stat utils –
 
+# -------------------------------------------------------------------
+# FIX: _sanitize_numpy — 統一清洗 numpy 型別，確保 JSON 可序列化
+# -------------------------------------------------------------------
+def _sanitize_numpy(obj):
+    """遞迴清洗 dict / list 中的 numpy 型別，確保 JSON 可序列化。"""
+    if isinstance(obj, dict):
+        return {k: _sanitize_numpy(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_numpy(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_sanitize_numpy(v) for v in obj]
+
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+
+    if isinstance(obj, (np.floating,)):
+        v = float(obj)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+
+    if isinstance(obj, pd.Timestamp):
+        return str(obj)
+
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+
+    return obj
+
+
+# – stat utils –
 def percentile_rank(series: pd.Series, window: int = 252) -> Optional[float]:
     s = series.dropna()
     if len(s) < 10:
@@ -112,6 +162,7 @@ def percentile_rank(series: pd.Series, window: int = 252) -> Optional[float]:
     current = s.iloc[-1]
     hist = s.iloc[-window:]
     return round((hist < current).sum() / len(hist), 4)
+
 
 def zscore_last(series: pd.Series, window: int = 252) -> Optional[float]:
     s = series.dropna()
@@ -122,6 +173,7 @@ def zscore_last(series: pd.Series, window: int = 252) -> Optional[float]:
     if sigma == 0 or pd.isna(sigma):
         return 0.0
     return round((s.iloc[-1] - mu) / sigma, 4)
+
 
 def slope_n(series: pd.Series, n: int = 5) -> Optional[float]:
     s = series.dropna().iloc[-n:]
@@ -134,6 +186,7 @@ def slope_n(series: pd.Series, n: int = 5) -> Optional[float]:
     m, _ = np.polyfit(x, y, 1)
     return round(float(m), 6)
 
+
 def max_drawdown(series: pd.Series, window: int = 20) -> Optional[float]:
     s = series.dropna().iloc[-window:]
     if len(s) < 2:
@@ -142,9 +195,11 @@ def max_drawdown(series: pd.Series, window: int = 20) -> Optional[float]:
     dd = (s - peak) / peak
     return round(float(dd.min()), 4)
 
+
 # ===================================================================
-# 1.  CANDLE
+# 1. CANDLE
 # ===================================================================
+
 
 def classify_candle(o, h, l, c) -> str:
     o, h, l, c = float(o), float(h), float(l), float(c)
@@ -160,14 +215,21 @@ def classify_candle(o, h, l, c) -> str:
         return "long_bull" if bullish else "long_bear"
     return "small_bull" if bullish else "small_bear"
 
+
 def detect_momentum_candle_patterns(df: pd.DataFrame, n: int = 5) -> Dict[str, Any]:
     if df is None or len(df) < n:
-        return {"consecutive_bull_bars": 0, "consecutive_bear_bars": 0,
-                "gap_up_breakout": False, "gap_down_breakdown": False}
+        return {
+            "consecutive_bull_bars": 0,
+            "consecutive_bear_bars": 0,
+            "gap_up_breakout": False,
+            "gap_down_breakdown": False,
+        }
 
     tail = df.tail(n)
-    types = [classify_candle(r["Open"], r["High"], r["Low"], r["Close"])
-             for _, r in tail.iterrows()]
+    types = [
+        classify_candle(r["Open"], r["High"], r["Low"], r["Close"])
+        for _, r in tail.iterrows()
+    ]
 
     cons_bull = 0
     for t in reversed(types):
@@ -199,9 +261,11 @@ def detect_momentum_candle_patterns(df: pd.DataFrame, n: int = 5) -> Dict[str, A
         "gap_down_breakdown": bool(gap_down),
     }
 
+
 # ===================================================================
-# 2.  CORE INDICATORS
+# 2. CORE INDICATORS
 # ===================================================================
+
 
 def calculate_rsi(series: pd.Series, period: int) -> pd.Series:
     delta = series.diff()
@@ -209,6 +273,7 @@ def calculate_rsi(series: pd.Series, period: int) -> pd.Series:
     loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
     rs = gain / loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
+
 
 def calculate_adx(df: pd.DataFrame, period: int = 14):
     df2 = df.copy()
@@ -218,22 +283,38 @@ def calculate_adx(df: pd.DataFrame, period: int = 14):
     df2["TR"] = df2[["H-L", "H-PC", "L-PC"]].max(axis=1)
     df2["UpMove"] = df2["High"] - df2["High"].shift(1)
     df2["DownMove"] = df2["Low"].shift(1) - df2["Low"]
-    df2["+DM"] = np.where((df2["UpMove"] > df2["DownMove"]) & (df2["UpMove"] > 0), df2["UpMove"], 0.0)
-    df2["-DM"] = np.where((df2["DownMove"] > df2["UpMove"]) & (df2["DownMove"] > 0), df2["DownMove"], 0.0)
+    df2["+DM"] = np.where(
+        (df2["UpMove"] > df2["DownMove"]) & (df2["UpMove"] > 0),
+        df2["UpMove"],
+        0.0,
+    )
+    df2["-DM"] = np.where(
+        (df2["DownMove"] > df2["UpMove"]) & (df2["DownMove"] > 0),
+        df2["DownMove"],
+        0.0,
+    )
     alpha = 1 / period
     df2["TR_s"] = df2["TR"].ewm(alpha=alpha, adjust=False).mean()
     df2["+DM_s"] = df2["+DM"].ewm(alpha=alpha, adjust=False).mean()
     df2["-DM_s"] = df2["-DM"].ewm(alpha=alpha, adjust=False).mean()
     df2["+DI"] = 100 * df2["+DM_s"] / df2["TR_s"].replace(0, np.nan)
     df2["-DI"] = 100 * df2["-DM_s"] / df2["TR_s"].replace(0, np.nan)
-    df2["DX"] = 100 * abs(df2["+DI"] - df2["-DI"]) / (df2["+DI"] + df2["-DI"]).replace(0, np.nan)
+    df2["DX"] = (
+        100
+        * abs(df2["+DI"] - df2["-DI"])
+        / (df2["+DI"] + df2["-DI"]).replace(0, np.nan)
+    )
     df2["ADX"] = df2["DX"].ewm(alpha=alpha, adjust=False).mean()
     return df2["ADX"], df2["+DI"], df2["-DI"]
 
+
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     h, l, c = df["High"], df["Low"], df["Close"]
-    tr = pd.concat([h - l, abs(h - c.shift(1)), abs(l - c.shift(1))], axis=1).max(axis=1)
+    tr = pd.concat([h - l, abs(h - c.shift(1)), abs(l - c.shift(1))], axis=1).max(
+        axis=1
+    )
     return tr.rolling(period).mean()
+
 
 def calculate_bbands(df: pd.DataFrame, period: int = 20, std_dev: int = 2):
     ma = df["Close"].rolling(window=period).mean()
@@ -243,23 +324,33 @@ def calculate_bbands(df: pd.DataFrame, period: int = 20, std_dev: int = 2):
     bbw = (upper - lower) / ma * 100
     return bbw, upper, lower
 
+
 def calculate_mfi(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tp = (df["High"] + df["Low"] + df["Close"]) / 3
     rmf = tp * df["Volume"]
-    pos = pd.Series(np.where(tp > tp.shift(1), rmf, 0.0), index=df.index).rolling(period).sum()
-    neg = pd.Series(np.where(tp < tp.shift(1), rmf, 0.0), index=df.index).rolling(period).sum()
+    pos = pd.Series(np.where(tp > tp.shift(1), rmf, 0.0), index=df.index).rolling(
+        period
+    ).sum()
+    neg = pd.Series(np.where(tp < tp.shift(1), rmf, 0.0), index=df.index).rolling(
+        period
+    ).sum()
     return 100 - (100 / (1 + pos / neg.abs().replace(0, np.nan)))
+
 
 def calculate_obv(df: pd.DataFrame) -> pd.Series:
     return (np.sign(df["Close"].diff()).fillna(0) * df["Volume"]).cumsum()
 
+
 def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0):
     df2 = df.copy()
-    tr = pd.concat([
-        df2["High"] - df2["Low"],
-        abs(df2["High"] - df2["Close"].shift(1)),
-        abs(df2["Low"] - df2["Close"].shift(1))
-    ], axis=1).max(axis=1)
+    tr = pd.concat(
+        [
+            df2["High"] - df2["Low"],
+            abs(df2["High"] - df2["Close"].shift(1)),
+            abs(df2["Low"] - df2["Close"].shift(1)),
+        ],
+        axis=1,
+    ).max(axis=1)
     atr = tr.ewm(span=period, adjust=False).mean()
     hl2 = (df2["High"] + df2["Low"]) / 2
     upper_band = (hl2 + multiplier * atr).copy()
@@ -271,8 +362,12 @@ def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float =
         ub_p = upper_band.iloc[i - 1]
         lb_p = lower_band.iloc[i - 1]
         c_p = df2["Close"].iloc[i - 1]
-        upper_band.iloc[i] = min(upper_band.iloc[i], ub_p) if c_p <= ub_p else upper_band.iloc[i]
-        lower_band.iloc[i] = max(lower_band.iloc[i], lb_p) if c_p >= lb_p else lower_band.iloc[i]
+        upper_band.iloc[i] = (
+            min(upper_band.iloc[i], ub_p) if c_p <= ub_p else upper_band.iloc[i]
+        )
+        lower_band.iloc[i] = (
+            max(lower_band.iloc[i], lb_p) if c_p >= lb_p else lower_band.iloc[i]
+        )
         c_now = df2["Close"].iloc[i]
         st_p = supertrend.iloc[i - 1]
 
@@ -295,6 +390,7 @@ def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float =
     direction.iloc[0] = -1
     return supertrend, direction
 
+
 def calculate_avwap(df: pd.DataFrame, anchor_date) -> Optional[pd.Series]:
     mask = df.index >= anchor_date
     if not mask.any():
@@ -303,11 +399,15 @@ def calculate_avwap(df: pd.DataFrame, anchor_date) -> Optional[pd.Series]:
     tp = (sub["High"] + sub["Low"] + sub["Close"]) / 3
     return (tp * sub["Volume"]).cumsum() / sub["Volume"].cumsum().replace(0, np.nan)
 
+
 # ===================================================================
-# 3.  VOLUME PROFILE (POC)
+# 3. VOLUME PROFILE (POC)
 # ===================================================================
 
-def calculate_volume_profile(df: pd.DataFrame, lookback: int = 60, n_bins: int = 50) -> Dict[str, Any]:
+
+def calculate_volume_profile(
+    df: pd.DataFrame, lookback: int = 60, n_bins: int = 50
+) -> Dict[str, Any]:
     sub = df.tail(lookback).copy()
     if sub.empty:
         return {"poc_price": None, "poc_volume_k": None, "price_vs_poc_pct": None}
@@ -341,6 +441,7 @@ def calculate_volume_profile(df: pd.DataFrame, lookback: int = 60, n_bins: int =
         "price_vs_poc_pct": price_vs_poc,
     }
 
+
 def detect_short_term_sr(df: pd.DataFrame, lookback: int = 20) -> Dict[str, Any]:
     sub = df.tail(lookback)
     if sub.empty:
@@ -350,11 +451,15 @@ def detect_short_term_sr(df: pd.DataFrame, lookback: int = 20) -> Dict[str, Any]
         "st_resistance": round(float(sub["High"].max()), 2),
     }
 
+
 # ===================================================================
-# 4.  DIVERGENCE DETECTION
+# 4. DIVERGENCE DETECTION
 # ===================================================================
 
-def detect_divergence(price: pd.Series, indicator: pd.Series, lookback: int = 60, pivot_n: int = 5) -> Dict[str, bool]:
+
+def detect_divergence(
+    price: pd.Series, indicator: pd.Series, lookback: int = 60, pivot_n: int = 5
+) -> Dict[str, bool]:
     result = {"bearish_divergence": False, "bullish_divergence": False}
     p = price.dropna().iloc[-lookback:]
     ind = indicator.dropna().iloc[-lookback:]
@@ -379,9 +484,11 @@ def detect_divergence(price: pd.Series, indicator: pd.Series, lookback: int = 60
 
     return result
 
+
 # ===================================================================
-# 5.  VOLUME QUALITY
+# 5. VOLUME QUALITY
 # ===================================================================
+
 
 def calculate_volume_quality(df: pd.DataFrame, period: int = 20) -> Dict[str, Any]:
     sub = df.tail(max(period, 60)).copy()
@@ -408,9 +515,11 @@ def calculate_volume_quality(df: pd.DataFrame, period: int = 20) -> Dict[str, An
         "obv_percentile_252d": obv_pct,
     }
 
+
 # ===================================================================
-# 6.  FIBONACCI
+# 6. FIBONACCI
 # ===================================================================
+
 
 def calculate_fibonacci_summary(df: pd.DataFrame, lookback: int = 120) -> Dict[str, Any]:
     sub = df.tail(lookback)
@@ -438,9 +547,11 @@ def calculate_fibonacci_summary(df: pd.DataFrame, lookback: int = 120) -> Dict[s
         "fib_nearest_resistance_2": resistances[1] if len(resistances) > 1 else None,
     }
 
+
 # ===================================================================
-# 7.  GAPS
+# 7. GAPS
 # ===================================================================
+
 
 def detect_gaps_summary(df: pd.DataFrame, lookback: int = 30) -> List[Dict]:
     if df is None or df.empty or len(df) < 2:
@@ -450,23 +561,40 @@ def detect_gaps_summary(df: pd.DataFrame, lookback: int = 30) -> List[Dict]:
     for i in range(1, len(sub)):
         prev, curr = sub.iloc[i - 1], sub.iloc[i]
         date_str = sub.index[i].strftime("%Y-%m-%d")
+
         if float(curr["Low"]) > float(prev["High"]):
-            future = sub.iloc[i + 1:]
+            future = sub.iloc[i + 1 :]
             filled = any(float(r["Low"]) <= float(prev["High"]) for _, r in future.iterrows())
             if not filled:
-                gaps.append({"date": date_str, "type": "up",
-                             "lower": float(prev["High"]), "upper": float(curr["Low"])})
+                gaps.append(
+                    {
+                        "date": date_str,
+                        "type": "up",
+                        "lower": float(prev["High"]),
+                        "upper": float(curr["Low"]),
+                    }
+                )
+
         elif float(curr["High"]) < float(prev["Low"]):
-            future = sub.iloc[i + 1:]
+            future = sub.iloc[i + 1 :]
             filled = any(float(r["High"]) >= float(prev["Low"]) for _, r in future.iterrows())
             if not filled:
-                gaps.append({"date": date_str, "type": "down",
-                             "lower": float(curr["High"]), "upper": float(prev["Low"])})
+                gaps.append(
+                    {
+                        "date": date_str,
+                        "type": "down",
+                        "lower": float(curr["High"]),
+                        "upper": float(prev["Low"]),
+                    }
+                )
+
     return gaps[-2:] if len(gaps) > 2 else gaps
 
+
 # ===================================================================
-# 8.  PATTERN DETECTION
+# 8. PATTERN DETECTION
 # ===================================================================
+
 
 def _find_pivots(df, left=3, right=3):
     if df is None or df.empty or len(df) < left + right + 5:
@@ -476,8 +604,8 @@ def _find_pivots(df, left=3, right=3):
     idx = df.index
     hp, lp = [], []
     for i in range(left, len(df) - right):
-        hw = highs[i - left: i + right + 1]
-        lw = lows[i - left: i + right + 1]
+        hw = highs[i - left : i + right + 1]
+        lw = lows[i - left : i + right + 1]
         if np.isfinite(highs[i]) and highs[i] == np.nanmax(hw):
             if not hp or hp[-1][0] < i - right:
                 hp.append((i, idx[i], highs[i]))
@@ -486,12 +614,16 @@ def _find_pivots(df, left=3, right=3):
                 lp.append((i, idx[i], lows[i]))
     return hp, lp
 
+
 def _pct_diff(a, b):
     if a == 0 or not np.isfinite(a) or not np.isfinite(b):
         return np.inf
     return abs(a - b) / abs(a)
 
-def detect_double_top(df, lookback=120, pivot_lr=3, peak_tol=0.018, min_gap=8, max_gap=60, confirm_margin=0.003):
+
+def detect_double_top(
+    df, lookback=120, pivot_lr=3, peak_tol=0.018, min_gap=8, max_gap=60, confirm_margin=0.003
+):
     if df is None or df.empty:
         return None
     sub = df.tail(lookback).copy()
@@ -503,13 +635,21 @@ def detect_double_top(df, lookback=120, pivot_lr=3, peak_tol=0.018, min_gap=8, m
     if p1 is None or _pct_diff(float(p1[2]), float(p2[2])) > peak_tol:
         return None
     lo, hi = min(p1[0], p2[0]), max(p1[0], p2[0])
-    neckline = float(sub.iloc[lo:hi + 1]["Low"].min())
-    confirmed = float(sub["Close"].iloc[-1]) < neckline * (1 - confirm_margin)
+    neckline = float(sub.iloc[lo : hi + 1]["Low"].min())
+    confirmed = bool(float(sub["Close"].iloc[-1]) < neckline * (1 - confirm_margin))
     height = max(float(p1[2]), float(p2[2])) - neckline
-    return {"pattern": "double_top", "confirmed": confirmed,
-            "neckline": neckline, "target": round(neckline - height, 2)}
+    return {
+        "pattern": "double_top",
+        "confirmed": confirmed,
+        "neckline": neckline,
+        "target": round(neckline - height, 2),
+        "bias": "bearish",
+    }
 
-def detect_double_bottom(df, lookback=160, pivot_lr=3, trough_tol=0.020, min_gap=8, max_gap=80, confirm_margin=0.003):
+
+def detect_double_bottom(
+    df, lookback=160, pivot_lr=3, trough_tol=0.020, min_gap=8, max_gap=80, confirm_margin=0.003
+):
     if df is None or df.empty:
         return None
     sub = df.tail(lookback).copy()
@@ -521,11 +661,17 @@ def detect_double_bottom(df, lookback=160, pivot_lr=3, trough_tol=0.020, min_gap
     if t1 is None or _pct_diff(float(t1[2]), float(t2[2])) > trough_tol:
         return None
     lo, hi = min(t1[0], t2[0]), max(t1[0], t2[0])
-    neckline = float(sub.iloc[lo:hi + 1]["High"].max())
-    confirmed = float(sub["Close"].iloc[-1]) > neckline * (1 + confirm_margin)
+    neckline = float(sub.iloc[lo : hi + 1]["High"].max())
+    confirmed = bool(float(sub["Close"].iloc[-1]) > neckline * (1 + confirm_margin))
     height = neckline - min(float(t1[2]), float(t2[2]))
-    return {"pattern": "double_bottom", "confirmed": confirmed,
-            "neckline": neckline, "target": round(neckline + height, 2)}
+    return {
+        "pattern": "double_bottom",
+        "confirmed": confirmed,
+        "neckline": neckline,
+        "target": round(neckline + height, 2),
+        "bias": "bullish",
+    }
+
 
 def detect_head_and_shoulders(df, lookback=180, pivot_lr=3, shoulder_tol=0.025, confirm_margin=0.003):
     if df is None or df.empty:
@@ -543,12 +689,20 @@ def detect_head_and_shoulders(df, lookback=180, pivot_lr=3, shoulder_tol=0.025, 
     if len(mid_lows) < 2:
         return None
     neckline = float(np.mean([p[2] for p in mid_lows]))
-    confirmed = float(sub["Close"].iloc[-1]) < neckline * (1 - confirm_margin)
+    confirmed = bool(float(sub["Close"].iloc[-1]) < neckline * (1 - confirm_margin))
     height = float(head[2]) - neckline
-    return {"pattern": "head_and_shoulders_top", "confirmed": confirmed,
-            "neckline": round(neckline, 2), "target": round(neckline - height, 2)}
+    return {
+        "pattern": "head_and_shoulders_top",
+        "confirmed": confirmed,
+        "neckline": round(neckline, 2),
+        "target": round(neckline - height, 2),
+        "bias": "bearish",
+    }
 
-def detect_inverse_head_and_shoulders(df, lookback=180, pivot_lr=3, shoulder_tol=0.025, confirm_margin=0.003):
+
+def detect_inverse_head_and_shoulders(
+    df, lookback=180, pivot_lr=3, shoulder_tol=0.025, confirm_margin=0.003
+):
     if df is None or df.empty:
         return None
     sub = df.tail(lookback).copy()
@@ -564,10 +718,16 @@ def detect_inverse_head_and_shoulders(df, lookback=180, pivot_lr=3, shoulder_tol
     if len(mid_highs) < 2:
         return None
     neckline = float(np.mean([p[2] for p in mid_highs]))
-    confirmed = float(sub["Close"].iloc[-1]) > neckline * (1 + confirm_margin)
+    confirmed = bool(float(sub["Close"].iloc[-1]) > neckline * (1 + confirm_margin))
     height = neckline - float(head[2])
-    return {"pattern": "inv_head_and_shoulders", "confirmed": confirmed,
-            "neckline": round(neckline, 2), "target": round(neckline + height, 2)}
+    return {
+        "pattern": "inv_head_and_shoulders",
+        "confirmed": confirmed,
+        "neckline": round(neckline, 2),
+        "target": round(neckline + height, 2),
+        "bias": "bullish",
+    }
+
 
 def detect_wedge(df, lookback=120, pivot_lr=3, breakout_margin=0.003):
     if df is None or df.empty:
@@ -589,18 +749,23 @@ def detect_wedge(df, lookback=120, pivot_lr=3, breakout_margin=0.003):
     close_now = float(sub["Close"].iloc[-1])
 
     if ah > 0 and al > 0 and al > ah:
-        confirmed = close_now < lower_now * (1 - breakout_margin)
-        return {"pattern": "rising_wedge", "confirmed": confirmed}
+        confirmed = bool(close_now < lower_now * (1 - breakout_margin))
+        return {"pattern": "rising_wedge", "confirmed": confirmed, "bias": "bearish"}
     if ah < 0 and al < 0 and ah < al:
-        confirmed = close_now > upper_now * (1 + breakout_margin)
-        return {"pattern": "falling_wedge", "confirmed": confirmed}
+        confirmed = bool(close_now > upper_now * (1 + breakout_margin))
+        return {"pattern": "falling_wedge", "confirmed": confirmed, "bias": "bullish"}
     return None
+
 
 def detect_patterns(df) -> List[Dict]:
     results = []
-    for fn in [detect_double_top, detect_double_bottom,
-               detect_head_and_shoulders, detect_inverse_head_and_shoulders,
-               detect_wedge]:
+    for fn in [
+        detect_double_top,
+        detect_double_bottom,
+        detect_head_and_shoulders,
+        detect_inverse_head_and_shoulders,
+        detect_wedge,
+    ]:
         try:
             p = fn(df)
             if p:
@@ -609,35 +774,97 @@ def detect_patterns(df) -> List[Dict]:
             pass
     return results
 
+
+_PATTERN_PRIORITY = {
+    "head_and_shoulders_top": 1,
+    "inv_head_and_shoulders": 1,
+    "double_top": 2,
+    "double_bottom": 2,
+    "rising_wedge": 3,
+    "falling_wedge": 3,
+}
+
+
+def _prioritize_patterns(raw_patterns: List[Dict]) -> List[Dict]:
+    """
+    將 pattern 分成 bearish / bullish 兩組，
+    每組取 confirmed 優先、priority 最高的 1 個，最多輸出 2 個。
+    """
+    bearish = [p for p in raw_patterns if p.get("bias") == "bearish"]
+    bullish = [p for p in raw_patterns if p.get("bias") == "bullish"]
+
+    def pick_best(group: List[Dict]) -> Optional[Dict]:
+        if not group:
+            return None
+        group.sort(
+            key=lambda p: (
+                0 if p.get("confirmed") else 1,
+                _PATTERN_PRIORITY.get(p.get("pattern", ""), 99),
+            )
+        )
+        return group[0]
+
+    result = []
+    b = pick_best(bearish)
+    if b:
+        result.append(b)
+    u = pick_best(bullish)
+    if u:
+        result.append(u)
+    return result
+
+
 # ===================================================================
-# 9.  INSTITUTIONAL DATA
+# 9. INSTITUTIONAL DATA
 # ===================================================================
+
 
 def _parse_twse_t86_csv(text: str):
     text = text.replace("\r", "").replace("=", "")
     lines = [ln for ln in text.split("\n") if ln.strip()]
-    start = next((i for i, ln in enumerate(lines) if "\u8b49\u5238\u4ee3\u865f" in ln and "\u8b49\u5238\u540d\u7a31" in ln), None)
+    start = next(
+        (
+            i
+            for i, ln in enumerate(lines)
+            if "證券代號" in ln and "證券名稱" in ln
+        ),
+        None,
+    )
     if start is None:
         return None
-    end = next((j for j in range(start + 1, len(lines))
-                if lines[j].startswith("\u8aaa\u660e") or lines[j].startswith("\u5099\u8a3b")), len(lines))
+    end = next(
+        (
+            j
+            for j in range(start + 1, len(lines))
+            if lines[j].startswith("說明") or lines[j].startswith("備註")
+        ),
+        len(lines),
+    )
     try:
         return pd.read_csv(io.StringIO("\n".join(lines[start:end])))
     except Exception:
         return None
 
+
 def _parse_tpex_csv(text: str):
     text = text.replace("\ufeff", "").replace("\r", "")
     lines = [ln for ln in text.split("\n") if ln.strip()]
-    start = next((i for i, ln in enumerate(lines) if "\u4ee3\u865f" in ln and "\u540d\u7a31" in ln), None)
+    start = next((i for i, ln in enumerate(lines) if "代號" in ln and "名稱" in ln), None)
     if start is None:
         return None
-    end = next((j for j in range(start + 1, len(lines))
-                if lines[j].startswith("\u8aaa\u660e") or lines[j].startswith("\u5099\u8a3b")), len(lines))
+    end = next(
+        (
+            j
+            for j in range(start + 1, len(lines))
+            if lines[j].startswith("說明") or lines[j].startswith("備註")
+        ),
+        len(lines),
+    )
     try:
         return pd.read_csv(io.StringIO("\n".join(lines[start:end])))
     except Exception:
         return None
+
 
 def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back: int = 10):
     stock_no = _strip_suffix(stock_id)
@@ -646,28 +873,28 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
     last_error = None
 
     def try_twse(d_):
-        url = "https://www.twse.com.tw/fund/T86?response=csv&date={}&selectType=ALLBUT0999".format(d_.strftime("%Y%m%d"))
+        url = f"https://www.twse.com.tw/fund/T86?response=csv&date={d_.strftime('%Y%m%d')}&selectType=ALLBUT0999"
         r = requests.get(url, headers=headers, timeout=15)
         if r.status_code != 200 or len(r.text) < 200:
-            return None, "TWSE HTTP {}".format(r.status_code)
-        if "\u6c92\u6709\u7b26\u5408\u689d\u4ef6\u7684\u8cc7\u6599" in r.text or "\u5f88\u62b1\u6b49" in r.text:
+            return None, f"TWSE HTTP {r.status_code}"
+        if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
             return None, "TWSE no data"
         df = _parse_twse_t86_csv(r.text)
         return (df, None) if df is not None else (None, "TWSE parse failed")
 
     def try_tpex(d_):
         roc_year = d_.year - 1911
-        roc_date = "{:03d}/{:02d}/{:02d}".format(roc_year, d_.month, d_.day)
+        roc_date = f"{roc_year:03d}/{d_.month:02d}/{d_.day:02d}"
         url = (
             "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php"
-            "?l=zh-tw&o=csv&se=EW&t=D&d={}&s=0,asc".format(roc_date)
+            f"?l=zh-tw&o=csv&se=EW&t=D&d={roc_date}&s=0,asc"
         )
         h2 = dict(headers)
         h2["Referer"] = "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge.php"
         r = requests.get(url, headers=h2, timeout=15)
         if r.status_code != 200 or len(r.text) < 200:
-            return None, "TPEx HTTP {}".format(r.status_code)
-        if "\u6c92\u6709\u7b26\u5408\u689d\u4ef6\u7684\u8cc7\u6599" in r.text or "\u5f88\u62b1\u6b49" in r.text:
+            return None, f"TPEx HTTP {r.status_code}"
+        if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
             return None, "TPEx no data"
         df = _parse_tpex_csv(r.text)
         return (df, None) if df is not None else (None, "TPEx parse failed")
@@ -680,33 +907,49 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
         return next((orig for nk, orig in colmap.items() if pred(nk)), None)
 
     def is_foreign(nk):
-        if "\u5916\u8cc7\u81ea\u71df\u5546" in nk and "\u4e0d\u542b\u5916\u8cc7\u81ea\u71df\u5546" not in nk:
+        if "外資自營商" in nk and "不含外資自營商" not in nk:
             return False
-        return ("\u5916\u9678\u8cc7" in nk) or ("\u5916\u8cc7\u53ca\u9678\u8cc7" in nk) or ("\u5916\u8cc7" in nk)
+        return ("外陸資" in nk) or ("外資及陸資" in nk) or ("外資" in nk)
 
     for back in range(max_back + 1):
         d = trade_date - timedelta(days=back)
         for mkt_name, fn in markets:
             df, err = fn(d)
             if df is None:
-                last_error = err; continue
+                last_error = err
+                continue
             cols = list(df.columns)
             colmap = {_norm_col(c): c for c in cols}
-            code_col = next((c for c in cols if _norm_col(c) in ("\u8b49\u5238\u4ee3\u865f", "\u4ee3\u865f")), None)
+            code_col = next((c for c in cols if _norm_col(c) in ("證券代號", "代號")), None)
             if code_col is None:
-                last_error = "{} no code col".format(mkt_name); continue
+                last_error = f"{mkt_name} no code col"
+                continue
             row = df[df[code_col].astype(str).str.strip() == stock_no]
             if row.empty:
-                last_error = "{} no {}".format(mkt_name, stock_no); continue
+                last_error = f"{mkt_name} no {stock_no}"
+                continue
 
-            foreign_col = find_col(colmap, lambda nk: is_foreign(nk) and "\u8cb7\u8ce3\u8d85" in nk)
-            trust_col = find_col(colmap, lambda nk: "\u6295\u4fe1" in nk and "\u8cb7\u8ce3\u8d85" in nk)
-            dealer_total = find_col(colmap, lambda nk: "\u81ea\u71df\u5546" in nk and "\u8cb7\u8ce3\u8d85" in nk
-                                    and "\u5916\u8cc7" not in nk and "\u81ea\u884c\u8cb7\u8ce3" not in nk and "\u907f\u96aa" not in nk)
-            dealer_self = find_col(colmap, lambda nk: "\u81ea\u71df\u5546" in nk and "\u81ea\u884c\u8cb7\u8ce3" in nk
-                                   and "\u8cb7\u8ce3\u8d85" in nk and "\u5916\u8cc7" not in nk)
-            dealer_hedge = find_col(colmap, lambda nk: "\u81ea\u71df\u5546" in nk and "\u907f\u96aa" in nk
-                                    and "\u8cb7\u8ce3\u8d85" in nk and "\u5916\u8cc7" not in nk)
+            foreign_col = find_col(colmap, lambda nk: is_foreign(nk) and "買賣超" in nk)
+            trust_col = find_col(colmap, lambda nk: "投信" in nk and "買賣超" in nk)
+            dealer_total = find_col(
+                colmap,
+                lambda nk: "自營商" in nk
+                and "買賣超" in nk
+                and "外資" not in nk
+                and "自營買賣" not in nk
+                and "避險" not in nk,
+            )
+            dealer_self = find_col(
+                colmap,
+                lambda nk: "自營商" in nk
+                and "自營買賣" in nk
+                and "買賣超" in nk
+                and "外資" not in nk,
+            )
+            dealer_hedge = find_col(
+                colmap,
+                lambda nk: "自營商" in nk and "避險" in nk and "買賣超" in nk and "外資" not in nk,
+            )
 
             foreign = _safe_int(row.iloc[0][foreign_col]) if foreign_col else None
             trust = _safe_int(row.iloc[0][trust_col]) if trust_col else None
@@ -719,20 +962,32 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
                 dealer = (a or 0) + (b or 0)
 
             if foreign is None:
-                buy_c = find_col(colmap, lambda nk: is_foreign(nk)
-                                 and ("\u8cb7\u9032" in nk or "\u8cb7\u5165" in nk) and "\u8cb7\u8ce3\u8d85" not in nk)
-                sell_c = find_col(colmap, lambda nk: is_foreign(nk)
-                                  and "\u8ce3\u51fa" in nk and "\u8cb7\u8ce3\u8d85" not in nk)
+                buy_c = find_col(
+                    colmap,
+                    lambda nk: is_foreign(nk)
+                    and ("買進" in nk or "買入" in nk)
+                    and "買賣超" not in nk,
+                )
+                sell_c = find_col(
+                    colmap, lambda nk: is_foreign(nk) and "賣出" in nk and "買賣超" not in nk
+                )
                 bv = _safe_int(row.iloc[0][buy_c]) if buy_c else None
                 sv = _safe_int(row.iloc[0][sell_c]) if sell_c else None
                 if bv is not None and sv is not None:
                     foreign = bv - sv
 
             yf_suffix = ".TW" if mkt_name == "TWSE" else ".TWO"
-            return {"id": "{}{}" .format(stock_no, yf_suffix), "date": d.strftime("%Y-%m-%d"),
-                    "foreign": foreign, "trust": trust, "dealer": dealer, "error": None}
+            return {
+                "id": f"{stock_no}{yf_suffix}",
+                "date": d.strftime("%Y-%m-%d"),
+                "foreign": foreign,
+                "trust": trust,
+                "dealer": dealer,
+                "error": None,
+            }
 
-    return {"error": last_error or "unknown", "id": "{}.TW".format(stock_no)}
+    return {"error": last_error or "unknown", "id": f"{stock_no}.TW"}
+
 
 def get_institutional_multi_days(stock_id: str, end_date, market_hint=None, days=20):
     results, d, attempts = [], end_date, 0
@@ -745,6 +1000,7 @@ def get_institutional_multi_days(stock_id: str, end_date, market_hint=None, days
         else:
             d = d - timedelta(days=1)
     return results
+
 
 def compute_institutional_features(chips_multi: List[Dict], price_now: float, price_20d_ago: float) -> Dict[str, Any]:
     feat: Dict[str, Any] = {}
@@ -782,6 +1038,7 @@ def compute_institutional_features(chips_multi: List[Dict], price_now: float, pr
             else:
                 break
         return count * direction
+
     feat["foreign_consecutive_days"] = _consec(f_vals)
     feat["trust_consecutive_days"] = _consec(t_vals)
 
@@ -792,20 +1049,20 @@ def compute_institutional_features(chips_multi: List[Dict], price_now: float, pr
 
     return feat
 
-# – foreign holding ratio –
 
 def get_foreign_holding_ratio(stock_no: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
     urls = [
-        "https://www.twse.com.tw/rwd/zh/fund/MI_QFIIS?response=json&stockNo={}&queryType=1".format(stock_no),
-        "https://www.twse.com.tw/fund/MI_QFIIS?response=json&stockNo={}&queryType=1".format(stock_no),
+        f"https://www.twse.com.tw/rwd/zh/fund/MI_QFIIS?response=json&stockNo={stock_no}&queryType=1",
+        f"https://www.twse.com.tw/fund/MI_QFIIS?response=json&stockNo={stock_no}&queryType=1",
     ]
     last_err = None
     for url in urls:
         try:
             r = requests.get(url, headers=headers, timeout=15)
             if r.status_code != 200:
-                last_err = "HTTP {}".format(r.status_code); continue
+                last_err = f"HTTP {r.status_code}"
+                continue
             j = r.json()
             fields, data = None, None
             if isinstance(j.get("tables"), list):
@@ -814,7 +1071,7 @@ def get_foreign_holding_ratio(stock_no: str) -> dict:
                     d = tbl.get("data", [])
                     if f and d:
                         joined = "".join(str(x) for x in f)
-                        if any(kw in joined for kw in ("\u6301\u80a1\u6bd4", "\u6bd4\u7387", "\u6bd4\u4f8b")):
+                        if any(kw in joined for kw in ("持股比", "比率", "比例")):
                             fields, data = f, d
                             break
             if fields is None and j.get("fields") and j.get("data"):
@@ -822,32 +1079,36 @@ def get_foreign_holding_ratio(stock_no: str) -> dict:
             if fields is None and isinstance(j.get("data"), list) and j["data"]:
                 data = j["data"]
             if not data:
-                last_err = "no data"; continue
+                last_err = "no data"
+                continue
             last = data[-1]
             if not last:
-                last_err = "empty row"; continue
+                last_err = "empty row"
+                continue
             date_str = _parse_roc_date(str(last[0]))
             ratio = None
             if fields:
                 norm_fields = [_norm_col(f) for f in fields]
                 for i, nf in enumerate(norm_fields):
-                    if any(kw in nf for kw in ("\u6301\u80a1\u6bd4", "\u6bd4\u7387", "\u6bd4\u4f8b", "Percentage")):
+                    if any(kw in nf for kw in ("持股比", "比率", "比例", "Percentage")):
                         if i < len(last):
                             raw = str(last[i]).replace("%", "").replace(",", "").strip()
-                            if raw and re.match(r"^-?\d+(.\d+)?$", raw):
+                            if raw and re.match(r"^-?\d+(\.\d+)?$", raw):
                                 ratio = float(raw)
                                 break
             if ratio is not None:
                 return {"ratio": ratio, "date": date_str, "error": None}
-            else:
-                last_err = "no ratio col"; continue
+            last_err = "no ratio col"
         except Exception as e:
-            last_err = str(e); continue
+            last_err = str(e)
+            continue
     return {"ratio": None, "date": None, "error": last_err or "unknown"}
+
 
 # ===================================================================
 # 10. MARGIN TRADING
 # ===================================================================
+
 
 def _parse_twse_json_table(obj):
     if not isinstance(obj, dict):
@@ -863,29 +1124,30 @@ def _parse_twse_json_table(obj):
             data = tbl.get("data", [])
             if not fields or not data:
                 continue
-            if any("\u4ee3\u865f" in str(f) or "\u4ee3\u78bc" in str(f) for f in fields):
+            if any("代號" in str(f) or "代碼" in str(f) for f in fields):
                 try:
                     return pd.DataFrame(data, columns=fields)
                 except Exception:
                     continue
-        best_table, max_cols = None, 0
-        if "tables" in obj:
-            for tbl in obj["tables"]:
-                if "fields" in tbl and "data" in tbl:
-                    if len(tbl["fields"]) > max_cols:
-                        max_cols = len(tbl["fields"])
-                        best_table = tbl
-            if best_table and max_cols > 5:
-                try:
-                    return pd.DataFrame(best_table["data"], columns=best_table["fields"])
-                except Exception:
-                    pass
+    best_table, max_cols = None, 0
+    if "tables" in obj:
+        for tbl in obj["tables"]:
+            if "fields" in tbl and "data" in tbl:
+                if len(tbl["fields"]) > max_cols:
+                    max_cols = len(tbl["fields"])
+                    best_table = tbl
+    if best_table and max_cols > 5:
+        try:
+            return pd.DataFrame(best_table["data"], columns=best_table["fields"])
+        except Exception:
+            pass
     return None
+
 
 def _twse_margin_json(date_yyyymmdd: str, headers: dict):
     urls = [
-        "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={}&selectType=ALL".format(date_yyyymmdd),
-        "https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={}&selectType=ALL".format(date_yyyymmdd),
+        f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
+        f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
     ]
     h2 = dict(headers)
     h2["Referer"] = "https://www.twse.com.tw/zh/page/trading/exchange/MI_MARGN.html"
@@ -894,7 +1156,8 @@ def _twse_margin_json(date_yyyymmdd: str, headers: dict):
         try:
             r = requests.get(url, headers=h2, timeout=15)
             if r.status_code != 200:
-                last_err = "HTTP {}".format(r.status_code); continue
+                last_err = f"HTTP {r.status_code}"
+                continue
             j = r.json()
             df = pd.DataFrame(j) if isinstance(j, list) else _parse_twse_json_table(j)
             if df is not None and not df.empty:
@@ -904,22 +1167,35 @@ def _twse_margin_json(date_yyyymmdd: str, headers: dict):
             last_err = str(e)
     return None, last_err or "failed"
 
+
 def _parse_tpex_margin_csv(text: str):
     if not text:
         return None
     text = text.replace("\ufeff", "").replace("\r", "")
     lines = [ln for ln in text.split("\n") if ln.strip()]
-    start = next((i for i, ln in enumerate(lines)
-                  if "\u4ee3\u865f" in ln and "\u540d\u7a31" in ln and ("\u8cc7" in ln or "\u878d\u8cc7" in ln)), None)
+    start = next(
+        (
+            i
+            for i, ln in enumerate(lines)
+            if "代號" in ln and "名稱" in ln and ("資" in ln or "融資" in ln)
+        ),
+        None,
+    )
     if start is None:
         return None
-    end = next((j for j in range(start + 1, len(lines))
-                if lines[j].startswith("*****") or lines[j].startswith("\u8aaa\u660e")
-                or lines[j].startswith("\u5099\u8a3b")), len(lines))
+    end = next(
+        (
+            j
+            for j in range(start + 1, len(lines))
+            if lines[j].startswith("*****") or lines[j].startswith("說明") or lines[j].startswith("備註")
+        ),
+        len(lines),
+    )
     try:
         return pd.read_csv(io.StringIO("\n".join(lines[start:end])))
     except Exception:
         return None
+
 
 def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, max_back: int = 10):
     stock_no = _strip_suffix(stock_id)
@@ -928,8 +1204,7 @@ def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, ma
     last_error = None
 
     def find_col(colmap, contains):
-        return next((orig for nk, orig in colmap.items()
-                     if all(kw in nk for kw in contains)), None)
+        return next((orig for nk, orig in colmap.items() if all(kw in nk for kw in contains)), None)
 
     for back in range(max_back + 1):
         d = trade_date - timedelta(days=back)
@@ -938,76 +1213,95 @@ def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, ma
             df, err = _twse_margin_json(d.strftime("%Y%m%d"), headers=headers)
             if df is not None and not df.empty:
                 colmap = {_norm_col(c): c for c in df.columns}
-                code_col = next((v for k, v in colmap.items()
-                                 if k in ("\u80a1\u7968\u4ee3\u865f", "\u8b49\u5238\u4ee3\u865f", "\u8b49\u5238\u4ee3\u78bc", "Code", "\u4ee3\u865f")), None)
+                code_col = next(
+                    (
+                        v
+                        for k, v in colmap.items()
+                        if k in ("股票代號", "證券代號", "證券代碼", "Code", "代號")
+                    ),
+                    None,
+                )
                 if not code_col:
-                    code_col = next((v for k, v in colmap.items() if "\u4ee3\u865f" in k or "\u4ee3\u78bc" in k), None)
+                    code_col = next((v for k, v in colmap.items() if "代號" in k or "代碼" in k), None)
                 if not code_col and len(df.columns) > 0:
                     first_col = df.columns[0]
                     sample = df[first_col].astype(str).str.strip().head(10)
                     if sample.str.match(r"^\d{4,6}[A-Z]?$").any():
                         code_col = first_col
+
                 if code_col:
                     sub = df[df[code_col].astype(str).str.strip().str.strip('"') == stock_no]
                     if not sub.empty:
                         row = sub.iloc[0]
-                        m_bal_c = find_col(colmap, ["\u878d\u8cc7", "\u9918\u984d"]) or find_col(colmap, ["\u8cc7", "\u9918\u984d"])
-                        m_chg_c = find_col(colmap, ["\u878d\u8cc7", "\u589e\u6e1b"]) or find_col(colmap, ["\u8cc7", "\u589e\u6e1b"])
-                        m_lim_c = find_col(colmap, ["\u878d\u8cc7", "\u9650\u984d"]) or find_col(colmap, ["\u8cc7", "\u9650\u984d"])
-                        s_bal_c = find_col(colmap, ["\u878d\u5238", "\u9918\u984d"]) or find_col(colmap, ["\u5238", "\u9918\u984d"])
-                        s_chg_c = find_col(colmap, ["\u878d\u5238", "\u589e\u6e1b"]) or find_col(colmap, ["\u5238", "\u589e\u6e1b"])
+                        m_bal_c = find_col(colmap, ["融資", "餘額"]) or find_col(colmap, ["資", "餘額"])
+                        m_chg_c = find_col(colmap, ["融資", "增減"]) or find_col(colmap, ["資", "增減"])
+                        m_lim_c = find_col(colmap, ["融資", "限額"]) or find_col(colmap, ["資", "限額"])
+                        s_bal_c = find_col(colmap, ["融券", "餘額"]) or find_col(colmap, ["券", "餘額"])
+                        s_chg_c = find_col(colmap, ["融券", "增減"]) or find_col(colmap, ["券", "增減"])
                         m_bal = _safe_int(row[m_bal_c]) if m_bal_c else None
                         m_chg = _safe_int(row[m_chg_c]) if m_chg_c else None
                         m_lim = _safe_int(row[m_lim_c]) if m_lim_c else None
                         s_bal = _safe_int(row[s_bal_c]) if s_bal_c else None
                         s_chg = _safe_int(row[s_chg_c]) if s_chg_c else None
                         usage = round(m_bal / m_lim * 100, 1) if (m_bal and m_lim and m_lim > 0) else None
-                        return {"id": "{}.TW".format(stock_no), "date": d.strftime("%Y-%m-%d"),
-                                "margin_balance": m_bal, "margin_change": m_chg,
-                                "margin_limit": m_lim, "margin_usage_rate": usage,
-                                "short_balance": s_bal, "short_change": s_chg, "error": None}
-                    else:
-                        last_error = "TWSE margin no {}".format(stock_no)
+                        return {
+                            "id": f"{stock_no}.TW",
+                            "date": d.strftime("%Y-%m-%d"),
+                            "margin_balance": m_bal,
+                            "margin_change": m_chg,
+                            "margin_limit": m_lim,
+                            "margin_usage_rate": usage,
+                            "short_balance": s_bal,
+                            "short_change": s_chg,
+                            "error": None,
+                        }
+                    last_error = f"TWSE margin no {stock_no}"
                 else:
                     last_error = "TWSE margin no code col"
             else:
                 last_error = err
 
         roc_year = d.year - 1911
-        roc_date = "{:03d}/{:02d}/{:02d}".format(roc_year, d.month, d.day)
+        roc_date = f"{roc_year:03d}/{d.month:02d}/{d.day:02d}"
         url_csv = (
             "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
-            "?l=zh-tw&d={}&o=csv&s=0,asc".format(roc_date)
+            f"?l=zh-tw&d={roc_date}&o=csv&s=0,asc"
         )
         try:
             r = requests.get(url_csv, headers=headers, timeout=15)
             df = _parse_tpex_margin_csv(r.text) if r.status_code == 200 and len(r.text) > 200 else None
             if df is not None and not df.empty:
                 colmap = {_norm_col(c): c for c in df.columns}
-                code_col = colmap.get("\u4ee3\u865f") or colmap.get("\u80a1\u7968\u4ee3\u865f")
+                code_col = colmap.get("代號") or colmap.get("股票代號")
                 if code_col:
                     sub = df[df[code_col].astype(str).str.strip() == stock_no]
                     if not sub.empty:
                         row = sub.iloc[0]
-                        m_bal_c = find_col(colmap, ["\u8cc7", "\u9918\u984d"])
-                        m_chg_c = find_col(colmap, ["\u8cc7", "\u589e\u6e1b"])
-                        s_bal_c = find_col(colmap, ["\u5238", "\u9918\u984d"])
-                        s_chg_c = find_col(colmap, ["\u5238", "\u589e\u6e1b"])
-                        return {"id": "{}.TWO".format(stock_no), "date": d.strftime("%Y-%m-%d"),
-                                "margin_balance": _safe_int(row[m_bal_c]) if m_bal_c else None,
-                                "margin_change": _safe_int(row[m_chg_c]) if m_chg_c else None,
-                                "margin_limit": None, "margin_usage_rate": None,
-                                "short_balance": _safe_int(row[s_bal_c]) if s_bal_c else None,
-                                "short_change": _safe_int(row[s_chg_c]) if s_chg_c else None,
-                                "error": None}
+                        m_bal_c = find_col(colmap, ["資", "餘額"])
+                        m_chg_c = find_col(colmap, ["資", "增減"])
+                        s_bal_c = find_col(colmap, ["券", "餘額"])
+                        s_chg_c = find_col(colmap, ["券", "增減"])
+                        return {
+                            "id": f"{stock_no}.TWO",
+                            "date": d.strftime("%Y-%m-%d"),
+                            "margin_balance": _safe_int(row[m_bal_c]) if m_bal_c else None,
+                            "margin_change": _safe_int(row[m_chg_c]) if m_chg_c else None,
+                            "margin_limit": None,
+                            "margin_usage_rate": None,
+                            "short_balance": _safe_int(row[s_bal_c]) if s_bal_c else None,
+                            "short_change": _safe_int(row[s_chg_c]) if s_chg_c else None,
+                            "error": None,
+                        }
         except Exception as e:
-            last_error = "TPEx margin: {}".format(e)
+            last_error = f"TPEx margin: {e}"
 
     return {"error": last_error or "unknown"}
+
 
 # ===================================================================
 # 11. TDCC
 # ===================================================================
+
 
 def get_tdcc_distribution(stock_no: str, weeks_back: int = 2) -> Dict[str, Any]:
     stock_no = _strip_suffix(stock_no)
@@ -1022,7 +1316,7 @@ def get_tdcc_distribution(stock_no: str, weeks_back: int = 2) -> Dict[str, Any]:
         )
         r = requests.get(url, headers=headers, timeout=15)
         if r.status_code != 200:
-            result["error"] = "TDCC HTTP {}".format(r.status_code)
+            result["error"] = f"TDCC HTTP {r.status_code}"
             return result
 
         try:
@@ -1083,13 +1377,15 @@ def get_tdcc_distribution(stock_no: str, weeks_back: int = 2) -> Dict[str, Any]:
             except Exception:
                 date_fmt = date_str
 
-            result["data"].append({
-                "date": date_fmt,
-                "total_holders": total_holders,
-                "retail_pct": retail_pct,
-                "whale_400_pct": whale_400_pct,
-                "whale_1000_pct": whale_1000_pct,
-            })
+            result["data"].append(
+                {
+                    "date": date_fmt,
+                    "total_holders": total_holders,
+                    "retail_pct": retail_pct,
+                    "whale_400_pct": whale_400_pct,
+                    "whale_1000_pct": whale_1000_pct,
+                }
+            )
 
         if result["data"]:
             result["as_of_date"] = result["data"][-1]["date"]
@@ -1103,6 +1399,7 @@ def get_tdcc_distribution(stock_no: str, weeks_back: int = 2) -> Dict[str, Any]:
         result["error"] = str(e)
 
     return result
+
 
 def compute_tdcc_features(tdcc_data: Dict) -> Dict[str, Any]:
     feat: Dict[str, Any] = {}
@@ -1126,15 +1423,11 @@ def compute_tdcc_features(tdcc_data: Dict) -> Dict[str, Any]:
     if len(records) >= 2:
         prev = records[-2]
         feat["tdcc_holders_change"] = (latest.get("total_holders") or 0) - (prev.get("total_holders") or 0)
-        feat["tdcc_retail_pct_change"] = round(
-            (latest.get("retail_pct") or 0) - (prev.get("retail_pct") or 0), 2)
-        feat["tdcc_whale_400_pct_change"] = round(
-            (latest.get("whale_400_pct") or 0) - (prev.get("whale_400_pct") or 0), 2)
-        feat["tdcc_whale_1000_pct_change"] = round(
-            (latest.get("whale_1000_pct") or 0) - (prev.get("whale_1000_pct") or 0), 2)
+        feat["tdcc_retail_pct_change"] = round((latest.get("retail_pct") or 0) - (prev.get("retail_pct") or 0), 2)
+        feat["tdcc_whale_400_pct_change"] = round((latest.get("whale_400_pct") or 0) - (prev.get("whale_400_pct") or 0), 2)
+        feat["tdcc_whale_1000_pct_change"] = round((latest.get("whale_1000_pct") or 0) - (prev.get("whale_1000_pct") or 0), 2)
         feat["flag_whale_up_retail_down"] = bool(
-            (feat.get("tdcc_whale_400_pct_change") or 0) > 0 and
-            (feat.get("tdcc_retail_pct_change") or 0) < 0
+            (feat.get("tdcc_whale_400_pct_change") or 0) > 0 and (feat.get("tdcc_retail_pct_change") or 0) < 0
         )
         feat["flag_holders_decreasing"] = bool((feat.get("tdcc_holders_change") or 0) < 0)
     else:
@@ -1147,31 +1440,42 @@ def compute_tdcc_features(tdcc_data: Dict) -> Dict[str, Any]:
 
     return feat
 
+
 # ===================================================================
 # 12. RELATIVE STRENGTH
 # ===================================================================
 
+
 def calc_relative_strength(stock_df, benchmark_ticker="0050.TW", period=20):
     try:
-        bench = clean_yf_columns(_ensure_naive_index(
-            yf.download(benchmark_ticker, period="3mo", progress=False, auto_adjust=False)))
+        bench = clean_yf_columns(
+            _ensure_naive_index(yf.download(benchmark_ticker, period="3mo", progress=False, auto_adjust=False))
+        )
         if bench.empty or len(stock_df) < period:
             return None
         s_ret = (float(stock_df["Close"].iloc[-1]) / float(stock_df["Close"].iloc[-period]) - 1) * 100
         b_ret = (float(bench["Close"].iloc[-1]) / float(bench["Close"].iloc[-period]) - 1) * 100
-        return {"stock_ret_20d": round(s_ret, 2), "bench_ret_20d": round(b_ret, 2),
-                "rs_20d": round(s_ret - b_ret, 2)}
+        return {
+            "stock_ret_20d": round(s_ret, 2),
+            "bench_ret_20d": round(b_ret, 2),
+            "rs_20d": round(s_ret - b_ret, 2),
+        }
     except Exception:
         return None
+
 
 # ===================================================================
 # 13. DECISION FIELDS
 # ===================================================================
 
-def compute_decision_fields(c_now: float, atr_now: float,
-                            resistance: Optional[float],
-                            support: Optional[float],
-                            supertrend_dir: int) -> Dict[str, Any]:
+
+def compute_decision_fields(
+    c_now: float,
+    atr_now: float,
+    resistance: Optional[float],
+    support: Optional[float],
+    supertrend_dir: int,
+) -> Dict[str, Any]:
     feat: Dict[str, Any] = {}
 
     if atr_now is None or atr_now <= 0 or not np.isfinite(atr_now):
@@ -1205,11 +1509,13 @@ def compute_decision_fields(c_now: float, atr_now: float,
 
     return feat
 
+
 # ===================================================================
-# 14.  MAIN: BUILD AI FEATURES JSON
+# 14. MAIN: BUILD AI FEATURES JSON
 # mode="human" => skip slow network calls
 # mode="ai"    => full data
 # ===================================================================
+
 
 def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[str, Any]:
     stock_id = stock_id.strip().upper()
@@ -1217,18 +1523,16 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     stock_no = _strip_suffix(stock_id)
 
     # -- download daily --
-    df_daily = yf.download(yf_ticker, period="2y", interval="1d",
-                           progress=False, auto_adjust=False)
+    df_daily = yf.download(yf_ticker, period="2y", interval="1d", progress=False, auto_adjust=False)
     df_daily = clean_yf_columns(_ensure_naive_index(df_daily))
 
     if df_daily.empty and yf_ticker.endswith(".TW"):
         yf_ticker = yf_ticker.replace(".TW", ".TWO")
-        df_daily = yf.download(yf_ticker, period="2y", interval="1d",
-                               progress=False, auto_adjust=False)
+        df_daily = yf.download(yf_ticker, period="2y", interval="1d", progress=False, auto_adjust=False)
         df_daily = clean_yf_columns(_ensure_naive_index(df_daily))
 
     if df_daily.empty:
-        return {"error": "not found: {}".format(stock_id), "symbol": stock_id}
+        return {"error": f"not found: {stock_id}", "symbol": stock_id}
 
     chosen_ts = _nearest_trading_ts(df_daily, as_of_date)
     if chosen_ts is None:
@@ -1245,11 +1549,10 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     # -- download weekly (only for AI mode) --
     df_weekly_upto = None
     if mode == "ai":
-        df_weekly = clean_yf_columns(_ensure_naive_index(
-            yf.download(yf_ticker, period="2y", interval="1wk",
-                        progress=False, auto_adjust=False)))
-        df_weekly_upto = (df_weekly.loc[:chosen_ts]
-                          if df_weekly is not None and not df_weekly.empty else None)
+        df_weekly = clean_yf_columns(
+            _ensure_naive_index(yf.download(yf_ticker, period="2y", interval="1wk", progress=False, auto_adjust=False))
+        )
+        df_weekly_upto = df_weekly.loc[:chosen_ts] if df_weekly is not None and not df_weekly.empty else None
 
     # -- basic price --
     close = df["Close"]
@@ -1259,11 +1562,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     l_now = float(latest["Low"])
     vol_now = float(latest["Volume"])
 
-    feat: Dict[str, Any] = {
-        "symbol": yf_ticker,
-        "price_date": str(trade_date),
-        "query_date": str(query_date),
-    }
+    feat: Dict[str, Any] = {"symbol": yf_ticker, "price_date": str(trade_date), "query_date": str(query_date)}
 
     feat["close"] = c_now
     feat["open"] = o_now
@@ -1298,11 +1597,15 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["ma5_slope_5d"] = slope_n(ma5, 5)
     feat["ma20_slope_5d"] = slope_n(ma20, 5)
 
-    # -- trend state --
+    # trend_state
     if c_now > ma20_now > ma60_now and ma5_now > ma20_now:
         trend_state = "uptrend"
+    elif c_now > ma20_now > ma60_now and ma5_now <= ma20_now:
+        trend_state = "uptrend_pullback"
     elif c_now < ma20_now < ma60_now and ma5_now < ma20_now:
         trend_state = "downtrend"
+    elif c_now < ma20_now < ma60_now and ma5_now >= ma20_now:
+        trend_state = "downtrend_bounce"
     elif c_now > ma20_now and ma20_now < ma60_now:
         trend_state = "bottom_bounce"
     elif c_now < ma20_now and ma20_now > ma60_now:
@@ -1323,7 +1626,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     else:
         feat["weekly_above_ma20"] = None
 
-    # -- relative strength (AI only, needs extra download) --
+    # relative strength (AI only)
     if mode == "ai":
         rs_data = calc_relative_strength(df, benchmark_ticker="0050.TW", period=20)
         if rs_data:
@@ -1335,7 +1638,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     else:
         feat["rs_vs_bench_20d"] = None
 
-    # -- volume analysis --
+    # volume analysis
     avg_vol_5 = float(df["Volume"].tail(5).mean())
     feat["vol_ratio_5d"] = round(vol_now / avg_vol_5, 4) if avg_vol_5 > 0 else None
     feat["flag_price_up_vol_up"] = bool(c_now > float(df["Close"].iloc[-2]) and vol_now > avg_vol_5)
@@ -1345,14 +1648,14 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     vq = calculate_volume_quality(df)
     feat.update(vq)
 
-    # -- RSI --
+    # RSI
     rsi14 = calculate_rsi(close, 14)
     rsi14_now = float(rsi14.iloc[-1])
     feat["rsi14"] = round(rsi14_now, 2)
     feat["rsi14_percentile_252d"] = percentile_rank(rsi14, 252)
     feat["rsi14_slope_5d"] = slope_n(rsi14, 5)
 
-    # -- KD --
+    # KD
     low_min = df["Low"].rolling(9).min()
     high_max = df["High"].rolling(9).max()
     rsv = (close - low_min) / (high_max - low_min).replace(0, np.nan) * 100
@@ -1361,15 +1664,13 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["kd_k"] = round(float(k_val.iloc[-1]), 2)
     feat["kd_d"] = round(float(d_val.iloc[-1]), 2)
     feat["flag_kd_golden_cross"] = bool(
-        len(k_val) >= 2 and len(d_val) >= 2 and
-        k_val.iloc[-2] < d_val.iloc[-2] and k_val.iloc[-1] > d_val.iloc[-1]
+        len(k_val) >= 2 and len(d_val) >= 2 and k_val.iloc[-2] < d_val.iloc[-2] and k_val.iloc[-1] > d_val.iloc[-1]
     )
     feat["flag_kd_death_cross"] = bool(
-        len(k_val) >= 2 and len(d_val) >= 2 and
-        k_val.iloc[-2] > d_val.iloc[-2] and k_val.iloc[-1] < d_val.iloc[-1]
+        len(k_val) >= 2 and len(d_val) >= 2 and k_val.iloc[-2] > d_val.iloc[-2] and k_val.iloc[-1] < d_val.iloc[-1]
     )
 
-    # -- MACD --
+    # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     dif = ema12 - ema26
@@ -1381,15 +1682,13 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["macd_osc_slope_5d"] = slope_n(osc, 5)
     feat["macd_osc_percentile_252d"] = percentile_rank(osc, 252)
     feat["flag_macd_golden_cross"] = bool(
-        len(dif) >= 2 and len(dea) >= 2 and
-        dif.iloc[-2] < dea.iloc[-2] and dif.iloc[-1] > dea.iloc[-1]
+        len(dif) >= 2 and len(dea) >= 2 and dif.iloc[-2] < dea.iloc[-2] and dif.iloc[-1] > dea.iloc[-1]
     )
     feat["flag_macd_death_cross"] = bool(
-        len(dif) >= 2 and len(dea) >= 2 and
-        dif.iloc[-2] > dea.iloc[-2] and dif.iloc[-1] < dea.iloc[-1]
+        len(dif) >= 2 and len(dea) >= 2 and dif.iloc[-2] > dea.iloc[-2] and dif.iloc[-1] < dea.iloc[-1]
     )
 
-    # -- ADX --
+    # ADX
     adx, pdi, mdi = calculate_adx(df)
     feat["adx"] = round(float(adx.iloc[-1]), 2)
     feat["plus_di"] = round(float(pdi.iloc[-1]), 2)
@@ -1397,20 +1696,20 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["flag_strong_trend"] = bool(float(adx.iloc[-1]) > 25)
     feat["flag_di_bullish"] = bool(float(pdi.iloc[-1]) > float(mdi.iloc[-1]))
 
-    # -- ATR --
+    # ATR
     atr_series = calculate_atr(df, 14)
     atr_now = float(atr_series.iloc[-1])
     feat["atr14"] = round(atr_now, 2)
     feat["atr14_pct"] = round(atr_now / c_now * 100, 4)
     feat["atr14_percentile_252d"] = percentile_rank(atr_series, 252)
 
-    # -- Volatility --
+    # Volatility
     returns_20d = close.pct_change().tail(20)
     feat["volatility_20d"] = round(float(returns_20d.std()) * 100, 4) if len(returns_20d) >= 10 else None
     feat["max_drawdown_20d"] = max_drawdown(close, 20)
     feat["max_drawdown_60d"] = max_drawdown(close, 60)
 
-    # -- Bollinger Bands --
+    # Bollinger Bands
     bbw, bb_upper, bb_lower = calculate_bbands(df)
     bb_upper_now = float(bb_upper.iloc[-1])
     bb_lower_now = float(bb_lower.iloc[-1])
@@ -1418,11 +1717,10 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["bb_width_pct"] = round(float(bbw.iloc[-1]), 4)
     feat["bb_position_pct"] = round((c_now - bb_lower_now) / bb_range * 100, 2) if bb_range > 0 else 50.0
     feat["bb_width_percentile_252d"] = percentile_rank(bbw, 252)
-    feat["flag_bb_squeeze"] = bool(feat["bb_width_percentile_252d"] is not None
-                                   and feat["bb_width_percentile_252d"] < 0.15)
+    feat["flag_bb_squeeze"] = bool(feat["bb_width_percentile_252d"] is not None and feat["bb_width_percentile_252d"] < 0.15)
     feat["flag_above_bb_upper"] = bool(c_now > bb_upper_now)
 
-    # -- SuperTrend --
+    # SuperTrend
     st_direction = 0
     try:
         st_line, st_dir = calculate_supertrend(df)
@@ -1434,12 +1732,12 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         feat["supertrend_bullish"] = None
         feat["supertrend_distance_pct"] = None
 
-    # -- MFI --
+    # MFI
     mfi_s = calculate_mfi(df)
     feat["mfi14"] = round(float(mfi_s.iloc[-1]), 2)
 
-    # -- AVWAP --
-    avwap = calculate_avwap(df, "{}-01-01".format(chosen_ts.year))
+    # AVWAP
+    avwap = calculate_avwap(df, f"{chosen_ts.year}-01-01")
     if avwap is not None and not avwap.empty and np.isfinite(float(avwap.iloc[-1])):
         avwap_now = float(avwap.iloc[-1])
         feat["avwap_ytd"] = round(avwap_now, 2)
@@ -1448,19 +1746,19 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         feat["avwap_ytd"] = None
         feat["avwap_dev_pct"] = None
 
-    # -- Volume Profile / POC --
+    # Volume Profile / POC
     vp = calculate_volume_profile(df, lookback=60)
     feat.update(vp)
 
-    # -- short term S/R --
+    # short term S/R
     sr = detect_short_term_sr(df, lookback=20)
     feat.update(sr)
 
-    # -- Fibonacci --
+    # Fibonacci
     fib = calculate_fibonacci_summary(df)
     feat.update(fib)
 
-    # -- Gaps --
+    # Gaps
     gaps = detect_gaps_summary(df)
     feat["unfilled_gaps_count"] = len(gaps)
     if gaps:
@@ -1472,7 +1770,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         feat["nearest_gap_lower"] = None
         feat["nearest_gap_upper"] = None
 
-    # -- Divergence --
+    # Divergence
     div_rsi = detect_divergence(close, rsi14, lookback=60)
     feat["flag_bearish_divergence_rsi"] = div_rsi["bearish_divergence"]
     feat["flag_bullish_divergence_rsi"] = div_rsi["bullish_divergence"]
@@ -1481,31 +1779,41 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["flag_bearish_divergence_macd"] = div_macd["bearish_divergence"]
     feat["flag_bullish_divergence_macd"] = div_macd["bullish_divergence"]
 
-    # -- Candle patterns --
+    # Candle patterns
     candle_patterns = detect_momentum_candle_patterns(df, n=5)
     feat.update(candle_patterns)
 
-    # -- Chart patterns --
-    chart_patterns = detect_patterns(df)
-    feat["chart_pattern_count"] = len(chart_patterns)
-    if chart_patterns:
-        feat["chart_pattern_latest"] = chart_patterns[-1].get("pattern")
-        feat["chart_pattern_confirmed"] = chart_patterns[-1].get("confirmed", False)
-    else:
-        feat["chart_pattern_latest"] = None
-        feat["chart_pattern_confirmed"] = False
+    # Chart patterns
+    raw_chart_patterns = detect_patterns(df)
+    prioritized = _prioritize_patterns(raw_chart_patterns)
 
-    # ===================================
-    #  EXTERNAL DATA (network requests)
-    #  ONLY in AI mode
-    # ===================================
+    feat["chart_pattern_count"] = len(raw_chart_patterns)
+
+    if len(prioritized) >= 1:
+        feat["chart_pattern_1"] = prioritized[0].get("pattern")
+        feat["chart_pattern_1_confirmed"] = bool(prioritized[0].get("confirmed", False))
+        feat["chart_pattern_1_bias"] = prioritized[0].get("bias")
+    else:
+        feat["chart_pattern_1"] = None
+        feat["chart_pattern_1_confirmed"] = False
+        feat["chart_pattern_1_bias"] = None
+
+    if len(prioritized) >= 2:
+        feat["chart_pattern_2"] = prioritized[1].get("pattern")
+        feat["chart_pattern_2_confirmed"] = bool(prioritized[1].get("confirmed", False))
+        feat["chart_pattern_2_bias"] = prioritized[1].get("bias")
+    else:
+        feat["chart_pattern_2"] = None
+        feat["chart_pattern_2_confirmed"] = False
+        feat["chart_pattern_2_bias"] = None
+
+    # External data (AI only)
     if mode == "ai":
         latest_overall_ts = df_daily.index[-1]
 
-        # -- Institutional (20 days) --
+        # Institutional (20 days)
         try:
-            chips_multi = get_institutional_multi_days(
-                stock_id, trade_date, market_hint=yf_ticker, days=20)
+            chips_multi = get_institutional_multi_days(stock_id, trade_date, market_hint=yf_ticker, days=20)
             price_20d_ago = float(df["Close"].iloc[-20]) if len(df) >= 20 else c_now
             inst_feat = compute_institutional_features(chips_multi, c_now, price_20d_ago)
             feat.update(inst_feat)
@@ -1513,21 +1821,31 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
             feat["inst_data_available"] = False
             feat["inst_error"] = str(e)
 
-        # -- Foreign holding ratio --
+        # Foreign holding availability
         try:
             if yf_ticker.endswith(".TW"):
                 fh = get_foreign_holding_ratio(stock_no)
-                feat["foreign_holding_pct"] = fh.get("ratio")
+                if fh.get("error") is None and fh.get("ratio") is not None:
+                    feat["foreign_holding_pct"] = fh["ratio"]
+                    feat["foreign_holding_available"] = True
+                else:
+                    feat["foreign_holding_pct"] = None
+                    feat["foreign_holding_available"] = False
             else:
                 feat["foreign_holding_pct"] = None
+                feat["foreign_holding_available"] = False
         except Exception:
             feat["foreign_holding_pct"] = None
+            feat["foreign_holding_available"] = False
 
-        # -- Margin trading --
+        # Margin trading
         try:
             margin = get_margin_short_data(
-                stock_id, trade_date=latest_overall_ts.date(),
-                market_hint=yf_ticker, max_back=7)
+                stock_id,
+                trade_date=latest_overall_ts.date(),
+                market_hint=yf_ticker,
+                max_back=7,
+            )
             if isinstance(margin, dict) and margin.get("error") is None:
                 feat["margin_balance"] = margin.get("margin_balance")
                 feat["margin_change"] = margin.get("margin_change")
@@ -1536,17 +1854,14 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
                 feat["short_change"] = margin.get("short_change")
                 m_bal = margin.get("margin_balance")
                 s_bal = margin.get("short_balance")
-                feat["short_margin_ratio"] = (
-                    round(s_bal / m_bal * 100, 2)
-                    if m_bal and s_bal and m_bal > 0 else None
-                )
+                feat["short_margin_ratio"] = round(s_bal / m_bal * 100, 2) if m_bal and s_bal and m_bal > 0 else None
                 feat["margin_data_available"] = True
             else:
                 feat["margin_data_available"] = False
         except Exception:
             feat["margin_data_available"] = False
 
-        # -- TDCC --
+        # TDCC
         try:
             tdcc = get_tdcc_distribution(stock_no, weeks_back=2)
             tdcc_feat = compute_tdcc_features(tdcc)
@@ -1554,61 +1869,77 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         except Exception:
             feat["tdcc_available"] = False
     else:
-        # Human mode: mark external data as skipped
         feat["inst_data_available"] = False
         feat["margin_data_available"] = False
         feat["tdcc_available"] = False
         feat["foreign_holding_pct"] = None
+        feat["foreign_holding_available"] = False
 
-    # -- Decision fields --
+    # Decision fields
     resistance = feat.get("fib_nearest_resistance_1") or feat.get("st_resistance")
     support = feat.get("fib_nearest_support_1") or feat.get("st_support")
     decision = compute_decision_fields(c_now, atr_now, resistance, support, st_direction)
     feat.update(decision)
 
+    # Final sanitize
+    feat = _sanitize_numpy(feat)
     return feat
 
+
 # ===================================================================
-# 15.  TEXT REPORT
+# 15. TEXT REPORT
 # ===================================================================
+
 
 def format_text_report(feat: Dict[str, Any]) -> str:
     if "error" in feat and feat["error"]:
-        return "Ｘ {}：{}".format(feat.get("symbol", "？"), feat["error"])
+        return "X {}：{}".format(feat.get("symbol", "？"), feat["error"])
 
     lines = []
-    # 使用全形等號作為分隔線，長度減半
-    SEP = "＝" * 30
+    SEP = "=" * 30
 
     lines.append(SEP)
-    lines.append("　{}　Technical Summary".format(feat["symbol"]))
-    lines.append("　Data：{}　Query：{}".format(feat["price_date"], feat["query_date"]))
+    lines.append("  {}  Technical Summary".format(feat["symbol"]))
+    lines.append("  Data：{}  Query：{}".format(feat["price_date"], feat["query_date"]))
     lines.append(SEP)
 
-    lines.append("　Close：{}　Trend：{}".format(feat["close"], feat["trend_state"]))
-    lines.append("　MA20 dev：{:+.2f}％ （pctl＝{}）".format(feat["ma20_dev_pct"], feat.get("ma20_dev_percentile_252d")))
-    lines.append("　MA60 dev：{:+.2f}％ （pctl＝{}）".format(feat["ma60_dev_pct"], feat.get("ma60_dev_percentile_252d")))
-    lines.append("　52w pos：{:.1f}％".format(feat["pos_52w_pct"]))
+    lines.append("  Close：{}  Trend：{}".format(feat["close"], feat["trend_state"]))
+    lines.append("  MA20 dev：{:+.2f}% (pctl={})".format(feat["ma20_dev_pct"], feat.get("ma20_dev_percentile_252d")))
+    lines.append("  MA60 dev：{:+.2f}% (pctl={})".format(feat["ma60_dev_pct"], feat.get("ma60_dev_percentile_252d")))
+    lines.append("  52w pos：{:.1f}%".format(feat["pos_52w_pct"]))
 
-    lines.append("　RSI14：{}　KD：{}／{}".format(feat["rsi14"], feat["kd_k"], feat["kd_d"]))
-    lines.append("　MACD OSC：{:.4f}　ADX：{}".format(feat["macd_osc"], feat["adx"]))
-    lines.append("　ATR14：{} （{:.2f}％）".format(feat["atr14"], feat["atr14_pct"]))
+    lines.append("  RSI14：{}  KD：{}/{}".format(feat["rsi14"], feat["kd_k"], feat["kd_d"]))
+    lines.append("  MACD OSC：{:.4f}  ADX：{}".format(feat["macd_osc"], feat["adx"]))
+    lines.append("  ATR14：{} ({:.2f}%)".format(feat["atr14"], feat["atr14_pct"]))
 
-    lines.append("　Vol ratio：{}　OBV slope 5d：{}".format(feat.get("vol_ratio_5d"), feat.get("obv_slope_5d")))
+    lines.append("  Vol ratio：{}  OBV slope 5d：{}".format(feat.get("vol_ratio_5d"), feat.get("obv_slope_5d")))
 
     flags = [k for k, v in feat.items() if k.startswith("flag_") and v is True]
     if flags:
-        lines.append("　Flags：{}".format("，".join(f.replace("flag_", "") for f in flags)))
+        lines.append("  Flags：{}".format("，".join(f.replace("flag_", "") for f in flags)))
+
+    cp1 = feat.get("chart_pattern_1")
+    cp2 = feat.get("chart_pattern_2")
+    if cp1 or cp2:
+        parts = []
+        if cp1:
+            conf = "✓" if feat.get("chart_pattern_1_confirmed") else "?"
+            parts.append("{}[{}]".format(cp1, conf))
+        if cp2:
+            conf = "✓" if feat.get("chart_pattern_2_confirmed") else "?"
+            parts.append("{}[{}]".format(cp2, conf))
+        lines.append("  Patterns：{}".format("，".join(parts)))
 
     if feat.get("decision_available"):
-        lines.append("　Stop：{} （{}％）".format(feat.get("atr_stop_loss"), feat.get("atr_stop_loss_pct")))
-        lines.append("　Target：{}　R:R＝{}".format(feat.get("target_resistance"), feat.get("risk_reward_ratio")))
+        lines.append("  Stop：{} ({}%)".format(feat.get("atr_stop_loss"), feat.get("atr_stop_loss_pct")))
+        lines.append("  Target：{}  R:R={}".format(feat.get("target_resistance"), feat.get("risk_reward_ratio")))
 
     lines.append(SEP)
     return "\n".join(lines)
 
+
 # ===================================================================
-# 16.  SECTOR ANALYSIS
+# 16. SECTOR ANALYSIS
 # ===================================================================
 
 SECTOR_DICT = {
@@ -1621,11 +1952,12 @@ SECTOR_DICT = {
     "散熱模組": ["3017.TW", "3324.TW", "3338.TW", "6230.TW", "2421.TW"],
 }
 
+
 def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers=None, mode: str = "human") -> str:
     target_list = custom_tickers if custom_tickers else SECTOR_DICT.get(sector_name, [])
 
     if not target_list:
-        return "No stocks in sector {}.".format(sector_name)
+        return f"No stocks in sector {sector_name}."
 
     results = []
 
@@ -1634,10 +1966,7 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
             feat = build_ai_features(stock_id, as_of_date=as_of_date, mode=mode)
 
             if feat.get("error"):
-                results.append({
-                    "Symbol": _strip_suffix(stock_id),
-                    "Close": "－", "Trend": "Error", "Vol_R": "－", "KD": "－／－", "Score": 0
-                })
+                results.append({"Symbol": _strip_suffix(stock_id), "Close": "-", "Trend": "Error", "Vol_R": "-", "KD": "-/-", "Score": 0})
                 continue
 
             score = 0
@@ -1652,56 +1981,59 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
 
             summary = {
                 "Symbol": _strip_suffix(feat.get("symbol", stock_id)),
-                "Close": feat.get("close", "－"),
-                "Trend": feat.get("trend_state", "－"),
-                "MA20_Dev": "{:+.2f}％".format(feat.get("ma20_dev_pct", 0)),
-                "Vol_R": feat.get("vol_ratio_5d", "－"),
-                "KD": "{:.0f}／{:.0f}".format(feat.get("kd_k", 0), feat.get("kd_d", 0)),
-                "Score": score
+                "Close": feat.get("close", "-"),
+                "Trend": feat.get("trend_state", "-"),
+                "MA20_Dev": "{:+.2f}%".format(feat.get("ma20_dev_pct", 0) or 0),
+                "Vol_R": feat.get("vol_ratio_5d", "-"),
+                "KD": "{:.0f}/{:.0f}".format(feat.get("kd_k", 0) or 0, feat.get("kd_d", 0) or 0),
+                "Score": score,
             }
             results.append(summary)
 
-        except Exception as e:
+        except Exception:
             results.append({"Symbol": stock_id, "Trend": "Exception", "Score": -1})
 
     results.sort(key=lambda x: x.get("Score", 0), reverse=True)
 
     lines = []
-    lines.append("Sector Scan：{}".format(sector_name))
+    lines.append(f"Sector Scan：{sector_name}")
     d_str = str(as_of_date) if as_of_date else "Today"
-    lines.append("Date：{}".format(d_str))
-    lines.append("－" * 35)
-    lines.append("{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format(
-        "Symbol", "Price", "Trend", "MA20Dev", "VolR", "KD", "Score"))
-    lines.append("－" * 35)
+    lines.append(f"Date：{d_str}")
+    lines.append("-" * 35)
+    lines.append("{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format("Symbol", "Price", "Trend", "MA20Dev", "VolR", "KD", "Score"))
+    lines.append("-" * 35)
 
     for r in results:
-        lines.append("{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format(
-            str(r.get("Symbol", "")),
-            str(r.get("Close", "")),
-            str(r.get("Trend", "")),
-            str(r.get("MA20_Dev", "")),
-            str(r.get("Vol_R", "")),
-            str(r.get("KD", "")),
-            str(r.get("Score", "")),
-        ))
+        lines.append(
+            "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format(
+                str(r.get("Symbol", "")),
+                str(r.get("Close", "")),
+                str(r.get("Trend", "")),
+                str(r.get("MA20_Dev", "")),
+                str(r.get("Vol_R", "")),
+                str(r.get("KD", "")),
+                str(r.get("Score", "")),
+            )
+        )
 
-    lines.append("－" * 35)
-    lines.append("（Score：uptrend＋2，price_up_vol_up＋1，KD_golden＋1，inst_consensus＋2）")
+    lines.append("-" * 35)
+    lines.append("（Score：uptrend+2，price_up_vol_up+1，KD_golden+1，inst_consensus+2）")
 
     return "\n".join(lines)
 
+
 # ===================================================================
-# 17.  ENTRY POINT
+# 17. ENTRY POINT
 # mode="human" => fast, text only
 # mode="ai"    => full JSON
 # ===================================================================
+
 
 def analyze_stock_technical(stock_id: str, as_of_date=None, mode: str = "human") -> dict:
     """
     Main entry point.
     mode="human" => returns {"human_report": str}   (fast, no network calls)
-    mode="ai"    => returns {"ai_report": dict}      (full JSON with all data)
+    mode="ai"    => returns {"ai_report": dict}     (full JSON with all data)
     """
     feat = build_ai_features(stock_id, as_of_date, mode=mode)
 
@@ -1711,12 +2043,14 @@ def analyze_stock_technical(stock_id: str, as_of_date=None, mode: str = "human")
         text = format_text_report(feat)
         return {"human_report": text}
 
+
 if __name__ == "__main__":
     import sys
+
     sid = sys.argv[1] if len(sys.argv) > 1 else "2330"
     m = sys.argv[2] if len(sys.argv) > 2 else "human"
     result = analyze_stock_technical(sid, mode=m)
     if "human_report" in result:
         print(result["human_report"])
     if "ai_report" in result:
-        print(json.dumps(result["ai_report"], default=str))
+        print(json.dumps(result["ai_report"], ensure_ascii=False, default=str))
