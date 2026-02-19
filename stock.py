@@ -6,6 +6,7 @@ import io
 import json
 import math
 import re
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -31,6 +32,11 @@ except Exception:
 
 # [OPT] Reusable HTTP session for connection pooling across all requests
 _http_session: Optional[requests.Session] = None
+
+# [FIX] yf.download() is NOT thread-safe — concurrent calls cause data
+# cross-contamination between tickers. This lock serializes all yfinance
+# calls while allowing external data fetches to remain fully parallel.
+_yf_lock = threading.Lock()
 
 
 def _get_session() -> requests.Session:
@@ -1540,9 +1546,10 @@ def compute_tdcc_features(tdcc_data: Dict) -> Dict[str, Any]:
 
 def calc_relative_strength(stock_df, benchmark_ticker="0050.TW", period=20):
     try:
-        bench = clean_yf_columns(
-            _ensure_naive_index(yf.download(benchmark_ticker, period="3mo", progress=False, auto_adjust=False))
-        )
+        with _yf_lock:
+            bench = clean_yf_columns(
+                _ensure_naive_index(yf.download(benchmark_ticker, period="3mo", progress=False, auto_adjust=False))
+            )
         if bench.empty or len(stock_df) < period:
             return None
         s_ret = (float(stock_df["Close"].iloc[-1]) / float(stock_df["Close"].iloc[-period]) - 1) * 100
@@ -1621,17 +1628,18 @@ def compute_decision_fields(
 
 # ===================================================================
 # 14. MAIN: BUILD AI FEATURES JSON
-# [OPT] Parallel yfinance downloads + parallel external data fetching
+# [OPT] Sequential yf downloads (thread-unsafe) + parallel external data
 # ===================================================================
 
 
 def _download_yf(ticker: str, period: str, interval: str):
-    """Helper for threaded yf.download."""
-    try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
-        return clean_yf_columns(_ensure_naive_index(df))
-    except Exception:
-        return pd.DataFrame()
+    """Helper for threaded yf.download — serialised via _yf_lock."""
+    with _yf_lock:
+        try:
+            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
+            return clean_yf_columns(_ensure_naive_index(df))
+        except Exception:
+            return pd.DataFrame()
 
 
 def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[str, Any]:
@@ -1639,15 +1647,8 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     yf_ticker = _resolve_yf_ticker(stock_id)
     stock_no = _strip_suffix(stock_id)
 
-    # [OPT] Parallel yfinance downloads: daily + weekly + benchmark at once
-    yf_futures = {}
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        yf_futures["daily"] = pool.submit(_download_yf, yf_ticker, "2y", "1d")
-        if mode == "ai":
-            yf_futures["weekly"] = pool.submit(_download_yf, yf_ticker, "2y", "1wk")
-            yf_futures["bench"] = pool.submit(_download_yf, "0050.TW", "3mo", "1d")
-
-    df_daily = yf_futures["daily"].result()
+    # -- download daily (sequential — yf.download is NOT thread-safe) --
+    df_daily = _download_yf(yf_ticker, "2y", "1d")
 
     if df_daily.empty and yf_ticker.endswith(".TW"):
         yf_ticker = yf_ticker.replace(".TW", ".TWO")
@@ -1668,16 +1669,13 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     trade_date = chosen_ts.date()
     query_date = as_of_date if as_of_date else datetime.now().date()
 
-    # -- weekly data (AI only) --
+    # -- download weekly + benchmark sequentially (AI only) --
     df_weekly_upto = None
-    if mode == "ai":
-        df_weekly = yf_futures["weekly"].result()
-        df_weekly_upto = df_weekly.loc[:chosen_ts] if df_weekly is not None and not df_weekly.empty else None
-
-    # -- pre-fetched benchmark (AI only) --
     bench_df = None
     if mode == "ai":
-        bench_df = yf_futures["bench"].result()
+        df_weekly = _download_yf(yf_ticker, "2y", "1wk")
+        df_weekly_upto = df_weekly.loc[:chosen_ts] if df_weekly is not None and not df_weekly.empty else None
+        bench_df = _download_yf("0050.TW", "3mo", "1d")
 
     # -- basic price --
     close = df["Close"]
