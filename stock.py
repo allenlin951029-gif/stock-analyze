@@ -1,6 +1,7 @@
-# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON1.14
+# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON1.15
 # Supports two modes: human (fast, skip network) / ai (full data)
 # *** OPTIMIZED VERSION – key changes marked with # [OPT] ***
+# *** DATA CLEANED VERSION – Added auto_adjust=True and ffill() for dirty data ***
 
 import io
 import json
@@ -1681,9 +1682,12 @@ def compute_tdcc_features(tdcc_data: Dict) -> Dict[str, Any]:
 def calc_relative_strength(stock_df, benchmark_ticker="0050.TW", period=20):
     try:
         with _yf_lock:
-            bench = clean_yf_columns(
-                _ensure_naive_index(yf.download(benchmark_ticker, period="3mo", progress=False, auto_adjust=False))
-            )
+            # [FIX] auto_adjust=True and ffill() to avoid missing data/unadjusted price bugs
+            bench = yf.download(benchmark_ticker, period="3mo", progress=False, auto_adjust=True)
+            bench = clean_yf_columns(_ensure_naive_index(bench))
+            if not bench.empty:
+                bench = bench.ffill().dropna(subset=["Close"])
+                
         if bench.empty or len(stock_df) < period:
             return None
         s_ret = (float(stock_df["Close"].iloc[-1]) / float(stock_df["Close"].iloc[-period]) - 1) * 100
@@ -1796,8 +1800,12 @@ def _download_yf(ticker: str, period: str, interval: str):
     """Helper for threaded yf.download — serialised via _yf_lock."""
     with _yf_lock:
         try:
-            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
-            return clean_yf_columns(_ensure_naive_index(df))
+            # [FIX] auto_adjust=True and ffill() to avoid missing data/unadjusted price bugs
+            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+            df = clean_yf_columns(_ensure_naive_index(df))
+            if not df.empty:
+                df = df.ffill().dropna(subset=["Close"])
+            return df
         except Exception:
             return pd.DataFrame()
 
