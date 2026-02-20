@@ -1,4 +1,4 @@
-# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON 1.13
+# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON1.14
 # Supports two modes: human (fast, skip network) / ai (full data)
 # *** OPTIMIZED VERSION – key changes marked with # [OPT] ***
 
@@ -2264,6 +2264,11 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
 
     # Decision fields
     resistance = feat.get("fib_nearest_resistance_1") or feat.get("st_resistance")
+    # For breakout stocks at highs with no retracement resistance, use extension levels
+    if resistance and resistance <= c_now * 1.005:
+        ext_resistance = feat.get("fib_ext_1272")
+        if ext_resistance and ext_resistance > c_now:
+            resistance = ext_resistance
     support = feat.get("fib_nearest_support_1") or feat.get("st_support")
     decision = compute_decision_fields(
         c_now, atr_now, resistance, support, st_direction,
