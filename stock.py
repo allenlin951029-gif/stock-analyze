@@ -1,4 +1,4 @@
-# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON
+# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON 1.13
 # Supports two modes: human (fast, skip network) / ai (full data)
 # *** OPTIMIZED VERSION – key changes marked with # [OPT] ***
 
@@ -204,6 +204,7 @@ def zscore_last(series: pd.Series, window: int = 252) -> Optional[float]:
 
 
 def slope_n(series: pd.Series, n: int = 5) -> Optional[float]:
+    """Normalized slope: percent change per day relative to the series mean."""
     s = series.dropna().iloc[-n:]
     if len(s) < n:
         return None
@@ -212,7 +213,11 @@ def slope_n(series: pd.Series, n: int = 5) -> Optional[float]:
     if np.all(np.isnan(y)):
         return None
     m, _ = np.polyfit(x, y, 1)
-    return round(float(m), 6)
+    # Normalize: slope per day as % of series mean
+    mean_val = np.mean(y)
+    if mean_val == 0:
+        return 0.0
+    return round(float(m / abs(mean_val) * 100), 4)
 
 
 def max_drawdown(series: pd.Series, window: int = 20) -> Optional[float]:
@@ -313,9 +318,10 @@ def detect_momentum_candle_patterns(df: pd.DataFrame, n: int = 5) -> Dict[str, A
 
 
 def calculate_rsi(series: pd.Series, period: int) -> pd.Series:
+    """RSI using Wilder's exponential smoothing (alpha=1/period)."""
     delta = series.diff()
-    gain = delta.where(delta > 0, 0).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    gain = delta.where(delta > 0, 0).ewm(alpha=1 / period, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1 / period, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
@@ -354,11 +360,12 @@ def calculate_adx(df: pd.DataFrame, period: int = 14):
 
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """ATR using Wilder's exponential smoothing (alpha=1/period)."""
     h, l, c = df["High"], df["Low"], df["Close"]
     tr = pd.concat([h - l, abs(h - c.shift(1)), abs(l - c.shift(1))], axis=1).max(
         axis=1
     )
-    return tr.rolling(period).mean()
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
 def calculate_bbands(df: pd.DataFrame, period: int = 20, std_dev: int = 2):
@@ -519,20 +526,74 @@ def calculate_volume_profile(
     c_now = float(sub["Close"].iloc[-1])
     price_vs_poc = round((c_now - poc_price) / poc_price * 100, 4) if poc_price > 0 else None
 
+    # Value Area: expand from POC until 70% of total volume is captured
+    total_vol = vol_by_bin.sum()
+    va_vol = vol_by_bin[poc_idx]
+    lo_idx, hi_idx = poc_idx, poc_idx
+    while total_vol > 0 and va_vol / total_vol < 0.70:
+        expand_lo = vol_by_bin[lo_idx - 1] if lo_idx > 0 else 0
+        expand_hi = vol_by_bin[hi_idx + 1] if hi_idx < n_bins - 1 else 0
+        if expand_lo >= expand_hi and lo_idx > 0:
+            lo_idx -= 1
+            va_vol += expand_lo
+        elif hi_idx < n_bins - 1:
+            hi_idx += 1
+            va_vol += expand_hi
+        else:
+            break
+    va_high = round(float((bins[hi_idx] + bins[hi_idx + 1]) / 2), 2)
+    va_low = round(float((bins[lo_idx] + bins[lo_idx + 1]) / 2), 2)
+
     return {
         "poc_price": poc_price,
         "poc_volume_k": poc_volume,
         "price_vs_poc_pct": price_vs_poc,
+        "va_high": va_high,
+        "va_low": va_low,
     }
 
 
-def detect_short_term_sr(df: pd.DataFrame, lookback: int = 20) -> Dict[str, Any]:
+def detect_short_term_sr(df: pd.DataFrame, lookback: int = 120, pivot_lr: int = 3, cluster_pct: float = 0.015) -> Dict[str, Any]:
+    """
+    Detect support/resistance by clustering pivot highs and lows.
+    Levels where 2+ pivots cluster within `cluster_pct` of each other are S/R.
+    Falls back to range-based min/max if insufficient pivots.
+    """
     sub = df.tail(lookback)
     if sub.empty:
         return {"st_support": None, "st_resistance": None}
+
+    c_now = float(sub["Close"].iloc[-1])
+    hp, lp = _find_pivots(sub, left=pivot_lr, right=pivot_lr)
+    all_pivot_prices = [p[2] for p in hp] + [p[2] for p in lp]
+
+    if len(all_pivot_prices) < 3:
+        # Fallback to range
+        return {
+            "st_support": round(float(sub["Low"].min()), 2),
+            "st_resistance": round(float(sub["High"].max()), 2),
+        }
+
+    # Cluster nearby pivot prices
+    all_pivot_prices.sort()
+    clusters = []
+    current_cluster = [all_pivot_prices[0]]
+    for i in range(1, len(all_pivot_prices)):
+        if abs(all_pivot_prices[i] - current_cluster[0]) / abs(current_cluster[0]) <= cluster_pct:
+            current_cluster.append(all_pivot_prices[i])
+        else:
+            if len(current_cluster) >= 2:
+                clusters.append(round(float(np.mean(current_cluster)), 2))
+            current_cluster = [all_pivot_prices[i]]
+    if len(current_cluster) >= 2:
+        clusters.append(round(float(np.mean(current_cluster)), 2))
+
+    supports = sorted([lv for lv in clusters if lv < c_now], reverse=True)
+    resistances = sorted([lv for lv in clusters if lv >= c_now])
+
     return {
-        "st_support": round(float(sub["Low"].min()), 2),
-        "st_resistance": round(float(sub["High"].max()), 2),
+        "st_support": supports[0] if supports else round(float(sub["Low"].min()), 2),
+        "st_resistance": resistances[0] if resistances else round(float(sub["High"].max()), 2),
     }
 
 
@@ -542,29 +603,61 @@ def detect_short_term_sr(df: pd.DataFrame, lookback: int = 20) -> Dict[str, Any]
 
 
 def detect_divergence(
-    price: pd.Series, indicator: pd.Series, lookback: int = 60, pivot_n: int = 5
+    price: pd.Series, indicator: pd.Series, lookback: int = 60,
+    pivot_left: int = 5, pivot_right: int = 3,
 ) -> Dict[str, bool]:
+    """
+    Detect divergence by finding pivot highs/lows in price and comparing
+    the indicator values at the same timestamps.
+    - Bearish divergence: price makes higher high, indicator makes lower high
+    - Bullish divergence: price makes lower low, indicator makes higher low
+    """
     result = {"bearish_divergence": False, "bullish_divergence": False}
     p = price.dropna().iloc[-lookback:]
-    ind = indicator.dropna().iloc[-lookback:]
+    ind = indicator.reindex(p.index).dropna()
     if len(p) < 20 or len(ind) < 20:
         return result
 
-    mid = len(p) // 2
-    p_first_half_high = p.iloc[:mid].max()
-    p_second_half_high = p.iloc[mid:].max()
-    ind_first_half_high = ind.iloc[:mid].max()
-    ind_second_half_high = ind.iloc[mid:].max()
+    p_vals = p.values.astype(float)
+    n = len(p_vals)
 
-    p_first_half_low = p.iloc[:mid].min()
-    p_second_half_low = p.iloc[mid:].min()
-    ind_first_half_low = ind.iloc[:mid].min()
-    ind_second_half_low = ind.iloc[mid:].min()
+    # Find pivot highs and lows in price
+    pivot_highs = []  # (index_in_p, price_value)
+    pivot_lows = []
+    for i in range(pivot_left, n - pivot_right):
+        window_h = p_vals[i - pivot_left : i + pivot_right + 1]
+        window_l = p_vals[i - pivot_left : i + pivot_right + 1]
+        if np.isfinite(p_vals[i]) and p_vals[i] == np.nanmax(window_h):
+            if not pivot_highs or pivot_highs[-1][0] < i - pivot_right:
+                pivot_highs.append((i, p_vals[i]))
+        if np.isfinite(p_vals[i]) and p_vals[i] == np.nanmin(window_l):
+            if not pivot_lows or pivot_lows[-1][0] < i - pivot_right:
+                pivot_lows.append((i, p_vals[i]))
 
-    if p_second_half_high > p_first_half_high and ind_second_half_high < ind_first_half_high:
-        result["bearish_divergence"] = True
-    if p_second_half_low < p_first_half_low and ind_second_half_low > ind_first_half_low:
-        result["bullish_divergence"] = True
+    # Need at least 2 pivot highs/lows to compare
+    ind_vals = ind.values.astype(float)
+
+    # Bearish divergence: last two pivot highs — price HH, indicator LH
+    if len(pivot_highs) >= 2:
+        ph1_idx, ph1_price = pivot_highs[-2]
+        ph2_idx, ph2_price = pivot_highs[-1]
+        if ph1_idx < len(ind_vals) and ph2_idx < len(ind_vals):
+            ind_at_ph1 = ind_vals[ph1_idx]
+            ind_at_ph2 = ind_vals[ph2_idx]
+            if (ph2_price > ph1_price and ind_at_ph2 < ind_at_ph1
+                    and np.isfinite(ind_at_ph1) and np.isfinite(ind_at_ph2)):
+                result["bearish_divergence"] = True
+
+    # Bullish divergence: last two pivot lows — price LL, indicator HL
+    if len(pivot_lows) >= 2:
+        pl1_idx, pl1_price = pivot_lows[-2]
+        pl2_idx, pl2_price = pivot_lows[-1]
+        if pl1_idx < len(ind_vals) and pl2_idx < len(ind_vals):
+            ind_at_pl1 = ind_vals[pl1_idx]
+            ind_at_pl2 = ind_vals[pl2_idx]
+            if (pl2_price < pl1_price and ind_at_pl2 > ind_at_pl1
+                    and np.isfinite(ind_at_pl1) and np.isfinite(ind_at_pl2)):
+                result["bullish_divergence"] = True
 
     return result
 
@@ -605,31 +698,60 @@ def calculate_volume_quality(df: pd.DataFrame, period: int = 20) -> Dict[str, An
 # ===================================================================
 
 
-def calculate_fibonacci_summary(df: pd.DataFrame, lookback: int = 120) -> Dict[str, Any]:
+def calculate_fibonacci_summary(df: pd.DataFrame, lookback: int = 120, trend_state: str = "consolidation") -> Dict[str, Any]:
+    """
+    Direction-aware Fibonacci retracement.
+    - Uptrend: measure from swing low → swing high (retracement = pullback support)
+    - Downtrend: measure from swing high → swing low (retracement = bounce resistance)
+    Adds extension levels (1.272, 1.618) for breakout targets.
+    """
     sub = df.tail(lookback)
     high = float(sub["High"].max())
     low = float(sub["Low"].min())
     diff = high - low
     c_now = float(sub["Close"].iloc[-1])
 
-    levels = {
-        "fib_0236": round(high - 0.236 * diff, 2),
-        "fib_0382": round(high - 0.382 * diff, 2),
-        "fib_0500": round(high - 0.500 * diff, 2),
-        "fib_0618": round(high - 0.618 * diff, 2),
-    }
+    is_uptrend = trend_state in ("uptrend", "strong_uptrend", "weak_uptrend", "uptrend_pullback", "bottom_bounce")
+
+    if is_uptrend:
+        # Uptrend: retracement from high, extensions above high
+        levels = {
+            "fib_0236": round(high - 0.236 * diff, 2),
+            "fib_0382": round(high - 0.382 * diff, 2),
+            "fib_0500": round(high - 0.500 * diff, 2),
+            "fib_0618": round(high - 0.618 * diff, 2),
+        }
+        extensions = {
+            "fib_ext_1272": round(low + 1.272 * diff, 2),
+            "fib_ext_1618": round(low + 1.618 * diff, 2),
+        }
+    else:
+        # Downtrend: retracement from low upward, extensions below low
+        levels = {
+            "fib_0236": round(low + 0.236 * diff, 2),
+            "fib_0382": round(low + 0.382 * diff, 2),
+            "fib_0500": round(low + 0.500 * diff, 2),
+            "fib_0618": round(low + 0.618 * diff, 2),
+        }
+        extensions = {
+            "fib_ext_1272": round(high - 1.272 * diff, 2),
+            "fib_ext_1618": round(high - 1.618 * diff, 2),
+        }
 
     resistances = sorted([v for v in levels.values() if v > c_now])
     supports = sorted([v for v in levels.values() if v <= c_now], reverse=True)
 
-    return {
+    result = {
         "fib_high": high,
         "fib_low": low,
+        "fib_direction": "up" if is_uptrend else "down",
         "fib_nearest_support_1": supports[0] if len(supports) > 0 else None,
         "fib_nearest_support_2": supports[1] if len(supports) > 1 else None,
         "fib_nearest_resistance_1": resistances[0] if len(resistances) > 0 else None,
         "fib_nearest_resistance_2": resistances[1] if len(resistances) > 1 else None,
     }
+    result.update(extensions)
+    return result
 
 
 # ===================================================================
@@ -1096,7 +1218,7 @@ def get_institutional_multi_days(stock_id: str, end_date, market_hint=None, days
     return results
 
 
-def compute_institutional_features(chips_multi: List[Dict], price_now: float, price_20d_ago: float) -> Dict[str, Any]:
+def compute_institutional_features(chips_multi: List[Dict], price_now: float, price_20d_ago: float, avg_daily_vol: float = 0) -> Dict[str, Any]:
     feat: Dict[str, Any] = {}
     if not chips_multi:
         return {"inst_data_available": False}
@@ -1117,6 +1239,18 @@ def compute_institutional_features(chips_multi: List[Dict], price_now: float, pr
     feat["trust_20d_net"] = sum(t_vals)
     feat["dealer_5d_net"] = sum(d_vals[-5:])
     feat["dealer_20d_net"] = sum(d_vals)
+
+    # Normalized institutional flow as % of average daily volume (Item #14)
+    if avg_daily_vol > 0:
+        feat["foreign_20d_net_pct_adv"] = round(
+            sum(f_vals) * 1000 / avg_daily_vol * 100, 2
+        )
+        feat["trust_20d_net_pct_adv"] = round(
+            sum(t_vals) * 1000 / avg_daily_vol * 100, 2
+        )
+    else:
+        feat["foreign_20d_net_pct_adv"] = None
+        feat["trust_20d_net_pct_adv"] = None
 
     feat["foreign_slope_20d"] = slope_n(pd.Series(f_vals), len(f_vals))
     feat["trust_slope_20d"] = slope_n(pd.Series(t_vals), len(t_vals))
@@ -1572,9 +1706,9 @@ def _calc_relative_strength_with_bench(stock_df, bench_df, period=20):
         s_ret = (float(stock_df["Close"].iloc[-1]) / float(stock_df["Close"].iloc[-period]) - 1) * 100
         b_ret = (float(bench_df["Close"].iloc[-1]) / float(bench_df["Close"].iloc[-period]) - 1) * 100
         return {
-            "stock_ret_20d": round(s_ret, 2),
-            "bench_ret_20d": round(b_ret, 2),
-            "rs_20d": round(s_ret - b_ret, 2),
+            f"stock_ret_{period}d": round(s_ret, 2),
+            f"bench_ret_{period}d": round(b_ret, 2),
+            f"rs_{period}d": round(s_ret - b_ret, 2),
         }
     except Exception:
         return None
@@ -1591,6 +1725,8 @@ def compute_decision_fields(
     resistance: Optional[float],
     support: Optional[float],
     supertrend_dir: int,
+    bb_squeeze: bool = False,
+    trend_state: str = "consolidation",
 ) -> Dict[str, Any]:
     feat: Dict[str, Any] = {}
 
@@ -1599,9 +1735,33 @@ def compute_decision_fields(
 
     feat["decision_available"] = True
 
-    stop_loss = round(c_now - 2 * atr_now, 2)
+    # Adaptive stop-loss multiplier based on context
+    is_bullish = supertrend_dir == 1
+    is_bearish_trend = trend_state in ("downtrend", "strong_downtrend", "weak_downtrend")
+
+    if is_bearish_trend:
+        # In a downtrend, long stop-loss is less meaningful — widen it or flag
+        multiplier = 2.5
+        feat["stop_loss_context"] = "bearish_trend_caution"
+    elif bb_squeeze:
+        # During compression, tighten stop
+        multiplier = 1.5
+        feat["stop_loss_context"] = "bb_squeeze_tight"
+    else:
+        multiplier = 2.0
+        feat["stop_loss_context"] = "normal"
+
+    raw_stop = c_now - multiplier * atr_now
+    # If support is nearby and above raw stop, use support as floor
+    if support and support < c_now and support > raw_stop:
+        stop_loss = round(support, 2)
+        feat["stop_loss_context"] += "_support_anchored"
+    else:
+        stop_loss = round(raw_stop, 2)
+
     feat["atr_stop_loss"] = stop_loss
     feat["atr_stop_loss_pct"] = round((stop_loss - c_now) / c_now * 100, 2)
+    feat["atr_stop_multiplier"] = multiplier
 
     if resistance and resistance > c_now:
         feat["target_resistance"] = resistance
@@ -1675,7 +1835,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     if mode == "ai":
         df_weekly = _download_yf(yf_ticker, "2y", "1wk")
         df_weekly_upto = df_weekly.loc[:chosen_ts] if df_weekly is not None and not df_weekly.empty else None
-        bench_df = _download_yf("0050.TW", "3mo", "1d")
+        bench_df = _download_yf("0050.TW", "2y", "1d")
 
     # -- basic price --
     close = df["Close"]
@@ -1742,22 +1902,79 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     low_52 = float(df.tail(252)["Low"].min())
     feat["pos_52w_pct"] = round((c_now - low_52) / (high_52 - low_52) * 100, 2) if high_52 != low_52 else 50.0
 
-    # weekly vs 20w MA (AI only)
+    # weekly vs 20w MA + multi-timeframe analysis (AI only, Item #12)
     if mode == "ai" and df_weekly_upto is not None and not df_weekly_upto.empty and len(df_weekly_upto) >= 20:
-        wma20 = float(df_weekly_upto["Close"].rolling(20).mean().iloc[-1])
-        feat["weekly_above_ma20"] = bool(float(df_weekly_upto["Close"].iloc[-1]) > wma20)
+        w_close = df_weekly_upto["Close"]
+        wma20 = float(w_close.rolling(20).mean().iloc[-1])
+        feat["weekly_above_ma20"] = bool(float(w_close.iloc[-1]) > wma20)
+
+        # Weekly trend state
+        wma5 = w_close.rolling(5).mean()
+        wma60_s = w_close.rolling(60).mean()
+        wma5_now = float(wma5.iloc[-1]) if len(wma5.dropna()) >= 1 else None
+        wma60_now = float(wma60_s.iloc[-1]) if len(wma60_s.dropna()) >= 1 else None
+        wc_now = float(w_close.iloc[-1])
+
+        if wma5_now and wma60_now:
+            if wc_now > wma20 > wma60_now and wma5_now > wma20:
+                weekly_trend = "uptrend"
+            elif wc_now < wma20 < wma60_now and wma5_now < wma20:
+                weekly_trend = "downtrend"
+            else:
+                weekly_trend = "consolidation"
+        else:
+            weekly_trend = "insufficient_data"
+        feat["weekly_trend_state"] = weekly_trend
+
+        # Weekly RSI
+        if len(w_close.dropna()) >= 20:
+            w_rsi = calculate_rsi(w_close, 14)
+            feat["weekly_rsi14"] = round(float(w_rsi.iloc[-1]), 2)
+        else:
+            feat["weekly_rsi14"] = None
+
+        # Multi-timeframe alignment
+        daily_bull = trend_state in ("uptrend", "strong_uptrend", "weak_uptrend", "uptrend_pullback")
+        daily_bear = trend_state in ("downtrend", "strong_downtrend", "weak_downtrend")
+        weekly_bull = weekly_trend == "uptrend"
+        weekly_bear = weekly_trend == "downtrend"
+
+        if daily_bull and weekly_bull:
+            feat["mtf_alignment"] = "aligned_bull"
+        elif daily_bear and weekly_bear:
+            feat["mtf_alignment"] = "aligned_bear"
+        else:
+            feat["mtf_alignment"] = "conflicting"
+        feat["daily_weekly_trend_agree"] = bool(
+            (daily_bull and weekly_bull) or (daily_bear and weekly_bear)
+        )
     else:
         feat["weekly_above_ma20"] = None
+        feat["weekly_trend_state"] = None
+        feat["weekly_rsi14"] = None
+        feat["mtf_alignment"] = None
+        feat["daily_weekly_trend_agree"] = None
 
     # [OPT] relative strength using pre-fetched benchmark (no extra download)
+    # Multi-period RS (Item #18): 20d, 63d, 252d
     if mode == "ai":
-        rs_data = _calc_relative_strength_with_bench(df, bench_df, period=20)
-        if rs_data:
-            feat["rs_vs_bench_20d"] = rs_data["rs_20d"]
-            feat["stock_ret_20d"] = rs_data["stock_ret_20d"]
-            feat["bench_ret_20d"] = rs_data["bench_ret_20d"]
-        else:
-            feat["rs_vs_bench_20d"] = None
+        for rs_period in [20, 63, 252]:
+            rs_data = _calc_relative_strength_with_bench(df, bench_df, period=rs_period)
+            if rs_data:
+                feat[f"rs_vs_bench_{rs_period}d"] = rs_data.get(f"rs_{rs_period}d")
+                if rs_period == 20:
+                    feat["stock_ret_20d"] = rs_data.get("stock_ret_20d")
+                    feat["bench_ret_20d"] = rs_data.get("bench_ret_20d")
+            else:
+                feat[f"rs_vs_bench_{rs_period}d"] = None
+                if rs_period == 20:
+                    feat["stock_ret_20d"] = None
+                    feat["bench_ret_20d"] = None
+
+        # RS acceleration: is short-term RS improving vs medium-term?
+        rs_20 = feat.get("rs_vs_bench_20d")
+        rs_63 = feat.get("rs_vs_bench_63d")
+        feat["rs_improving"] = bool(rs_20 is not None and rs_63 is not None and rs_20 > rs_63)
     else:
         feat["rs_vs_bench_20d"] = None
 
@@ -1819,6 +2036,23 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["flag_strong_trend"] = bool(float(adx.iloc[-1]) > 25)
     feat["flag_di_bullish"] = bool(float(pdi.iloc[-1]) > float(mdi.iloc[-1]))
 
+    # Refine trend_state with ADX strength (Item #8)
+    adx_now_val = float(adx.iloc[-1])
+    if adx_now_val >= 25:
+        trend_strength = "strong"
+    elif adx_now_val >= 20:
+        trend_strength = "moderate"
+    else:
+        trend_strength = "weak"
+    feat["trend_strength"] = trend_strength
+
+    # Qualify trend_state with ADX
+    if trend_state == "uptrend":
+        trend_state = "strong_uptrend" if adx_now_val > 25 else "weak_uptrend"
+    elif trend_state == "downtrend":
+        trend_state = "strong_downtrend" if adx_now_val > 25 else "weak_downtrend"
+    feat["trend_state"] = trend_state
+
     # ATR
     atr_series = calculate_atr(df, 14)
     atr_now = float(atr_series.iloc[-1])
@@ -1827,8 +2061,13 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["atr14_percentile_252d"] = percentile_rank(atr_series, 252)
 
     # Volatility
+    # Volatility (annualized)
     returns_20d = close.pct_change().tail(20)
-    feat["volatility_20d"] = round(float(returns_20d.std()) * 100, 4) if len(returns_20d) >= 10 else None
+    if len(returns_20d) >= 10:
+        daily_std = float(returns_20d.std())
+        feat["volatility_20d_ann"] = round(daily_std * math.sqrt(252) * 100, 4)
+    else:
+        feat["volatility_20d_ann"] = None
     feat["max_drawdown_20d"] = max_drawdown(close, 20)
     feat["max_drawdown_60d"] = max_drawdown(close, 60)
 
@@ -1842,6 +2081,23 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["bb_width_percentile_252d"] = percentile_rank(bbw, 252)
     feat["flag_bb_squeeze"] = bool(feat["bb_width_percentile_252d"] is not None and feat["bb_width_percentile_252d"] < 0.15)
     feat["flag_above_bb_upper"] = bool(c_now > bb_upper_now)
+
+    # Volatility regime classifier (Item #13)
+    def _classify_vol_regime(bb_pctl, atr_pctl):
+        if bb_pctl is None or atr_pctl is None:
+            return "unknown"
+        if bb_pctl < 0.15 and atr_pctl < 0.25:
+            return "compression"
+        elif bb_pctl > 0.80 or atr_pctl > 0.80:
+            return "expansion"
+        elif atr_pctl > 0.60:
+            return "high_volatility"
+        return "normal"
+
+    feat["volatility_regime"] = _classify_vol_regime(
+        feat.get("bb_width_percentile_252d"),
+        feat.get("atr14_percentile_252d"),
+    )
 
     # SuperTrend
     st_direction = 0
@@ -1873,12 +2129,12 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     vp = calculate_volume_profile(df, lookback=60)
     feat.update(vp)
 
-    # short term S/R
-    sr = detect_short_term_sr(df, lookback=20)
+    # short term S/R (pivot-clustered)
+    sr = detect_short_term_sr(df, lookback=120)
     feat.update(sr)
 
-    # Fibonacci
-    fib = calculate_fibonacci_summary(df)
+    # Fibonacci (direction-aware)
+    fib = calculate_fibonacci_summary(df, trend_state=trend_state)
     feat.update(fib)
 
     # Gaps
@@ -1934,6 +2190,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     if mode == "ai":
         latest_overall_ts = df_daily.index[-1]
         price_20d_ago = float(df["Close"].iloc[-20]) if len(df) >= 20 else c_now
+        avg_daily_vol_20d = float(df["Volume"].tail(20).mean()) if len(df) >= 20 else 0
 
         # Define tasks for parallel execution
         ext_results = {}
@@ -1941,7 +2198,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         def _fetch_institutional():
             try:
                 chips_multi = get_institutional_multi_days(stock_id, trade_date, market_hint=yf_ticker, days=20)
-                return compute_institutional_features(chips_multi, c_now, price_20d_ago)
+                return compute_institutional_features(chips_multi, c_now, price_20d_ago, avg_daily_vol_20d)
             except Exception as e:
                 return {"inst_data_available": False, "inst_error": str(e)}
 
@@ -2008,8 +2265,21 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     # Decision fields
     resistance = feat.get("fib_nearest_resistance_1") or feat.get("st_resistance")
     support = feat.get("fib_nearest_support_1") or feat.get("st_support")
-    decision = compute_decision_fields(c_now, atr_now, resistance, support, st_direction)
+    decision = compute_decision_fields(
+        c_now, atr_now, resistance, support, st_direction,
+        bb_squeeze=bool(feat.get("flag_bb_squeeze")),
+        trend_state=trend_state,
+    )
     feat.update(decision)
+
+    # Data quality metadata (Item #19)
+    feat["data_quality"] = {
+        "price_data_days": len(df),
+        "volume_zero_pct": round(float((df["Volume"] == 0).sum()) / len(df) * 100, 1) if len(df) > 0 else None,
+        "stale_warning": bool((datetime.now().date() - trade_date).days > 3),
+    }
+    if mode == "ai":
+        feat["data_quality"]["inst_data_coverage"] = None  # Updated if inst data fetched
 
     # Final sanitize
     feat = _sanitize_numpy(feat)
