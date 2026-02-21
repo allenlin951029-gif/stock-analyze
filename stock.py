@@ -1,7 +1,8 @@
-# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON1.15
+# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON1.16
 # Supports two modes: human (fast, skip network) / ai (full data)
 # *** OPTIMIZED VERSION – key changes marked with # [OPT] ***
 # *** DATA CLEANED VERSION – Added auto_adjust=True and ffill() for dirty data ***
+# *** + ADDED ATR FLOOR & WHIPSAW RISK ALERT ***
 
 import io
 import json
@@ -352,9 +353,9 @@ def calculate_adx(df: pd.DataFrame, period: int = 14):
     df2["+DI"] = 100 * df2["+DM_s"] / df2["TR_s"].replace(0, np.nan)
     df2["-DI"] = 100 * df2["-DM_s"] / df2["TR_s"].replace(0, np.nan)
     df2["DX"] = (
-        100
-        * abs(df2["+DI"] - df2["-DI"])
-        / (df2["+DI"] + df2["-DI"]).replace(0, np.nan)
+            100
+            * abs(df2["+DI"] - df2["-DI"])
+            / (df2["+DI"] + df2["-DI"]).replace(0, np.nan)
     )
     df2["ADX"] = df2["DX"].ewm(alpha=alpha, adjust=False).mean()
     return df2["ADX"], df2["+DI"], df2["-DI"]
@@ -475,7 +476,7 @@ def calculate_avwap(df: pd.DataFrame, anchor_date) -> Optional[pd.Series]:
 
 
 def calculate_volume_profile(
-    df: pd.DataFrame, lookback: int = 60, n_bins: int = 50
+        df: pd.DataFrame, lookback: int = 60, n_bins: int = 50
 ) -> Dict[str, Any]:
     sub = df.tail(lookback)
     if sub.empty:
@@ -506,7 +507,7 @@ def calculate_volume_profile(
 
     # bins_lo[b], bins_hi[b] for each bin
     bins_lo = bins[:-1]  # (B,)
-    bins_hi = bins[1:]   # (B,)
+    bins_hi = bins[1:]  # (B,)
 
     # Broadcasting: overlap[row, bin] = max(0, min(row_hi, bin_hi) - max(row_lo, bin_lo))
     # Shapes: row arrays (R,1), bin arrays (1,B)
@@ -554,7 +555,8 @@ def calculate_volume_profile(
     }
 
 
-def detect_short_term_sr(df: pd.DataFrame, lookback: int = 120, pivot_lr: int = 3, cluster_pct: float = 0.015) -> Dict[str, Any]:
+def detect_short_term_sr(df: pd.DataFrame, lookback: int = 120, pivot_lr: int = 3, cluster_pct: float = 0.015) -> Dict[
+    str, Any]:
     """
     Detect support/resistance by clustering pivot highs and lows.
     Levels where 2+ pivots cluster within `cluster_pct` of each other are S/R.
@@ -604,8 +606,8 @@ def detect_short_term_sr(df: pd.DataFrame, lookback: int = 120, pivot_lr: int = 
 
 
 def detect_divergence(
-    price: pd.Series, indicator: pd.Series, lookback: int = 60,
-    pivot_left: int = 5, pivot_right: int = 3,
+        price: pd.Series, indicator: pd.Series, lookback: int = 60,
+        pivot_left: int = 5, pivot_right: int = 3,
 ) -> Dict[str, bool]:
     """
     Detect divergence by finding pivot highs/lows in price and comparing
@@ -626,8 +628,8 @@ def detect_divergence(
     pivot_highs = []  # (index_in_p, price_value)
     pivot_lows = []
     for i in range(pivot_left, n - pivot_right):
-        window_h = p_vals[i - pivot_left : i + pivot_right + 1]
-        window_l = p_vals[i - pivot_left : i + pivot_right + 1]
+        window_h = p_vals[i - pivot_left: i + pivot_right + 1]
+        window_l = p_vals[i - pivot_left: i + pivot_right + 1]
         if np.isfinite(p_vals[i]) and p_vals[i] == np.nanmax(window_h):
             if not pivot_highs or pivot_highs[-1][0] < i - pivot_right:
                 pivot_highs.append((i, p_vals[i]))
@@ -699,7 +701,8 @@ def calculate_volume_quality(df: pd.DataFrame, period: int = 20) -> Dict[str, An
 # ===================================================================
 
 
-def calculate_fibonacci_summary(df: pd.DataFrame, lookback: int = 120, trend_state: str = "consolidation") -> Dict[str, Any]:
+def calculate_fibonacci_summary(df: pd.DataFrame, lookback: int = 120, trend_state: str = "consolidation") -> Dict[
+    str, Any]:
     """
     Direction-aware Fibonacci retracement.
     - Uptrend: measure from swing low → swing high (retracement = pullback support)
@@ -820,8 +823,8 @@ def _find_pivots(df, left=3, right=3):
     idx = df.index
     hp, lp = [], []
     for i in range(left, len(df) - right):
-        hw = highs[i - left : i + right + 1]
-        lw = lows[i - left : i + right + 1]
+        hw = highs[i - left: i + right + 1]
+        lw = lows[i - left: i + right + 1]
         if np.isfinite(highs[i]) and highs[i] == np.nanmax(hw):
             if not hp or hp[-1][0] < i - right:
                 hp.append((i, idx[i], highs[i]))
@@ -838,7 +841,7 @@ def _pct_diff(a, b):
 
 
 def detect_double_top(
-    df, lookback=120, pivot_lr=3, peak_tol=0.018, min_gap=8, max_gap=60, confirm_margin=0.003
+        df, lookback=120, pivot_lr=3, peak_tol=0.018, min_gap=8, max_gap=60, confirm_margin=0.003
 ):
     if df is None or df.empty:
         return None
@@ -851,7 +854,7 @@ def detect_double_top(
     if p1 is None or _pct_diff(float(p1[2]), float(p2[2])) > peak_tol:
         return None
     lo, hi = min(p1[0], p2[0]), max(p1[0], p2[0])
-    neckline = float(sub.iloc[lo : hi + 1]["Low"].min())
+    neckline = float(sub.iloc[lo: hi + 1]["Low"].min())
     confirmed = bool(float(sub["Close"].iloc[-1]) < neckline * (1 - confirm_margin))
     height = max(float(p1[2]), float(p2[2])) - neckline
     return {
@@ -864,7 +867,7 @@ def detect_double_top(
 
 
 def detect_double_bottom(
-    df, lookback=160, pivot_lr=3, trough_tol=0.020, min_gap=8, max_gap=80, confirm_margin=0.003
+        df, lookback=160, pivot_lr=3, trough_tol=0.020, min_gap=8, max_gap=80, confirm_margin=0.003
 ):
     if df is None or df.empty:
         return None
@@ -877,7 +880,7 @@ def detect_double_bottom(
     if t1 is None or _pct_diff(float(t1[2]), float(t2[2])) > trough_tol:
         return None
     lo, hi = min(t1[0], t2[0]), max(t1[0], t2[0])
-    neckline = float(sub.iloc[lo : hi + 1]["High"].max())
+    neckline = float(sub.iloc[lo: hi + 1]["High"].max())
     confirmed = bool(float(sub["Close"].iloc[-1]) > neckline * (1 + confirm_margin))
     height = neckline - min(float(t1[2]), float(t2[2]))
     return {
@@ -917,7 +920,7 @@ def detect_head_and_shoulders(df, lookback=180, pivot_lr=3, shoulder_tol=0.025, 
 
 
 def detect_inverse_head_and_shoulders(
-    df, lookback=180, pivot_lr=3, shoulder_tol=0.025, confirm_margin=0.003
+        df, lookback=180, pivot_lr=3, shoulder_tol=0.025, confirm_margin=0.003
 ):
     if df is None or df.empty:
         return None
@@ -1151,17 +1154,17 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
             dealer_total = find_col(
                 colmap,
                 lambda nk: "自營商" in nk
-                and "買賣超" in nk
-                and "外資" not in nk
-                and "自營買賣" not in nk
-                and "避險" not in nk,
+                           and "買賣超" in nk
+                           and "外資" not in nk
+                           and "自營買賣" not in nk
+                           and "避險" not in nk,
             )
             dealer_self = find_col(
                 colmap,
                 lambda nk: "自營商" in nk
-                and "自營買賣" in nk
-                and "買賣超" in nk
-                and "外資" not in nk,
+                           and "自營買賣" in nk
+                           and "買賣超" in nk
+                           and "外資" not in nk,
             )
             dealer_hedge = find_col(
                 colmap,
@@ -1182,8 +1185,8 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
                 buy_c = find_col(
                     colmap,
                     lambda nk: is_foreign(nk)
-                    and ("買進" in nk or "買入" in nk)
-                    and "買賣超" not in nk,
+                               and ("買進" in nk or "買入" in nk)
+                               and "買賣超" not in nk,
                 )
                 sell_c = find_col(
                     colmap, lambda nk: is_foreign(nk) and "賣出" in nk and "買賣超" not in nk
@@ -1219,7 +1222,8 @@ def get_institutional_multi_days(stock_id: str, end_date, market_hint=None, days
     return results
 
 
-def compute_institutional_features(chips_multi: List[Dict], price_now: float, price_20d_ago: float, avg_daily_vol: float = 0) -> Dict[str, Any]:
+def compute_institutional_features(chips_multi: List[Dict], price_now: float, price_20d_ago: float,
+                                   avg_daily_vol: float = 0) -> Dict[str, Any]:
     feat: Dict[str, Any] = {}
     if not chips_multi:
         return {"inst_data_available": False}
@@ -1657,8 +1661,10 @@ def compute_tdcc_features(tdcc_data: Dict) -> Dict[str, Any]:
         prev = records[-2]
         feat["tdcc_holders_change"] = (latest.get("total_holders") or 0) - (prev.get("total_holders") or 0)
         feat["tdcc_retail_pct_change"] = round((latest.get("retail_pct") or 0) - (prev.get("retail_pct") or 0), 2)
-        feat["tdcc_whale_400_pct_change"] = round((latest.get("whale_400_pct") or 0) - (prev.get("whale_400_pct") or 0), 2)
-        feat["tdcc_whale_1000_pct_change"] = round((latest.get("whale_1000_pct") or 0) - (prev.get("whale_1000_pct") or 0), 2)
+        feat["tdcc_whale_400_pct_change"] = round((latest.get("whale_400_pct") or 0) - (prev.get("whale_400_pct") or 0),
+                                                  2)
+        feat["tdcc_whale_1000_pct_change"] = round(
+            (latest.get("whale_1000_pct") or 0) - (prev.get("whale_1000_pct") or 0), 2)
         feat["flag_whale_up_retail_down"] = bool(
             (feat.get("tdcc_whale_400_pct_change") or 0) > 0 and (feat.get("tdcc_retail_pct_change") or 0) < 0
         )
@@ -1687,7 +1693,7 @@ def calc_relative_strength(stock_df, benchmark_ticker="0050.TW", period=20):
             bench = clean_yf_columns(_ensure_naive_index(bench))
             if not bench.empty:
                 bench = bench.ffill().dropna(subset=["Close"])
-                
+
         if bench.empty or len(stock_df) < period:
             return None
         s_ret = (float(stock_df["Close"].iloc[-1]) / float(stock_df["Close"].iloc[-period]) - 1) * 100
@@ -1719,18 +1725,19 @@ def _calc_relative_strength_with_bench(stock_df, bench_df, period=20):
 
 
 # ===================================================================
-# 13. DECISION FIELDS
+# 13. DECISION FIELDS (MODIFIED: ATR FLOOR & WHIPSAW WARNING)
 # ===================================================================
 
 
 def compute_decision_fields(
-    c_now: float,
-    atr_now: float,
-    resistance: Optional[float],
-    support: Optional[float],
-    supertrend_dir: int,
-    bb_squeeze: bool = False,
-    trend_state: str = "consolidation",
+        c_now: float,
+        atr_now: float,
+        resistance: Optional[float],
+        support: Optional[float],
+        supertrend_dir: int,
+        bb_squeeze: bool = False,
+        trend_state: str = "consolidation",
+        volatility_regime: str = "normal",
 ) -> Dict[str, Any]:
     feat: Dict[str, Any] = {}
 
@@ -1739,27 +1746,39 @@ def compute_decision_fields(
 
     feat["decision_available"] = True
 
-    # Adaptive stop-loss multiplier based on context
     is_bullish = supertrend_dir == 1
     is_bearish_trend = trend_state in ("downtrend", "strong_downtrend", "weak_downtrend")
 
+    # Adaptive stop-loss multiplier based on context
     if is_bearish_trend:
-        # In a downtrend, long stop-loss is less meaningful — widen it or flag
         multiplier = 2.5
         feat["stop_loss_context"] = "bearish_trend_caution"
-    elif bb_squeeze:
-        # During compression, tighten stop
+    elif bb_squeeze and volatility_regime not in ("high_volatility", "expansion"):
         multiplier = 1.5
         feat["stop_loss_context"] = "bb_squeeze_tight"
+    elif volatility_regime in ("high_volatility", "expansion"):
+        multiplier = 2.5
+        feat["stop_loss_context"] = "high_volatility_wide"
     else:
         multiplier = 2.0
         feat["stop_loss_context"] = "normal"
 
     raw_stop = c_now - multiplier * atr_now
-    # If support is nearby and above raw stop, use support as floor
+
+    # --- ATR FLOOR MECHANISM ---
+    # Absolutely minimum stop distance is 1.5x ATR
+    min_stop_distance = 1.5 * atr_now
+    max_stop_price = c_now - min_stop_distance
+
+    # If support is nearby and above raw stop, consider using support
     if support and support < c_now and support > raw_stop:
-        stop_loss = round(support, 2)
-        feat["stop_loss_context"] += "_support_anchored"
+        if support <= max_stop_price:
+            stop_loss = round(support, 2)
+            feat["stop_loss_context"] += "_support_anchored"
+        else:
+            # Support is too close! Enforce ATR floor to prevent whipsaw
+            stop_loss = round(max_stop_price, 2)
+            feat["stop_loss_context"] += "_atr_floor_enforced"
     else:
         stop_loss = round(raw_stop, 2)
 
@@ -1772,11 +1791,20 @@ def compute_decision_fields(
         feat["target_distance_pct"] = round((resistance - c_now) / c_now * 100, 2)
         risk = c_now - stop_loss
         reward = resistance - c_now
-        feat["risk_reward_ratio"] = round(reward / risk, 2) if risk > 0 else None
+        rr = round(reward / risk, 2) if risk > 0 else None
+        feat["risk_reward_ratio"] = rr
+
+        # --- ANOMALY WARNING ---
+        if rr and rr > 10.0:
+            feat["flag_rr_anomaly"] = True
+            feat["stop_loss_context"] += "_[Whipsaw_Risk]"
+        else:
+            feat["flag_rr_anomaly"] = False
     else:
         feat["target_resistance"] = None
         feat["target_distance_pct"] = None
         feat["risk_reward_ratio"] = None
+        feat["flag_rr_anomaly"] = False
 
     if support and support < c_now:
         feat["nearest_support"] = support
@@ -2087,7 +2115,8 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["bb_width_pct"] = round(float(bbw.iloc[-1]), 4)
     feat["bb_position_pct"] = round((c_now - bb_lower_now) / bb_range * 100, 2) if bb_range > 0 else 50.0
     feat["bb_width_percentile_252d"] = percentile_rank(bbw, 252)
-    feat["flag_bb_squeeze"] = bool(feat["bb_width_percentile_252d"] is not None and feat["bb_width_percentile_252d"] < 0.15)
+    feat["flag_bb_squeeze"] = bool(
+        feat["bb_width_percentile_252d"] is not None and feat["bb_width_percentile_252d"] < 0.15)
     feat["flag_above_bb_upper"] = bool(c_now > bb_upper_now)
 
     # Volatility regime classifier (Item #13)
@@ -2270,7 +2299,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         feat["foreign_holding_pct"] = None
         feat["foreign_holding_available"] = False
 
-    # Decision fields
+    # Decision fields (WITH ATR FLOOR & WHIPSAW RISK ALERT)
     resistance = feat.get("fib_nearest_resistance_1") or feat.get("st_resistance")
     # For breakout stocks at highs with no retracement resistance, use extension levels
     if resistance and resistance <= c_now * 1.005:
@@ -2278,10 +2307,12 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         if ext_resistance and ext_resistance > c_now:
             resistance = ext_resistance
     support = feat.get("fib_nearest_support_1") or feat.get("st_support")
+    
     decision = compute_decision_fields(
         c_now, atr_now, resistance, support, st_direction,
         bb_squeeze=bool(feat.get("flag_bb_squeeze")),
         trend_state=trend_state,
+        volatility_regime=feat.get("volatility_regime", "normal")
     )
     feat.update(decision)
 
@@ -2424,7 +2455,9 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
     d_str = str(as_of_date) if as_of_date else "Today"
     lines.append(f"Date：{d_str}")
     lines.append("-" * 35)
-    lines.append("{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format("Symbol", "Price", "Trend", "MA20Dev", "VolR", "KD", "Score"))
+    lines.append(
+        "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format("Symbol", "Price", "Trend", "MA20Dev", "VolR", "KD",
+                                                              "Score"))
     lines.append("-" * 35)
 
     for r in results:
