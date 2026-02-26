@@ -1,4 +1,4 @@
-# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON1.15
+# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON1.17
 # Supports two modes: human (fast, skip network) / ai (full data)
 # *** OPTIMIZED VERSION – key changes marked with # [OPT] ***
 # *** DATA CLEANED VERSION – Added auto_adjust=True and ffill() for dirty data ***
@@ -1097,43 +1097,50 @@ def _parse_tpex_csv(text: str):
         return None
 
 
+# [OPT-v2] Module-level cached CSV downloads — persist across all ticker lookups
+@lru_cache(maxsize=64)
+def _cached_twse_t86(date_str: str):
+    """Download and parse T86 once per date. Cached at module level."""
+    sess = _get_session()
+    headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-TW,zh;q=0.9"}
+    url = f"https://www.twse.com.tw/fund/T86?response=csv&date={date_str}&selectType=ALLBUT0999"
+    r = sess.get(url, headers=headers, timeout=15)
+    if r.status_code != 200 or len(r.text) < 200:
+        return None, f"TWSE HTTP {r.status_code}"
+    if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
+        return None, "TWSE no data"
+    df = _parse_twse_t86_csv(r.text)
+    return (df, None) if df is not None else (None, "TWSE parse failed")
+
+
+@lru_cache(maxsize=64)
+def _cached_tpex_csv(date_str: str):
+    """Download and parse TPEx CSV once per date. Cached at module level."""
+    sess = _get_session()
+    headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-TW,zh;q=0.9"}
+    d_ = datetime.strptime(date_str, "%Y%m%d").date()
+    roc_year = d_.year - 1911
+    roc_date = f"{roc_year:03d}/{d_.month:02d}/{d_.day:02d}"
+    url = (
+        "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php"
+        f"?l=zh-tw&o=csv&se=EW&t=D&d={roc_date}&s=0,asc"
+    )
+    headers_ext = dict(headers)
+    headers_ext["Referer"] = "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge.php"
+    r = sess.get(url, headers=headers_ext, timeout=15)
+    if r.status_code != 200 or len(r.text) < 200:
+        return None, f"TPEx HTTP {r.status_code}"
+    if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
+        return None, "TPEx no data"
+    df = _parse_tpex_csv(r.text)
+    return (df, None) if df is not None else (None, "TPEx parse failed")
+
+
 def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back: int = 10):
     stock_no = _strip_suffix(stock_id)
-    sess = _get_session()  # [OPT] connection pooling
     headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-TW,zh;q=0.9"}
     prefer_twse = not (isinstance(market_hint, str) and market_hint.upper().endswith(".TWO"))
     last_error = None
-
-    # [OPT-v2] Cached T86/TPEx CSV parsers — download once per date, reuse across tickers
-    @lru_cache(maxsize=64)
-    def _cached_twse_t86(date_str):
-        url = f"https://www.twse.com.tw/fund/T86?response=csv&date={date_str}&selectType=ALLBUT0999"
-        r = sess.get(url, headers=headers, timeout=15)
-        if r.status_code != 200 or len(r.text) < 200:
-            return None, f"TWSE HTTP {r.status_code}"
-        if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
-            return None, "TWSE no data"
-        df = _parse_twse_t86_csv(r.text)
-        return (df, None) if df is not None else (None, "TWSE parse failed")
-
-    @lru_cache(maxsize=64)
-    def _cached_tpex_csv(date_str):
-        d_ = datetime.strptime(date_str, "%Y%m%d").date()
-        roc_year = d_.year - 1911
-        roc_date = f"{roc_year:03d}/{d_.month:02d}/{d_.day:02d}"
-        url = (
-            "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php"
-            f"?l=zh-tw&o=csv&se=EW&t=D&d={roc_date}&s=0,asc"
-        )
-        h2 = dict(headers)
-        h2["Referer"] = "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge.php"
-        r = sess.get(url, headers=h2, timeout=15)
-        if r.status_code != 200 or len(r.text) < 200:
-            return None, f"TPEx HTTP {r.status_code}"
-        if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
-            return None, "TPEx no data"
-        df = _parse_tpex_csv(r.text)
-        return (df, None) if df is not None else (None, "TPEx parse failed")
 
     def try_twse(d_):
         return _cached_twse_t86(d_.strftime('%Y%m%d'))
@@ -1409,32 +1416,34 @@ def _parse_twse_json_table(obj):
     return None
 
 
+@lru_cache(maxsize=32)
+def _cached_margin_download(date_str: str):
+    """Download margin trading JSON once per date. Cached at module level."""
+    sess = _get_session()
+    urls = [
+        f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_str}&selectType=ALL",
+        f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={date_str}&selectType=ALL",
+    ]
+    headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-TW,zh;q=0.9"}
+    headers["Referer"] = "https://www.twse.com.tw/zh/page/trading/exchange/MI_MARGN.html"
+    last_err = None
+    for url in urls:
+        try:
+            r = sess.get(url, headers=headers, timeout=15)
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}"
+                continue
+            j = r.json()
+            df = pd.DataFrame(j) if isinstance(j, list) else _parse_twse_json_table(j)
+            if df is not None and not df.empty:
+                return df, None
+            last_err = "empty"
+        except Exception as e:
+            last_err = str(e)
+    return None, last_err or "failed"
+
+
 def _twse_margin_json(date_yyyymmdd: str, headers: dict):
-    sess = _get_session()  # [OPT]
-    # [OPT-v2] Use lru_cache on the inner function to avoid re-downloading for same date
-    @lru_cache(maxsize=32)
-    def _cached_margin_download(date_str):
-        urls = [
-            f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_str}&selectType=ALL",
-            f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={date_str}&selectType=ALL",
-        ]
-        h2 = dict(headers)
-        h2["Referer"] = "https://www.twse.com.tw/zh/page/trading/exchange/MI_MARGN.html"
-        last_err = None
-        for url in urls:
-            try:
-                r = sess.get(url, headers=h2, timeout=15)
-                if r.status_code != 200:
-                    last_err = f"HTTP {r.status_code}"
-                    continue
-                j = r.json()
-                df = pd.DataFrame(j) if isinstance(j, list) else _parse_twse_json_table(j)
-                if df is not None and not df.empty:
-                    return df, None
-                last_err = "empty"
-            except Exception as e:
-                last_err = str(e)
-        return None, last_err or "failed"
     return _cached_margin_download(date_yyyymmdd)
 
 
@@ -1827,20 +1836,6 @@ def compute_decision_fields(
         feat["support_distance_pct"] = None
 
     feat["flag_entry_trigger"] = bool(supertrend_dir == 1)
-    # [NEW-v2] True trigger: SuperTrend flipped from bearish to bullish TODAY
-    try:
-        st_dir_prev = int(st_dir.iloc[-2]) if len(st_dir) >= 2 else supertrend_dir
-        feat["flag_supertrend_flip_bull"] = bool(st_dir_prev == -1 and supertrend_dir == 1)
-        feat["flag_supertrend_flip_bear"] = bool(st_dir_prev == 1 and supertrend_dir == -1)
-    except Exception:
-        feat["flag_supertrend_flip_bull"] = False
-        feat["flag_supertrend_flip_bear"] = False
-
-    # [NEW-v2] Liquidity gate — essential risk control
-    avg_vol_20 = float(df["Volume"].tail(20).mean()) if len(df) >= 20 else 0
-    feat["avg_daily_volume_20d"] = int(avg_vol_20)
-    feat["avg_daily_turnover_20d_m"] = round(avg_vol_20 * c_now / 1e6, 2) if avg_vol_20 > 0 else 0
-    feat["is_liquid"] = bool(avg_vol_20 > 500_000)  # > 500 lots/day threshold
 
     return feat
 
@@ -2265,6 +2260,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
 
     # SuperTrend
     st_direction = 0
+    st_dir = None
     try:
         st_line, st_dir = calculate_supertrend(df)
         st_val = float(st_line.iloc[-1])
@@ -2274,6 +2270,25 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     except Exception:
         feat["supertrend_bullish"] = None
         feat["supertrend_distance_pct"] = None
+
+    # [NEW-v2] True trigger: SuperTrend flipped from bearish to bullish TODAY
+    try:
+        if st_dir is not None and len(st_dir) >= 2:
+            st_dir_prev = int(st_dir.iloc[-2])
+            feat["flag_supertrend_flip_bull"] = bool(st_dir_prev == -1 and st_direction == 1)
+            feat["flag_supertrend_flip_bear"] = bool(st_dir_prev == 1 and st_direction == -1)
+        else:
+            feat["flag_supertrend_flip_bull"] = False
+            feat["flag_supertrend_flip_bear"] = False
+    except Exception:
+        feat["flag_supertrend_flip_bull"] = False
+        feat["flag_supertrend_flip_bear"] = False
+
+    # [NEW-v2] Liquidity gate — essential risk control
+    avg_vol_20 = float(df["Volume"].tail(20).mean()) if len(df) >= 20 else 0
+    feat["avg_daily_volume_20d"] = int(avg_vol_20)
+    feat["avg_daily_turnover_20d_m"] = round(avg_vol_20 * c_now / 1e6, 2) if avg_vol_20 > 0 else 0
+    feat["is_liquid"] = bool(avg_vol_20 > 500_000)  # > 500 lots/day threshold
 
     # MFI
     mfi_s = calculate_mfi(df)
