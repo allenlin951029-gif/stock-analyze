@@ -1,4 +1,4 @@
-# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON1.17
+# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON1.15
 # Supports two modes: human (fast, skip network) / ai (full data)
 # *** OPTIMIZED VERSION – key changes marked with # [OPT] ***
 # *** DATA CLEANED VERSION – Added auto_adjust=True and ffill() for dirty data ***
