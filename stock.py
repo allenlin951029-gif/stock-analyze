@@ -1,4 +1,4 @@
-# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON1.17
+# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON1.15
 # Supports two modes: human (fast, skip network) / ai (full data)
 # *** OPTIMIZED VERSION – key changes marked with # [OPT] ***
 # *** DATA CLEANED VERSION – Added auto_adjust=True and ffill() for dirty data ***
@@ -1823,10 +1823,14 @@ def compute_decision_fields(
         risk = c_now - stop_loss
         reward = resistance - c_now
         feat["risk_reward_ratio"] = round(reward / risk, 2) if risk > 0 else None
+        # [NEW-v2] Flag poor risk-reward setups
+        rr = feat["risk_reward_ratio"]
+        feat["flag_poor_risk_reward"] = bool(rr is not None and rr < 1.0)
     else:
         feat["target_resistance"] = None
         feat["target_distance_pct"] = None
         feat["risk_reward_ratio"] = None
+        feat["flag_poor_risk_reward"] = False
 
     if support and support < c_now:
         feat["nearest_support"] = support
@@ -2443,8 +2447,9 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
 
     # Decision fields
     resistance = feat.get("fib_nearest_resistance_1") or feat.get("st_resistance")
-    # For breakout stocks at highs with no retracement resistance, use extension levels
-    if resistance and resistance <= c_now * 1.005:
+    # [FIX-v2] For breakout stocks near highs, 0.5% threshold was too tight.
+    # Use 2% — if resistance is within 2% of current price, switch to extension target.
+    if resistance and resistance <= c_now * 1.02:
         ext_resistance = feat.get("fib_ext_1272")
         if ext_resistance and ext_resistance > c_now:
             resistance = ext_resistance
@@ -2516,7 +2521,9 @@ def format_text_report(feat: Dict[str, Any]) -> str:
 
     if feat.get("decision_available"):
         lines.append("  Stop：{} ({}%)".format(feat.get("atr_stop_loss"), feat.get("atr_stop_loss_pct")))
-        lines.append("  Target：{}  R:R={}".format(feat.get("target_resistance"), feat.get("risk_reward_ratio")))
+        rr = feat.get("risk_reward_ratio")
+        rr_warn = "  ⚠ R:R < 1" if feat.get("flag_poor_risk_reward") else ""
+        lines.append("  Target：{}  R:R={}{}".format(feat.get("target_resistance"), rr, rr_warn))
 
     lines.append(SEP)
     return "\n".join(lines)
