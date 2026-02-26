@@ -1,8 +1,7 @@
-# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON1.16
+# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON1.17
 # Supports two modes: human (fast, skip network) / ai (full data)
 # *** OPTIMIZED VERSION – key changes marked with # [OPT] ***
 # *** DATA CLEANED VERSION – Added auto_adjust=True and ffill() for dirty data ***
-# *** + ADDED ATR FLOOR & WHIPSAW RISK ALERT ***
 
 import io
 import json
@@ -34,27 +33,34 @@ except Exception:
 
 # [OPT] Reusable HTTP session for connection pooling across all requests
 _http_session: Optional[requests.Session] = None
+_session_lock = threading.Lock()
 
 # [FIX] yf.download() is NOT thread-safe — concurrent calls cause data
 # cross-contamination between tickers. This lock serializes all yfinance
 # calls while allowing external data fetches to remain fully parallel.
 _yf_lock = threading.Lock()
 
+# [OPT-v2] LRU cache for institutional/margin CSVs (keyed by date)
+from functools import lru_cache
+
 
 def _get_session() -> requests.Session:
-    """Return a module-level requests.Session with connection pooling."""
+    """Return a module-level requests.Session with connection pooling.
+    Thread-safe via double-checked locking."""
     global _http_session
     if _http_session is None:
-        _http_session = requests.Session()
-        _http_session.headers.update(
-            {"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-TW,zh;q=0.9"}
-        )
-        # Increase pool size for concurrent requests
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=10, pool_maxsize=20, max_retries=1
-        )
-        _http_session.mount("https://", adapter)
-        _http_session.mount("http://", adapter)
+        with _session_lock:
+            if _http_session is None:
+                s = requests.Session()
+                s.headers.update(
+                    {"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-TW,zh;q=0.9"}
+                )
+                adapter = requests.adapters.HTTPAdapter(
+                    pool_connections=10, pool_maxsize=20, max_retries=1
+                )
+                s.mount("https://", adapter)
+                s.mount("http://", adapter)
+                _http_session = s
     return _http_session
 
 
@@ -206,7 +212,8 @@ def zscore_last(series: pd.Series, window: int = 252) -> Optional[float]:
 
 
 def slope_n(series: pd.Series, n: int = 5) -> Optional[float]:
-    """Normalized slope: percent change per day relative to the series mean."""
+    """Normalized slope: percent change per day relative to the series mean.
+    [FIX-v2] Clamp output to ±100 to prevent extreme values when mean ≈ 0 (e.g. MACD osc)."""
     s = series.dropna().iloc[-n:]
     if len(s) < n:
         return None
@@ -217,9 +224,14 @@ def slope_n(series: pd.Series, n: int = 5) -> Optional[float]:
     m, _ = np.polyfit(x, y, 1)
     # Normalize: slope per day as % of series mean
     mean_val = np.mean(y)
-    if mean_val == 0:
-        return 0.0
-    return round(float(m / abs(mean_val) * 100), 4)
+    if abs(mean_val) < 1e-8:
+        # Near-zero mean — use absolute slope scaled by series std instead
+        std_val = np.std(y)
+        if std_val < 1e-8:
+            return 0.0
+        return round(float(np.clip(m / std_val * 100, -100, 100)), 4)
+    raw = m / abs(mean_val) * 100
+    return round(float(np.clip(raw, -100, 100)), 4)
 
 
 def max_drawdown(series: pd.Series, window: int = 20) -> Optional[float]:
@@ -411,10 +423,10 @@ def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float =
     )
     tr[0] = high[0] - low[0]
 
-    # EWM ATR
+    # EWM ATR — [FIX-v2] use Wilder's alpha=1/period for consistency with calculate_atr()
     atr = np.empty(n, dtype=float)
     atr[0] = tr[0]
-    alpha = 2.0 / (period + 1)
+    alpha = 1.0 / period  # Wilder's smoothing (was 2/(period+1))
     for i in range(1, n):
         atr[i] = alpha * tr[i] + (1 - alpha) * atr[i - 1]
 
@@ -1092,8 +1104,10 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
     prefer_twse = not (isinstance(market_hint, str) and market_hint.upper().endswith(".TWO"))
     last_error = None
 
-    def try_twse(d_):
-        url = f"https://www.twse.com.tw/fund/T86?response=csv&date={d_.strftime('%Y%m%d')}&selectType=ALLBUT0999"
+    # [OPT-v2] Cached T86/TPEx CSV parsers — download once per date, reuse across tickers
+    @lru_cache(maxsize=64)
+    def _cached_twse_t86(date_str):
+        url = f"https://www.twse.com.tw/fund/T86?response=csv&date={date_str}&selectType=ALLBUT0999"
         r = sess.get(url, headers=headers, timeout=15)
         if r.status_code != 200 or len(r.text) < 200:
             return None, f"TWSE HTTP {r.status_code}"
@@ -1102,7 +1116,9 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
         df = _parse_twse_t86_csv(r.text)
         return (df, None) if df is not None else (None, "TWSE parse failed")
 
-    def try_tpex(d_):
+    @lru_cache(maxsize=64)
+    def _cached_tpex_csv(date_str):
+        d_ = datetime.strptime(date_str, "%Y%m%d").date()
         roc_year = d_.year - 1911
         roc_date = f"{roc_year:03d}/{d_.month:02d}/{d_.day:02d}"
         url = (
@@ -1118,6 +1134,12 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
             return None, "TPEx no data"
         df = _parse_tpex_csv(r.text)
         return (df, None) if df is not None else (None, "TPEx parse failed")
+
+    def try_twse(d_):
+        return _cached_twse_t86(d_.strftime('%Y%m%d'))
+
+    def try_tpex(d_):
+        return _cached_tpex_csv(d_.strftime('%Y%m%d'))
 
     markets = [("TWSE", try_twse), ("TPEx", try_tpex)]
     if not prefer_twse:
@@ -1277,8 +1299,17 @@ def compute_institutional_features(chips_multi: List[Dict], price_now: float, pr
 
     price_up_20d = price_now > price_20d_ago
     feat["flag_foreign_divergence"] = bool(price_up_20d and feat["foreign_20d_net"] < 0)
-    feat["flag_inst_consensus_buy"] = bool(feat["foreign_20d_net"] > 0 and feat["trust_20d_net"] > 0)
-    feat["flag_inst_consensus_sell"] = bool(feat["foreign_20d_net"] < 0 and feat["trust_20d_net"] < 0)
+    # [FIX-v2] Require meaningful flow (>5% of ADV) not just net > 0
+    _f_pct = abs(feat.get("foreign_20d_net_pct_adv") or 0)
+    _t_pct = abs(feat.get("trust_20d_net_pct_adv") or 0)
+    feat["flag_inst_consensus_buy"] = bool(
+        feat["foreign_20d_net"] > 0 and feat["trust_20d_net"] > 0
+        and (_f_pct > 5 or _t_pct > 5)
+    )
+    feat["flag_inst_consensus_sell"] = bool(
+        feat["foreign_20d_net"] < 0 and feat["trust_20d_net"] < 0
+        and (_f_pct > 5 or _t_pct > 5)
+    )
 
     return feat
 
@@ -1380,27 +1411,31 @@ def _parse_twse_json_table(obj):
 
 def _twse_margin_json(date_yyyymmdd: str, headers: dict):
     sess = _get_session()  # [OPT]
-    urls = [
-        f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
-        f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
-    ]
-    h2 = dict(headers)
-    h2["Referer"] = "https://www.twse.com.tw/zh/page/trading/exchange/MI_MARGN.html"
-    last_err = None
-    for url in urls:
-        try:
-            r = sess.get(url, headers=h2, timeout=15)
-            if r.status_code != 200:
-                last_err = f"HTTP {r.status_code}"
-                continue
-            j = r.json()
-            df = pd.DataFrame(j) if isinstance(j, list) else _parse_twse_json_table(j)
-            if df is not None and not df.empty:
-                return df, None
-            last_err = "empty"
-        except Exception as e:
-            last_err = str(e)
-    return None, last_err or "failed"
+    # [OPT-v2] Use lru_cache on the inner function to avoid re-downloading for same date
+    @lru_cache(maxsize=32)
+    def _cached_margin_download(date_str):
+        urls = [
+            f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_str}&selectType=ALL",
+            f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={date_str}&selectType=ALL",
+        ]
+        h2 = dict(headers)
+        h2["Referer"] = "https://www.twse.com.tw/zh/page/trading/exchange/MI_MARGN.html"
+        last_err = None
+        for url in urls:
+            try:
+                r = sess.get(url, headers=h2, timeout=15)
+                if r.status_code != 200:
+                    last_err = f"HTTP {r.status_code}"
+                    continue
+                j = r.json()
+                df = pd.DataFrame(j) if isinstance(j, list) else _parse_twse_json_table(j)
+                if df is not None and not df.empty:
+                    return df, None
+                last_err = "empty"
+            except Exception as e:
+                last_err = str(e)
+        return None, last_err or "failed"
+    return _cached_margin_download(date_yyyymmdd)
 
 
 def _parse_tpex_margin_csv(text: str):
@@ -1725,7 +1760,7 @@ def _calc_relative_strength_with_bench(stock_df, bench_df, period=20):
 
 
 # ===================================================================
-# 13. DECISION FIELDS (MODIFIED: ATR FLOOR & WHIPSAW WARNING)
+# 13. DECISION FIELDS
 # ===================================================================
 
 
@@ -1737,7 +1772,6 @@ def compute_decision_fields(
         supertrend_dir: int,
         bb_squeeze: bool = False,
         trend_state: str = "consolidation",
-        volatility_regime: str = "normal",
 ) -> Dict[str, Any]:
     feat: Dict[str, Any] = {}
 
@@ -1746,39 +1780,27 @@ def compute_decision_fields(
 
     feat["decision_available"] = True
 
+    # Adaptive stop-loss multiplier based on context
     is_bullish = supertrend_dir == 1
     is_bearish_trend = trend_state in ("downtrend", "strong_downtrend", "weak_downtrend")
 
-    # Adaptive stop-loss multiplier based on context
     if is_bearish_trend:
+        # In a downtrend, long stop-loss is less meaningful — widen it or flag
         multiplier = 2.5
         feat["stop_loss_context"] = "bearish_trend_caution"
-    elif bb_squeeze and volatility_regime not in ("high_volatility", "expansion"):
+    elif bb_squeeze:
+        # During compression, tighten stop
         multiplier = 1.5
         feat["stop_loss_context"] = "bb_squeeze_tight"
-    elif volatility_regime in ("high_volatility", "expansion"):
-        multiplier = 2.5
-        feat["stop_loss_context"] = "high_volatility_wide"
     else:
         multiplier = 2.0
         feat["stop_loss_context"] = "normal"
 
     raw_stop = c_now - multiplier * atr_now
-
-    # --- ATR FLOOR MECHANISM ---
-    # Absolutely minimum stop distance is 1.5x ATR
-    min_stop_distance = 1.5 * atr_now
-    max_stop_price = c_now - min_stop_distance
-
-    # If support is nearby and above raw stop, consider using support
+    # If support is nearby and above raw stop, use support as floor
     if support and support < c_now and support > raw_stop:
-        if support <= max_stop_price:
-            stop_loss = round(support, 2)
-            feat["stop_loss_context"] += "_support_anchored"
-        else:
-            # Support is too close! Enforce ATR floor to prevent whipsaw
-            stop_loss = round(max_stop_price, 2)
-            feat["stop_loss_context"] += "_atr_floor_enforced"
+        stop_loss = round(support, 2)
+        feat["stop_loss_context"] += "_support_anchored"
     else:
         stop_loss = round(raw_stop, 2)
 
@@ -1791,20 +1813,11 @@ def compute_decision_fields(
         feat["target_distance_pct"] = round((resistance - c_now) / c_now * 100, 2)
         risk = c_now - stop_loss
         reward = resistance - c_now
-        rr = round(reward / risk, 2) if risk > 0 else None
-        feat["risk_reward_ratio"] = rr
-
-        # --- ANOMALY WARNING ---
-        if rr and rr > 10.0:
-            feat["flag_rr_anomaly"] = True
-            feat["stop_loss_context"] += "_[Whipsaw_Risk]"
-        else:
-            feat["flag_rr_anomaly"] = False
+        feat["risk_reward_ratio"] = round(reward / risk, 2) if risk > 0 else None
     else:
         feat["target_resistance"] = None
         feat["target_distance_pct"] = None
         feat["risk_reward_ratio"] = None
-        feat["flag_rr_anomaly"] = False
 
     if support and support < c_now:
         feat["nearest_support"] = support
@@ -1814,6 +1827,20 @@ def compute_decision_fields(
         feat["support_distance_pct"] = None
 
     feat["flag_entry_trigger"] = bool(supertrend_dir == 1)
+    # [NEW-v2] True trigger: SuperTrend flipped from bearish to bullish TODAY
+    try:
+        st_dir_prev = int(st_dir.iloc[-2]) if len(st_dir) >= 2 else supertrend_dir
+        feat["flag_supertrend_flip_bull"] = bool(st_dir_prev == -1 and supertrend_dir == 1)
+        feat["flag_supertrend_flip_bear"] = bool(st_dir_prev == 1 and supertrend_dir == -1)
+    except Exception:
+        feat["flag_supertrend_flip_bull"] = False
+        feat["flag_supertrend_flip_bear"] = False
+
+    # [NEW-v2] Liquidity gate — essential risk control
+    avg_vol_20 = float(df["Volume"].tail(20).mean()) if len(df) >= 20 else 0
+    feat["avg_daily_volume_20d"] = int(avg_vol_20)
+    feat["avg_daily_turnover_20d_m"] = round(avg_vol_20 * c_now / 1e6, 2) if avg_vol_20 > 0 else 0
+    feat["is_liquid"] = bool(avg_vol_20 > 500_000)  # > 500 lots/day threshold
 
     return feat
 
@@ -1838,17 +1865,78 @@ def _download_yf(ticker: str, period: str, interval: str):
             return pd.DataFrame()
 
 
+# [OPT-v2] Batch download stock + benchmark in one call, resample weekly from daily
+def _download_batch(ticker: str, period: str = "2y", include_bench: bool = False):
+    """Download stock (and optionally benchmark) in a single yf.download call.
+    Returns (stock_daily, stock_weekly, bench_daily_or_None)."""
+    tickers = [ticker]
+    if include_bench and ticker != "0050.TW":
+        tickers.append("0050.TW")
+
+    with _yf_lock:
+        try:
+            raw = yf.download(tickers, period=period, interval="1d",
+                              progress=False, auto_adjust=True, threads=False)
+        except Exception:
+            return pd.DataFrame(), None, None
+
+    stock_df = pd.DataFrame()
+    bench_df = None
+
+    if len(tickers) == 1:
+        stock_df = clean_yf_columns(_ensure_naive_index(raw))
+    elif isinstance(raw.columns, pd.MultiIndex):
+        try:
+            # Multi-ticker result: columns are (Price, Ticker)
+            lv0 = raw.columns.get_level_values(0)
+            lv1 = raw.columns.get_level_values(1)
+            # Determine which level has tickers
+            if ticker in set(lv1):
+                stock_df = _ensure_naive_index(raw.xs(ticker, level=1, axis=1))
+                if "0050.TW" in set(lv1):
+                    bench_df = _ensure_naive_index(raw.xs("0050.TW", level=1, axis=1))
+            elif ticker in set(lv0):
+                stock_df = _ensure_naive_index(raw.xs(ticker, level=0, axis=1))
+                if "0050.TW" in set(lv0):
+                    bench_df = _ensure_naive_index(raw.xs("0050.TW", level=0, axis=1))
+            else:
+                stock_df = clean_yf_columns(_ensure_naive_index(raw))
+        except Exception:
+            stock_df = clean_yf_columns(_ensure_naive_index(raw))
+    else:
+        stock_df = clean_yf_columns(_ensure_naive_index(raw))
+
+    if not stock_df.empty:
+        stock_df = stock_df.ffill().dropna(subset=["Close"])
+    if bench_df is not None and not bench_df.empty:
+        bench_df = bench_df.ffill().dropna(subset=["Close"])
+
+    # [OPT-v2] Resample daily → weekly (avoids separate yf.download for weekly)
+    weekly_df = None
+    if not stock_df.empty and len(stock_df) > 20:
+        try:
+            weekly_df = stock_df.resample("W-FRI").agg({
+                "Open": "first", "High": "max", "Low": "min",
+                "Close": "last", "Volume": "sum"
+            }).dropna()
+        except Exception:
+            weekly_df = None
+
+    return stock_df, weekly_df, bench_df
+
+
 def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[str, Any]:
     stock_id = stock_id.strip().upper()
     yf_ticker = _resolve_yf_ticker(stock_id)
     stock_no = _strip_suffix(stock_id)
 
-    # -- download daily (sequential — yf.download is NOT thread-safe) --
-    df_daily = _download_yf(yf_ticker, "2y", "1d")
+    # -- [OPT-v2] Batch download: stock + benchmark in one call, resample weekly --
+    include_bench = (mode == "ai")
+    df_daily, df_weekly_raw, bench_df = _download_batch(yf_ticker, "2y", include_bench=include_bench)
 
     if df_daily.empty and yf_ticker.endswith(".TW"):
         yf_ticker = yf_ticker.replace(".TW", ".TWO")
-        df_daily = _download_yf(yf_ticker, "2y", "1d")
+        df_daily, df_weekly_raw, bench_df = _download_batch(yf_ticker, "2y", include_bench=include_bench)
 
     if df_daily.empty:
         return {"error": f"not found: {stock_id}", "symbol": stock_id}
@@ -1865,13 +1953,10 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     trade_date = chosen_ts.date()
     query_date = as_of_date if as_of_date else datetime.now().date()
 
-    # -- download weekly + benchmark sequentially (AI only) --
+    # -- [OPT-v2] Weekly + benchmark already downloaded via _download_batch --
     df_weekly_upto = None
-    bench_df = None
-    if mode == "ai":
-        df_weekly = _download_yf(yf_ticker, "2y", "1wk")
-        df_weekly_upto = df_weekly.loc[:chosen_ts] if df_weekly is not None and not df_weekly.empty else None
-        bench_df = _download_yf("0050.TW", "2y", "1d")
+    if mode == "ai" and df_weekly_raw is not None and not df_weekly_raw.empty:
+        df_weekly_upto = df_weekly_raw.loc[:chosen_ts]
 
     # -- basic price --
     close = df["Close"]
@@ -1916,20 +2001,45 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["ma5_slope_5d"] = slope_n(ma5, 5)
     feat["ma20_slope_5d"] = slope_n(ma20, 5)
 
-    # trend_state
-    if c_now > ma20_now > ma60_now and ma5_now > ma20_now:
-        trend_state = "uptrend"
-    elif c_now > ma20_now > ma60_now and ma5_now <= ma20_now:
+    # -- [FIX-v2] Compute ADX FIRST so trend_state incorporates strength from the start --
+    adx, pdi, mdi = calculate_adx(df)
+    adx_now_val = float(adx.iloc[-1])
+    feat["adx"] = round(adx_now_val, 2)
+    feat["plus_di"] = round(float(pdi.iloc[-1]), 2)
+    feat["minus_di"] = round(float(mdi.iloc[-1]), 2)
+    feat["flag_strong_trend"] = bool(adx_now_val > 25)
+    feat["flag_di_bullish"] = bool(float(pdi.iloc[-1]) > float(mdi.iloc[-1]))
+
+    if adx_now_val >= 25:
+        trend_strength = "strong"
+    elif adx_now_val >= 20:
+        trend_strength = "moderate"
+    else:
+        trend_strength = "weak"
+    feat["trend_strength"] = trend_strength
+
+    # -- [FIX-v2] trend_state with ADX qualification built-in + hysteresis band --
+    # Hysteresis: require ±0.3% deviation from MA to switch sides (prevents whipsaw)
+    _HYSTERESIS = 0.003
+    above_ma20 = c_now > ma20_now * (1 + _HYSTERESIS)
+    below_ma20 = c_now < ma20_now * (1 - _HYSTERESIS)
+    above_ma60 = ma20_now > ma60_now * (1 + _HYSTERESIS)
+    below_ma60 = ma20_now < ma60_now * (1 - _HYSTERESIS)
+
+    if above_ma20 and above_ma60 and ma5_now > ma20_now:
+        trend_state = "strong_uptrend" if adx_now_val > 25 else "weak_uptrend"
+    elif above_ma20 and above_ma60 and ma5_now <= ma20_now:
         trend_state = "uptrend_pullback"
-    elif c_now < ma20_now < ma60_now and ma5_now < ma20_now:
-        trend_state = "downtrend"
-    elif c_now < ma20_now < ma60_now and ma5_now >= ma20_now:
+    elif below_ma20 and below_ma60 and ma5_now < ma20_now:
+        trend_state = "strong_downtrend" if adx_now_val > 25 else "weak_downtrend"
+    elif below_ma20 and below_ma60 and ma5_now >= ma20_now:
         trend_state = "downtrend_bounce"
     elif c_now > ma20_now and ma20_now < ma60_now:
         trend_state = "bottom_bounce"
     elif c_now < ma20_now and ma20_now > ma60_now:
         trend_state = "top_pullback"
     else:
+        # [NEW-v2] Distinguish tight consolidation from choppy range
         trend_state = "consolidation"
     feat["trend_state"] = trend_state
 
@@ -2011,6 +2121,25 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         rs_20 = feat.get("rs_vs_bench_20d")
         rs_63 = feat.get("rs_vs_bench_63d")
         feat["rs_improving"] = bool(rs_20 is not None and rs_63 is not None and rs_20 > rs_63)
+
+        # [NEW-v2] Rolling beta to benchmark (60d)
+        try:
+            if bench_df is not None and not bench_df.empty and len(df) >= 63:
+                stock_rets = df["Close"].pct_change().dropna().tail(60)
+                bench_rets_aligned = bench_df["Close"].pct_change().reindex(stock_rets.index).dropna()
+                common = stock_rets.index.intersection(bench_rets_aligned.index)
+                if len(common) >= 30:
+                    sr = stock_rets.loc[common].values
+                    br = bench_rets_aligned.loc[common].values
+                    cov = np.cov(sr, br)
+                    beta = cov[0, 1] / cov[1, 1] if cov[1, 1] != 0 else None
+                    feat["beta_60d"] = round(float(beta), 3) if beta is not None else None
+                else:
+                    feat["beta_60d"] = None
+            else:
+                feat["beta_60d"] = None
+        except Exception:
+            feat["beta_60d"] = None
     else:
         feat["rs_vs_bench_20d"] = None
 
@@ -2039,12 +2168,18 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     d_val = k_val.ewm(com=2).mean()
     feat["kd_k"] = round(float(k_val.iloc[-1]), 2)
     feat["kd_d"] = round(float(d_val.iloc[-1]), 2)
-    feat["flag_kd_golden_cross"] = bool(
+    # [FIX-v2] Zone-filtered KD crosses: golden cross only meaningful below 30, death cross above 70
+    _kd_crossed_up = bool(
         len(k_val) >= 2 and len(d_val) >= 2 and k_val.iloc[-2] < d_val.iloc[-2] and k_val.iloc[-1] > d_val.iloc[-1]
     )
-    feat["flag_kd_death_cross"] = bool(
+    _kd_crossed_down = bool(
         len(k_val) >= 2 and len(d_val) >= 2 and k_val.iloc[-2] > d_val.iloc[-2] and k_val.iloc[-1] < d_val.iloc[-1]
     )
+    feat["flag_kd_golden_cross"] = bool(_kd_crossed_up and float(k_val.iloc[-2]) < 30)
+    feat["flag_kd_death_cross"] = bool(_kd_crossed_down and float(k_val.iloc[-2]) > 70)
+    # Also expose the raw cross (without zone filter) for consumers who want it
+    feat["flag_kd_cross_up_raw"] = _kd_crossed_up
+    feat["flag_kd_cross_down_raw"] = _kd_crossed_down
 
     # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
@@ -2057,37 +2192,19 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["macd_osc"] = round(float(osc.iloc[-1]), 4)
     feat["macd_osc_slope_5d"] = slope_n(osc, 5)
     feat["macd_osc_percentile_252d"] = percentile_rank(osc, 252)
-    feat["flag_macd_golden_cross"] = bool(
+    # [FIX-v2] MACD cross with histogram confirmation: golden cross requires OSC going negative→positive
+    _macd_crossed_up = bool(
         len(dif) >= 2 and len(dea) >= 2 and dif.iloc[-2] < dea.iloc[-2] and dif.iloc[-1] > dea.iloc[-1]
     )
-    feat["flag_macd_death_cross"] = bool(
+    _macd_crossed_down = bool(
         len(dif) >= 2 and len(dea) >= 2 and dif.iloc[-2] > dea.iloc[-2] and dif.iloc[-1] < dea.iloc[-1]
     )
+    feat["flag_macd_golden_cross"] = bool(_macd_crossed_up and float(osc.iloc[-2]) < 0 and float(osc.iloc[-1]) > 0)
+    feat["flag_macd_death_cross"] = bool(_macd_crossed_down and float(osc.iloc[-2]) > 0 and float(osc.iloc[-1]) < 0)
+    feat["flag_macd_cross_up_raw"] = _macd_crossed_up
+    feat["flag_macd_cross_down_raw"] = _macd_crossed_down
 
-    # ADX
-    adx, pdi, mdi = calculate_adx(df)
-    feat["adx"] = round(float(adx.iloc[-1]), 2)
-    feat["plus_di"] = round(float(pdi.iloc[-1]), 2)
-    feat["minus_di"] = round(float(mdi.iloc[-1]), 2)
-    feat["flag_strong_trend"] = bool(float(adx.iloc[-1]) > 25)
-    feat["flag_di_bullish"] = bool(float(pdi.iloc[-1]) > float(mdi.iloc[-1]))
-
-    # Refine trend_state with ADX strength (Item #8)
-    adx_now_val = float(adx.iloc[-1])
-    if adx_now_val >= 25:
-        trend_strength = "strong"
-    elif adx_now_val >= 20:
-        trend_strength = "moderate"
-    else:
-        trend_strength = "weak"
-    feat["trend_strength"] = trend_strength
-
-    # Qualify trend_state with ADX
-    if trend_state == "uptrend":
-        trend_state = "strong_uptrend" if adx_now_val > 25 else "weak_uptrend"
-    elif trend_state == "downtrend":
-        trend_state = "strong_downtrend" if adx_now_val > 25 else "weak_downtrend"
-    feat["trend_state"] = trend_state
+    # ADX — [FIX-v2] Already computed above (before trend classification). Skipping duplicate.
 
     # ATR
     atr_series = calculate_atr(df, 14)
@@ -2118,6 +2235,16 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["flag_bb_squeeze"] = bool(
         feat["bb_width_percentile_252d"] is not None and feat["bb_width_percentile_252d"] < 0.15)
     feat["flag_above_bb_upper"] = bool(c_now > bb_upper_now)
+
+    # [NEW-v2] Squeeze fire: BBW was in squeeze zone 3 bars ago but has expanded past 0.25
+    _bbw_3_ago = float(bbw.iloc[-4]) if len(bbw) >= 4 else None
+    _bbw_now_pctl = feat["bb_width_percentile_252d"]
+    feat["flag_bb_squeeze_fire"] = bool(
+        _bbw_3_ago is not None and _bbw_now_pctl is not None
+        and percentile_rank(bbw.iloc[:-3], 252) is not None
+        and (percentile_rank(bbw.iloc[:-3], 252) or 1.0) < 0.15
+        and _bbw_now_pctl > 0.25
+    )
 
     # Volatility regime classifier (Item #13)
     def _classify_vol_regime(bb_pctl, atr_pctl):
@@ -2299,7 +2426,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         feat["foreign_holding_pct"] = None
         feat["foreign_holding_available"] = False
 
-    # Decision fields (WITH ATR FLOOR & WHIPSAW RISK ALERT)
+    # Decision fields
     resistance = feat.get("fib_nearest_resistance_1") or feat.get("st_resistance")
     # For breakout stocks at highs with no retracement resistance, use extension levels
     if resistance and resistance <= c_now * 1.005:
@@ -2307,12 +2434,10 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         if ext_resistance and ext_resistance > c_now:
             resistance = ext_resistance
     support = feat.get("fib_nearest_support_1") or feat.get("st_support")
-    
     decision = compute_decision_fields(
         c_now, atr_now, resistance, support, st_direction,
         bb_squeeze=bool(feat.get("flag_bb_squeeze")),
         trend_state=trend_state,
-        volatility_regime=feat.get("volatility_regime", "normal")
     )
     feat.update(decision)
 
@@ -2411,14 +2536,30 @@ def _analyze_one_stock_for_sector(stock_id, as_of_date, mode):
                 "Score": 0,
             }
         score = 0
-        if feat.get("trend_state") == "uptrend":
-            score += 2
+        # [IMPROVED-v2] Weighted composite score
+        ts = feat.get("trend_state", "")
+        if ts in ("strong_uptrend", "weak_uptrend"):
+            score += 3 if "strong" in ts else 2
+        elif ts == "uptrend_pullback":
+            score += 1
+        elif ts in ("strong_downtrend", "weak_downtrend"):
+            score -= 2
         if feat.get("flag_price_up_vol_up"):
             score += 1
         if feat.get("flag_kd_golden_cross"):
-            score += 1
+            score += 2  # now zone-filtered, more valuable
+        if feat.get("flag_kd_death_cross"):
+            score -= 2
         if feat.get("flag_inst_consensus_buy"):
             score += 2
+        if feat.get("flag_inst_consensus_sell"):
+            score -= 1
+        if feat.get("flag_supertrend_flip_bull"):
+            score += 2
+        if feat.get("flag_bb_squeeze_fire"):
+            score += 1
+        if feat.get("flag_bearish_divergence_rsi"):
+            score -= 1
         return {
             "Symbol": _strip_suffix(feat.get("symbol", stock_id)),
             "Close": feat.get("close", "-"),
