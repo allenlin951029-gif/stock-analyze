@@ -367,7 +367,7 @@ with st.sidebar:
     st.subheader("🤖 AI 操盤手分析指令")
     st.caption("💡 點擊右上方按鈕一鍵複製，連同下載的 JSON 貼給 AI")
     
-    ai_prompt = """我上傳了最新的台股快篩數據，我的交易風格是「專注於高盈虧比、跟隨法人籌碼的短波段交易」。請幫我執行嚴格的汰弱留強。
+    ai_prompt = """我上傳了最新的台股快篩數據，我的交易風格是「專注於高盈虧比、跟隨法人籌碼的短波段交易」。請幫我執行嚴格的汰弱留強。並且只要分析我上傳的檔案。
 
 【第一階段：系統性過濾 (請在內心執行，不需全部列出)】
 的標的分為「🎯 優先重壓區」、「⚠️ 觀望/防守區」、「🚨 必須停損區」。
@@ -652,5 +652,6 @@ if archive_len > 0:
         st.code(str(content), language="text")
 else:
     st.info("No results yet. Use the tabs above to run an analysis.")
+
 
 
