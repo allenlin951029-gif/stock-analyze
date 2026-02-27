@@ -352,7 +352,39 @@ with st.sidebar:
         st.warning("No cloud DB")
     
     st.info("Use pagination below to browse results.")
+# === 原本側邊欄的結尾 ===
+    if "firebase" in st.secrets:
+        st.success("Cloud DB connected")
+    else:
+        st.warning("No cloud DB")
 
+    st.info("")
+
+    # ==========================================
+    # 加入 AI 操盤手提示詞複製區
+    # ==========================================
+    st.divider()
+    st.subheader("🤖 AI 操盤手分析指令")
+    st.caption("💡 點擊右上方按鈕一鍵複製，連同下載的 JSON 貼給 AI")
+    
+    ai_prompt = """我上傳了最新的台股快篩數據，我的交易風格是「專注於高盈虧比、跟隨法人籌碼的短波段交易」。請幫我執行嚴格的汰弱留強。
+
+【第一階段：系統性過濾 (請在內心執行，不需全部列出)】
+直接剔除：流動性不足 (is_liquid: false)、盈虧比 < 1、或出現明確法人倒貨背離的標的。
+將剩下的標的分為「🎯 優先重壓區」、「⚠️ 觀望/防守區」、「🚨 必須停損區」。
+
+【第二階段：深度分析輸出 (請針對名單中的重點股票回答)】
+請針對各區塊的代表性股票，用以下 5 大維度給出簡潔、拳拳到肉的分析：
+1. 趨勢與型態：目前趨勢狀態？是否剛完成什麼底部/突破型態？
+2. 籌碼與動能：法人 (特別是外資) 是否在偷偷吃貨？MACD/RSI 有無關鍵轉折或背離？
+3. 風險報酬 (R:R)：現在進場的盈虧比是多少？潛在獲利與風險是否對等？
+4. 極限防守線：若要進場/續抱，具體的 ATR 停損價位設在多少？會不會容易被洗盤 (Whipsaw)？
+5. 操盤手決策：給出明確的明日行動指令（如：開盤直接買、掛回踩價低接、立刻市價停利）。
+
+【排版要求】
+語氣要專業、果斷、像操盤手對老闆的精準匯報。請多用列點，並將股票代號、停損價位、盈虧比等關鍵字加粗。"""
+
+    st.code(ai_prompt, language="text")
 # -------------------------
 # Main Content
 # -------------------------
@@ -621,3 +653,4 @@ if archive_len > 0:
         st.code(str(content), language="text")
 else:
     st.info("No results yet. Use the tabs above to run an analysis.")
+
