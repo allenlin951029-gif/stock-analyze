@@ -777,7 +777,11 @@ def calculate_fibonacci_summary(df: pd.DataFrame, lookback: int = 120, trend_sta
     diff = high - low
     c_now = float(sub["Close"].iloc[-1])
 
-    is_uptrend = trend_state in ("uptrend", "strong_uptrend", "weak_uptrend", "uptrend_pullback", "bottom_bounce")
+    # [P3] bottom_bounce excluded from uptrend — in still-bearish context (MA20 < MA60),
+    # uptrend Fib produces misleading support levels. Consolidation Fib is more appropriate.
+    is_uptrend = trend_state in (
+        "uptrend", "strong_uptrend", "weak_uptrend", "uptrend_pullback",
+    )
 
     if is_uptrend:
         # Uptrend: retracement from high, extensions above high
@@ -2094,9 +2098,23 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["ma5_slope_5d"] = slope_n(ma5, 5)
     feat["ma20_slope_5d"] = slope_n(ma20, 5)
 
-    # [P3 FIX] Trend state will be set AFTER ADX is computed (unified classify_trend)
-    # Placeholder — real classification happens below after ADX calculation
-    trend_state = "consolidation"  # temporary, overwritten below
+    # [P3 FIX] Preliminary MA-only trend classification for sections that run
+    # before ADX is available. Will be overwritten by classify_trend() after ADX.
+    if c_now > ma20_now > ma60_now and ma5_now > ma20_now:
+        trend_state = "uptrend"
+    elif c_now > ma20_now > ma60_now and ma5_now <= ma20_now:
+        trend_state = "uptrend_pullback"
+    elif c_now < ma20_now < ma60_now and ma5_now < ma20_now:
+        trend_state = "downtrend"
+    elif c_now < ma20_now < ma60_now and ma5_now >= ma20_now:
+        trend_state = "downtrend_bounce"
+    elif c_now > ma20_now and ma20_now < ma60_now:
+        trend_state = "bottom_bounce"
+    elif c_now < ma20_now and ma20_now > ma60_now:
+        trend_state = "top_pullback"
+    else:
+        trend_state = "consolidation"
+    # Note: trend_state will be REFINED with ADX qualification by classify_trend() below
 
     # 52w position
     high_52 = float(df.tail(252)["High"].max())
