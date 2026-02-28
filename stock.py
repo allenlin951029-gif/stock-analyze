@@ -1380,6 +1380,12 @@ def compute_institutional_features(chips_multi: List[Dict], price_now: float, pr
 
 
 def get_foreign_holding_ratio(stock_no: str) -> dict:
+    """
+    [P0-A] Fetch foreign holding ratio with verification:
+    - Confirms the returned data matches the requested stock_no
+    - Flags suspicious values (>90% or <0.1%)
+    - Returns source metadata for data quality tracking
+    """
     sess = _get_session()  # [OPT]
     headers = {"User-Agent": "Mozilla/5.0"}
     urls = [
@@ -1415,10 +1421,20 @@ def get_foreign_holding_ratio(stock_no: str) -> dict:
             if not last:
                 last_err = "empty row"
                 continue
+
+            # [P0-A FIX] Verify the returned data is for the correct stock
+            returned_stock = None
+            if fields:
+                norm_fields = [_norm_col(f) for f in fields]
+                for i, nf in enumerate(norm_fields):
+                    if any(kw in nf for kw in ("證券代號", "代號", "Code")):
+                        if i < len(last):
+                            returned_stock = str(last[i]).strip().replace('"', '')
+                            break
+
             date_str = _parse_roc_date(str(last[0]))
             ratio = None
             if fields:
-                norm_fields = [_norm_col(f) for f in fields]
                 for i, nf in enumerate(norm_fields):
                     if any(kw in nf for kw in ("持股比", "比率", "比例", "Percentage")):
                         if i < len(last):
@@ -1427,12 +1443,24 @@ def get_foreign_holding_ratio(stock_no: str) -> dict:
                                 ratio = float(raw)
                                 break
             if ratio is not None:
-                return {"ratio": ratio, "date": date_str, "error": None}
+                # [P0-A] Stock mismatch detection
+                stock_verified = (returned_stock is not None and returned_stock == stock_no)
+                # [P0-A] Sanity flag for suspicious values
+                suspicious = bool(ratio > 90.0 or ratio < 0.1)
+                return {
+                    "ratio": ratio,
+                    "date": date_str,
+                    "error": None,
+                    "stock_verified": stock_verified,
+                    "returned_stock": returned_stock,
+                    "suspicious": suspicious,
+                }
             last_err = "no ratio col"
         except Exception as e:
             last_err = str(e)
             continue
-    return {"ratio": None, "date": None, "error": last_err or "unknown"}
+    return {"ratio": None, "date": None, "error": last_err or "unknown",
+            "stock_verified": False, "returned_stock": None, "suspicious": False}
 
 
 # ===================================================================
@@ -1877,6 +1905,10 @@ def compute_decision_fields(
         supertrend_flip_bull: bool = False,
         kd_golden_cross: bool = False,
         macd_golden_cross: bool = False,
+        # [P1-B] Veto rule inputs
+        above_bb_upper: bool = False,
+        price_down_vol_up: bool = False,
+        close_gt_open: bool = False,
 ) -> Dict[str, Any]:
     feat: Dict[str, Any] = {}
 
@@ -1953,9 +1985,11 @@ def compute_decision_fields(
         feat["support_distance_pct"] = None
 
     # ---------------------------------------------------------------
-    # [P4 Item 1] EVENT-BASED ENTRY TRIGGER
-    # Fires only on the first day of a momentum shift, not a constant state.
-    # Requires at least one "today event" + R:R threshold.
+    # [P4 Item 1] EVENT-BASED ENTRY TRIGGER (v2)
+    # Now includes:
+    #   - Veto rules for adverse tape conditions (P1-B)
+    #   - Single-event confirmation requirement
+    #   - Price-action quality check
     # ---------------------------------------------------------------
     rr_val = feat.get("risk_reward_ratio")
     rr_ok = bool(rr_val is not None and rr_val >= ENTRY_MIN_RR)
@@ -1977,12 +2011,49 @@ def compute_decision_fields(
     has_event = len(today_events) >= 1
     not_bearish = trend_state not in ("downtrend", "strong_downtrend", "weak_downtrend", "top_pullback")
 
-    feat["flag_entry_trigger"] = bool(has_event and rr_ok and not_bearish and is_bullish)
-    feat["entry_trigger_events"] = today_events if feat["flag_entry_trigger"] else []
-    feat["entry_trigger_reason"] = (
-        f"Events: {', '.join(today_events)} | R:R={rr_val}" if feat["flag_entry_trigger"]
-        else "no_trigger"
+    # [P1-B] VETO RULES — hard disqualifiers that prevent trigger regardless of events
+    veto_reasons = []
+    if price_down_vol_up and not supertrend_flip_bull:
+        # Distribution bar (down + volume) — only override if a strong reversal signal is present
+        veto_reasons.append("price_down_vol_up_distribution")
+    if above_bb_upper and volatility_regime in ("high_volatility", "expansion"):
+        # Overextended + high vol — pullback risk too high
+        veto_reasons.append("above_bb_upper_in_high_vol")
+    if not close_gt_open and not supertrend_flip_bull and not kd_golden_cross:
+        # Red candle without strong reversal confirmation
+        veto_reasons.append("red_candle_no_reversal_confirm")
+
+    vetoed = len(veto_reasons) > 0
+
+    # [P1-B] CONFIRMATION REQUIREMENT — single-event triggers need extra support
+    # bb_squeeze_fire alone is a "candidate", not a trigger. It needs at least one of:
+    #   - volume confirmation (vol_surge)
+    #   - another event (ST flip, KD cross, MACD cross)
+    #   - green candle in favorable regime
+    needs_confirmation = (len(today_events) == 1 and today_events[0] == "bb_squeeze_fire")
+    has_confirmation = vol_surge or close_gt_open
+    single_event_blocked = needs_confirmation and not has_confirmation
+
+    # Final trigger decision
+    trigger_pass = bool(
+        has_event and rr_ok and not_bearish and is_bullish
+        and not vetoed and not single_event_blocked
     )
+
+    feat["flag_entry_trigger"] = trigger_pass
+    feat["entry_trigger_events"] = today_events if trigger_pass else []
+    feat["entry_trigger_veto"] = veto_reasons if veto_reasons else []
+
+    if trigger_pass:
+        feat["entry_trigger_reason"] = f"Events: {', '.join(today_events)} | R:R={rr_val}"
+    elif vetoed:
+        feat["entry_trigger_reason"] = f"vetoed: {', '.join(veto_reasons)}"
+    elif single_event_blocked:
+        feat["entry_trigger_reason"] = f"needs_confirmation: {today_events[0]} alone insufficient"
+    elif has_event and not rr_ok:
+        feat["entry_trigger_reason"] = f"rr_insufficient: R:R={rr_val} < {ENTRY_MIN_RR}"
+    else:
+        feat["entry_trigger_reason"] = "no_trigger"
 
     # ---------------------------------------------------------------
     # [P4 Item 2] SUGGESTED POSITION SIZE
@@ -2152,20 +2223,45 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         else:
             feat["weekly_rsi14"] = None
 
-        # Multi-timeframe alignment
-        daily_bull = trend_state in ("uptrend", "strong_uptrend", "weak_uptrend", "uptrend_pullback")
-        daily_bear = trend_state in ("downtrend", "strong_downtrend", "weak_downtrend")
+        # Multi-timeframe alignment — upgraded taxonomy (P2-C)
+        # States: aligned_bull, aligned_bear, mixed_bull_bias, mixed_bear_bias, conflicting
+        daily_strong_bull = trend_state in ("uptrend", "strong_uptrend")
+        daily_bull_bias = trend_state in (
+            "uptrend", "strong_uptrend", "weak_uptrend", "uptrend_pullback",
+            "bottom_bounce", "strong_bottom_bounce", "weak_bottom_bounce",
+        )
+        daily_strong_bear = trend_state in ("downtrend", "strong_downtrend")
+        daily_bear_bias = trend_state in (
+            "downtrend", "strong_downtrend", "weak_downtrend",
+            "downtrend_bounce", "top_pullback",
+        )
         weekly_bull = weekly_trend == "uptrend"
         weekly_bear = weekly_trend == "downtrend"
+        weekly_neutral = weekly_trend in ("consolidation", "insufficient_data")
 
-        if daily_bull and weekly_bull:
+        if daily_bull_bias and weekly_bull:
             feat["mtf_alignment"] = "aligned_bull"
-        elif daily_bear and weekly_bear:
+        elif daily_bear_bias and weekly_bear:
             feat["mtf_alignment"] = "aligned_bear"
-        else:
+        elif daily_bull_bias and weekly_neutral:
+            feat["mtf_alignment"] = "mixed_bull_bias"
+        elif daily_bear_bias and weekly_neutral:
+            feat["mtf_alignment"] = "mixed_bear_bias"
+        elif daily_strong_bull and weekly_bear:
+            feat["mtf_alignment"] = "conflicting"  # True directional disagreement
+        elif daily_strong_bear and weekly_bull:
             feat["mtf_alignment"] = "conflicting"
+        else:
+            feat["mtf_alignment"] = "mixed_neutral"
+
+        # Strict agreement (unchanged — directional only)
         feat["daily_weekly_trend_agree"] = bool(
-            (daily_bull and weekly_bull) or (daily_bear and weekly_bear)
+            (daily_bull_bias and weekly_bull) or (daily_bear_bias and weekly_bear)
+        )
+        # [P2-C] Bias agreement (looser — includes neutral weekly)
+        feat["daily_weekly_bias_agree"] = bool(
+            (daily_bull_bias and (weekly_bull or weekly_neutral))
+            or (daily_bear_bias and (weekly_bear or weekly_neutral))
         )
     else:
         feat["weekly_above_ma20"] = None
@@ -2173,6 +2269,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         feat["weekly_rsi14"] = None
         feat["mtf_alignment"] = None
         feat["daily_weekly_trend_agree"] = None
+        feat["daily_weekly_bias_agree"] = None
 
     # [OPT] relative strength using pre-fetched benchmark (no extra download)
     # Multi-period RS (Item #18): 20d, 63d, 252d
@@ -2517,7 +2614,23 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
                 if yf_ticker.endswith(".TW"):
                     fh = get_foreign_holding_ratio(stock_no)
                     if fh.get("error") is None and fh.get("ratio") is not None:
-                        return {"foreign_holding_pct": fh["ratio"], "foreign_holding_available": True}
+                        ratio = fh["ratio"]
+                        verified = fh.get("stock_verified", False)
+                        suspicious = fh.get("suspicious", False)
+                        # [P0-A] Hard gate: if stock mismatch detected, reject the data
+                        if fh.get("returned_stock") and fh["returned_stock"] != stock_no:
+                            return {
+                                "foreign_holding_pct": None,
+                                "foreign_holding_available": False,
+                                "foreign_holding_warning": f"stock_mismatch: requested={stock_no} got={fh['returned_stock']}",
+                            }
+                        return {
+                            "foreign_holding_pct": ratio,
+                            "foreign_holding_available": True,
+                            "foreign_holding_verified": verified,
+                            "foreign_holding_suspicious": suspicious,
+                            "foreign_holding_warning": "value>90%_verify_source" if suspicious else None,
+                        }
                 return {"foreign_holding_pct": None, "foreign_holding_available": False}
             except Exception:
                 return {"foreign_holding_pct": None, "foreign_holding_available": False}
@@ -2533,14 +2646,19 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
                 if isinstance(margin, dict) and margin.get("error") is None:
                     m_bal = margin.get("margin_balance")
                     s_bal = margin.get("short_balance")
+                    m_chg = margin.get("margin_change")
+                    s_chg = margin.get("short_change")
+                    m_usage = margin.get("margin_usage_rate")
+                    # [P0-A FIX] Only mark available if at least one core field is non-null
+                    has_real_data = any(v is not None for v in [m_bal, s_bal, m_chg, s_chg, m_usage])
                     return {
-                        "margin_balance": margin.get("margin_balance"),
-                        "margin_change": margin.get("margin_change"),
-                        "margin_usage_rate": margin.get("margin_usage_rate"),
-                        "short_balance": margin.get("short_balance"),
-                        "short_change": margin.get("short_change"),
+                        "margin_balance": m_bal,
+                        "margin_change": m_chg,
+                        "margin_usage_rate": m_usage,
+                        "short_balance": s_bal,
+                        "short_change": s_chg,
                         "short_margin_ratio": round(s_bal / m_bal * 100, 2) if m_bal and s_bal and m_bal > 0 else None,
-                        "margin_data_available": True,
+                        "margin_data_available": has_real_data,
                     }
                 return {"margin_data_available": False}
             except Exception:
@@ -2638,6 +2756,10 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         supertrend_flip_bull=bool(feat.get("flag_supertrend_flip_bull")),
         kd_golden_cross=bool(feat.get("flag_kd_golden_cross")),
         macd_golden_cross=bool(feat.get("flag_macd_golden_cross")),
+        # [P1-B] Veto rule inputs
+        above_bb_upper=bool(feat.get("flag_above_bb_upper")),
+        price_down_vol_up=bool(feat.get("flag_price_down_vol_up")),
+        close_gt_open=bool(c_now > o_now),
     )
     feat.update(decision)
 
@@ -2646,13 +2768,30 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     feat["flag_poor_risk_reward"] = bool(rr is not None and rr < 1.0)
 
     # Data quality metadata (Item #19)
+    # [P0-A] Data quality metadata — now includes external source reliability
     feat["data_quality"] = {
         "price_data_days": len(df),
         "volume_zero_pct": round(float((df["Volume"] == 0).sum()) / len(df) * 100, 1) if len(df) > 0 else None,
         "stale_warning": bool((datetime.now().date() - trade_date).days > 3),
     }
     if mode == "ai":
-        feat["data_quality"]["inst_data_coverage"] = None  # Updated if inst data fetched
+        feat["data_quality"]["inst_data_coverage"] = None
+        # [P0-A] External source reliability gates
+        feat["data_quality"]["external_sources"] = {
+            "foreign_holding": {
+                "available": feat.get("foreign_holding_available", False),
+                "verified": feat.get("foreign_holding_verified", False),
+                "suspicious": feat.get("foreign_holding_suspicious", False),
+                "warning": feat.get("foreign_holding_warning"),
+            },
+            "margin": {
+                "available": feat.get("margin_data_available", False),
+                "has_real_data": feat.get("margin_data_available", False),
+            },
+            "institutional": {
+                "available": feat.get("inst_data_available", False),
+            },
+        }
 
     # Final sanitize
     feat = _sanitize_numpy(feat)
