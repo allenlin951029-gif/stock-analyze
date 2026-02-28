@@ -1379,283 +1379,6 @@ def compute_institutional_features(chips_multi: List[Dict], price_now: float, pr
     return feat
 
 
-def get_foreign_holding_ratio(stock_no: str, trade_date=None) -> dict:
-    """
-    Fetch foreign holding ratio from TWSE.
-
-    THREE STRATEGIES (tried in order):
-    1. queryType=2 + date (per-stock time series for ONE stock)
-    2. MI_QFIIS_sort_20 (full-market cross-section, ALL stocks, cacheable)
-    3. queryType=1 (category subset — last resort, least reliable)
-
-    HISTORY OF BUGS:
-    - v1: took data[-1] from queryType=1 → always got stock 1110
-    - v2: filtered queryType=1 by code → correct but table was 8-row subset
-    - v3: added queryType=2 without date param → API returned empty data
-    - v4 (current): adds date param + MI_QFIIS_sort_20 full-market endpoint
-    """
-    sess = _get_session()
-    headers = {"User-Agent": "Mozilla/5.0"}
-    last_err = None
-
-    # Compute date strings for API calls
-    if trade_date is None:
-        trade_date = datetime.now().date()
-    if hasattr(trade_date, 'date'):
-        trade_date = trade_date.date()
-    date_str_api = trade_date.strftime("%Y%m%d")
-
-    # =================================================================
-    # STRATEGY 1: queryType=2 + date (per-stock time series)
-    # The date param was missing in v3, causing empty responses.
-    # =================================================================
-    qt2_urls = [
-        f"https://www.twse.com.tw/rwd/zh/fund/MI_QFIIS?response=json&date={date_str_api}&stockNo={stock_no}&queryType=2",
-        f"https://www.twse.com.tw/fund/MI_QFIIS?response=json&date={date_str_api}&stockNo={stock_no}&queryType=2",
-    ]
-    for url in qt2_urls:
-        try:
-            r = sess.get(url, headers=headers, timeout=15)
-            if r.status_code != 200:
-                last_err = f"qt2 HTTP {r.status_code}"
-                continue
-            j = r.json()
-            fields, data = _extract_mi_qfiis_table(j)
-            if not data or len(data) == 0:
-                last_err = f"qt2 no data (date={date_str_api})"
-                continue
-
-            latest_row = data[-1]
-            if not latest_row:
-                last_err = "qt2 empty latest row"
-                continue
-
-            row_date = _parse_roc_date(str(latest_row[0]))
-            ratio = _extract_holding_ratio(fields, latest_row)
-            if ratio is not None:
-                return {
-                    "ratio": ratio,
-                    "date": row_date,
-                    "error": None,
-                    "stock_verified": True,
-                    "returned_stock": stock_no,
-                    "suspicious": bool(ratio > 90.0 or ratio < 0.1),
-                    "_debug": {"method": "queryType=2", "table_rows": len(data)},
-                }
-            last_err = "qt2 no ratio value"
-        except Exception as e:
-            last_err = f"qt2 exception: {e}"
-            continue
-
-    # =================================================================
-    # STRATEGY 2: MI_QFIIS_sort_20 (full-market cross-section)
-    # Returns ALL listed stocks' foreign holding for one date.
-    # Cacheable — one download serves every stock in a sector scan.
-    # Try current date, then back up to 7 days for holidays.
-    # =================================================================
-    for back_days in range(8):
-        d = trade_date - timedelta(days=back_days)
-        ds = d.strftime("%Y%m%d")
-        cache_key = ("mi_qfiis_sort20", ds)
-
-        cached = None
-        with _inst_cache_lock:
-            if cache_key in _inst_csv_cache:
-                cached = _inst_csv_cache[cache_key]
-
-        if cached is not None:
-            fields, data = cached.get("fields"), cached.get("data")
-            if not data:
-                continue
-        else:
-            sort20_urls = [
-                f"https://www.twse.com.tw/rwd/zh/fund/MI_QFIIS_sort_20?response=json&date={ds}",
-                f"https://www.twse.com.tw/fund/MI_QFIIS_sort_20?response=json&date={ds}",
-            ]
-            fields, data = None, None
-            for url in sort20_urls:
-                try:
-                    r = sess.get(url, headers=headers, timeout=15)
-                    if r.status_code != 200:
-                        last_err = f"sort20 HTTP {r.status_code} (date={ds})"
-                        continue
-                    j = r.json()
-                    fields, data = _extract_mi_qfiis_table(j)
-                    if data and len(data) > 20:
-                        break
-                    else:
-                        last_err = f"sort20 small table: {len(data) if data else 0} rows (date={ds})"
-                        fields, data = None, None
-                except Exception as e:
-                    last_err = f"sort20 exception: {e}"
-                    continue
-
-            with _inst_cache_lock:
-                _inst_csv_cache[cache_key] = {"fields": fields, "data": data}
-
-            if not data:
-                continue
-
-        target_row = _filter_by_stock_code(fields, data, stock_no)
-        if target_row is not None:
-            row_date = _parse_roc_date(str(target_row[0])) if target_row[0] else ds
-            ratio = _extract_holding_ratio(fields, target_row)
-            if ratio is not None:
-                return {
-                    "ratio": ratio,
-                    "date": row_date,
-                    "error": None,
-                    "stock_verified": True,
-                    "returned_stock": stock_no,
-                    "suspicious": bool(ratio > 90.0 or ratio < 0.1),
-                    "_debug": {"method": "sort20", "table_rows": len(data), "date_used": ds},
-                }
-            last_err = f"sort20 found {stock_no} but no ratio value"
-        else:
-            if back_days == 0:
-                sample = _sample_codes_from_table(fields, data, n=5)
-                last_err = f"sort20 {stock_no} not in {len(data)}-row table (first: {sample})"
-
-    # =================================================================
-    # STRATEGY 3: queryType=1 (category subset) — LAST RESORT
-    # =================================================================
-    qt1_urls = [
-        f"https://www.twse.com.tw/rwd/zh/fund/MI_QFIIS?response=json&date={date_str_api}&stockNo={stock_no}&queryType=1",
-        f"https://www.twse.com.tw/fund/MI_QFIIS?response=json&date={date_str_api}&stockNo={stock_no}&queryType=1",
-    ]
-    for url in qt1_urls:
-        try:
-            r = sess.get(url, headers=headers, timeout=15)
-            if r.status_code != 200:
-                last_err = f"qt1 HTTP {r.status_code}"
-                continue
-            j = r.json()
-            fields, data = _extract_mi_qfiis_table(j)
-            if not data:
-                last_err = "qt1 no data"
-                continue
-            target_row = _filter_by_stock_code(fields, data, stock_no)
-            if target_row is None:
-                sample = _sample_codes_from_table(fields, data, n=5)
-                last_err = f"qt1 {stock_no} not in {len(data)}-row table (first: {sample})"
-                continue
-            row_date = _parse_roc_date(str(target_row[0]))
-            ratio = _extract_holding_ratio(fields, target_row)
-            if ratio is not None:
-                return {
-                    "ratio": ratio,
-                    "date": row_date,
-                    "error": None,
-                    "stock_verified": True,
-                    "returned_stock": stock_no,
-                    "suspicious": bool(ratio > 90.0 or ratio < 0.1),
-                    "_debug": {"method": "queryType=1_filtered", "table_rows": len(data)},
-                }
-            last_err = "qt1 no ratio in target row"
-        except Exception as e:
-            last_err = f"qt1 exception: {e}"
-            continue
-
-    return {"ratio": None, "date": None, "error": last_err or "all_strategies_failed",
-            "stock_verified": False, "returned_stock": None, "suspicious": False}
-
-
-def _extract_mi_qfiis_table(j: dict):
-    """Extract (fields, data) from MI_QFIIS JSON response."""
-    fields, data = None, None
-    if isinstance(j.get("tables"), list):
-        # Prefer the table with ratio-related keywords
-        for tbl in j["tables"]:
-            f = tbl.get("fields", [])
-            d = tbl.get("data", [])
-            if f and d:
-                joined = "".join(str(x) for x in f)
-                if any(kw in joined for kw in ("持股比", "比率", "比例", "持有")):
-                    fields, data = f, d
-                    break
-        # Fallback: take the LARGEST table (most likely to be the main data)
-        if fields is None:
-            best_size = 0
-            for tbl in j["tables"]:
-                f = tbl.get("fields", [])
-                d = tbl.get("data", [])
-                if f and d and len(d) > best_size:
-                    fields, data = f, d
-                    best_size = len(d)
-    if fields is None and j.get("fields") and j.get("data"):
-        fields, data = j["fields"], j["data"]
-    if fields is None and isinstance(j.get("data"), list) and j["data"]:
-        data = j["data"]
-    return fields, data
-
-
-def _extract_holding_ratio(fields, row):
-    """Extract foreign holding ratio from a row. Returns float or None."""
-    if fields:
-        norm_fields = [_norm_col(f) for f in fields]
-        for i, nf in enumerate(norm_fields):
-            if any(kw in nf for kw in ("持股比", "比率", "比例", "Percentage")):
-                if i < len(row):
-                    raw = str(row[i]).replace("%", "").replace(",", "").strip()
-                    if raw and re.match(r"^-?\d+(\.\d+)?$", raw):
-                        return float(raw)
-    # Fallback: scan cells for a percentage-like value (0-100 range)
-    for cell in row[1:]:
-        raw = str(cell).replace("%", "").replace(",", "").strip()
-        if raw and re.match(r"^-?\d+(\.\d+)?$", raw):
-            val = float(raw)
-            if 0 <= val <= 100:
-                return val
-    return None
-
-
-def _filter_by_stock_code(fields, data, stock_no: str):
-    """Find the row matching stock_no in a cross-section table."""
-    if not fields or not data:
-        return None
-    norm_fields = [_norm_col(f) for f in fields]
-    code_col_idx = None
-    for i, nf in enumerate(norm_fields):
-        if any(kw in nf for kw in ("證券代號", "證券代碼")):
-            code_col_idx = i
-            break
-    if code_col_idx is None:
-        for i, nf in enumerate(norm_fields):
-            if nf in ("代號", "Code") or nf.endswith("代號"):
-                sample_vals = [
-                    str(r[i]).strip().replace('"', '') for r in data[:10] if i < len(r)
-                ]
-                if any(re.match(r'^\d{4,6}[A-Z]?$', v) for v in sample_vals):
-                    code_col_idx = i
-                    break
-    if code_col_idx is None:
-        return None
-    for row in data:
-        if code_col_idx < len(row):
-            row_code = str(row[code_col_idx]).strip().replace('"', '').replace(' ', '')
-            if row_code == stock_no:
-                return row
-    return None
-
-
-def _sample_codes_from_table(fields, data, n=5) -> list:
-    """Extract first N stock codes from a table for diagnostics."""
-    if not fields or not data:
-        return []
-    norm_fields = [_norm_col(f) for f in fields]
-    code_col_idx = None
-    for i, nf in enumerate(norm_fields):
-        if any(kw in nf for kw in ("證券代號", "證券代碼", "代號")):
-            code_col_idx = i
-            break
-    if code_col_idx is None:
-        return []
-    return [
-        str(r[code_col_idx]).strip().replace('"', '')
-        for r in data[:n] if code_col_idx < len(r)
-    ]
-
-
 
 # ===================================================================
 # 10. MARGIN TRADING – [OPT] uses pooled session
@@ -2803,40 +2526,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
             except Exception as e:
                 return {"inst_data_available": False, "inst_error": str(e)}
 
-        def _fetch_foreign_holding():
-            try:
-                if yf_ticker.endswith(".TW"):
-                    fh = get_foreign_holding_ratio(stock_no, trade_date=trade_date)
-                    if fh.get("error") is None and fh.get("ratio") is not None:
-                        ratio = fh["ratio"]
-                        verified = fh.get("stock_verified", False)
-                        suspicious = fh.get("suspicious", False)
-                        returned = fh.get("returned_stock")
-                        # Hard gate: if stock mismatch detected, reject the data
-                        if returned is not None and returned != stock_no:
-                            return {
-                                "foreign_holding_pct": None,
-                                "foreign_holding_available": False,
-                                "foreign_holding_warning": f"stock_mismatch: requested={stock_no} got={returned}",
-                            }
-                        return {
-                            "foreign_holding_pct": ratio,
-                            "foreign_holding_available": True,
-                            "foreign_holding_verified": verified,
-                            "foreign_holding_suspicious": suspicious,
-                            "foreign_holding_warning": "value>90%_verify_source" if suspicious else None,
-                        }
-                    else:
-                        return {
-                            "foreign_holding_pct": None,
-                            "foreign_holding_available": False,
-                            "foreign_holding_warning": fh.get("error", "fetch_failed"),
-                        }
-                return {"foreign_holding_pct": None, "foreign_holding_available": False}
-            except Exception as e:
-                return {"foreign_holding_pct": None, "foreign_holding_available": False,
-                        "foreign_holding_warning": str(e)}
-
         def _fetch_margin():
             try:
                 margin = get_margin_short_data(
@@ -2876,12 +2565,10 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         # [OPT] Run all 4 external data fetches in parallel threads
         with ThreadPoolExecutor(max_workers=4) as pool:
             fut_inst = pool.submit(_fetch_institutional)
-            fut_fh = pool.submit(_fetch_foreign_holding)
             fut_margin = pool.submit(_fetch_margin)
             fut_tdcc = pool.submit(_fetch_tdcc)
 
         feat.update(fut_inst.result())
-        feat.update(fut_fh.result())
         feat.update(fut_margin.result())
         feat.update(fut_tdcc.result())
 
@@ -2889,8 +2576,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         feat["inst_data_available"] = False
         feat["margin_data_available"] = False
         feat["tdcc_available"] = False
-        feat["foreign_holding_pct"] = None
-        feat["foreign_holding_available"] = False
 
     # ===================================================================
     # [P0] GHOST FIELD IMPLEMENTATIONS — Beta, Liquidity, Divergence Net
@@ -2980,12 +2665,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         feat["data_quality"]["inst_data_coverage"] = None
         # [P0-A] External source reliability gates
         feat["data_quality"]["external_sources"] = {
-            "foreign_holding": {
-                "available": feat.get("foreign_holding_available", False),
-                "verified": feat.get("foreign_holding_verified", False),
-                "suspicious": feat.get("foreign_holding_suspicious", False),
-                "warning": feat.get("foreign_holding_warning"),
-            },
             "margin": {
                 "available": feat.get("margin_data_available", False),
                 "has_real_data": feat.get("margin_data_available", False),
