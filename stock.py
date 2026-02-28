@@ -1381,12 +1381,18 @@ def compute_institutional_features(chips_multi: List[Dict], price_now: float, pr
 
 def get_foreign_holding_ratio(stock_no: str) -> dict:
     """
-    [P0-A] Fetch foreign holding ratio with verification:
-    - Confirms the returned data matches the requested stock_no
-    - Flags suspicious values (>90% or <0.1%)
-    - Returns source metadata for data quality tracking
+    Fetch foreign holding ratio from TWSE MI_QFIIS.
+    
+    ROOT CAUSE FIX: The MI_QFIIS endpoint returns a FULL-MARKET table
+    (all stocks, one date) regardless of the stockNo parameter.
+    Previously, `data[-1]` grabbed the last row (always stock 1110).
+    Now we: (1) find the code column, (2) filter for the requested stock,
+    (3) extract the ratio from the matching row.
+    
+    CACHING: The full-market table is cached so sector scans don't
+    re-download for every stock.
     """
-    sess = _get_session()  # [OPT]
+    sess = _get_session()
     headers = {"User-Agent": "Mozilla/5.0"}
     urls = [
         f"https://www.twse.com.tw/rwd/zh/fund/MI_QFIIS?response=json&stockNo={stock_no}&queryType=1",
@@ -1395,67 +1401,148 @@ def get_foreign_holding_ratio(stock_no: str) -> dict:
     last_err = None
     for url in urls:
         try:
-            r = sess.get(url, headers=headers, timeout=15)
-            if r.status_code != 200:
-                last_err = f"HTTP {r.status_code}"
-                continue
-            j = r.json()
-            fields, data = None, None
-            if isinstance(j.get("tables"), list):
-                for tbl in j["tables"]:
-                    f = tbl.get("fields", [])
-                    d = tbl.get("data", [])
-                    if f and d:
-                        joined = "".join(str(x) for x in f)
-                        if any(kw in joined for kw in ("持股比", "比率", "比例")):
-                            fields, data = f, d
-                            break
-            if fields is None and j.get("fields") and j.get("data"):
-                fields, data = j["fields"], j["data"]
-            if fields is None and isinstance(j.get("data"), list) and j["data"]:
-                data = j["data"]
-            if not data:
-                last_err = "no data"
-                continue
-            last = data[-1]
-            if not last:
-                last_err = "empty row"
-                continue
+            # Check if we have cached parsed data for this URL's base endpoint
+            cache_key = ("mi_qfiis", url.split("?")[0])
+            cached_parsed = None
+            with _inst_cache_lock:
+                if cache_key in _inst_csv_cache:
+                    cached_parsed = _inst_csv_cache[cache_key]
 
-            # [P0-A FIX] Verify the returned data is for the correct stock
-            returned_stock = None
+            if cached_parsed is not None:
+                fields, data = cached_parsed.get("fields"), cached_parsed.get("data")
+                if fields is None or data is None:
+                    last_err = "cached_no_data"
+                    continue
+            else:
+                r = sess.get(url, headers=headers, timeout=15)
+                if r.status_code != 200:
+                    last_err = f"HTTP {r.status_code}"
+                    continue
+                j = r.json()
+                fields, data = None, None
+                if isinstance(j.get("tables"), list):
+                    for tbl in j["tables"]:
+                        f = tbl.get("fields", [])
+                        d = tbl.get("data", [])
+                        if f and d:
+                            joined = "".join(str(x) for x in f)
+                            if any(kw in joined for kw in ("持股比", "比率", "比例")):
+                                fields, data = f, d
+                                break
+                if fields is None and j.get("fields") and j.get("data"):
+                    fields, data = j["fields"], j["data"]
+                if fields is None and isinstance(j.get("data"), list) and j["data"]:
+                    data = j["data"]
+                # Cache the parsed result for other stocks
+                with _inst_cache_lock:
+                    _inst_csv_cache[cache_key] = {"fields": fields, "data": data}
+
+                if not data:
+                    last_err = "no data"
+                    continue
+
+            # -------------------------------------------------------
+            # STEP 1: Detect code column and ratio column indices
+            # -------------------------------------------------------
+            code_col_idx = None
+            ratio_col_idx = None
+            norm_fields = []
+
             if fields:
                 norm_fields = [_norm_col(f) for f in fields]
+                # Find code column
                 for i, nf in enumerate(norm_fields):
-                    if any(kw in nf for kw in ("證券代號", "代號", "Code")):
-                        if i < len(last):
-                            returned_stock = str(last[i]).strip().replace('"', '')
-                            break
+                    if any(kw in nf for kw in ("證券代號", "證券代碼")):
+                        code_col_idx = i
+                        break
+                # Fallback: "代號" but NOT if it's a partial match on something else
+                if code_col_idx is None:
+                    for i, nf in enumerate(norm_fields):
+                        # Match "代號" or "Code" but exclude "外資代號" or unrelated fields
+                        if nf in ("代號", "Code") or nf.endswith("代號"):
+                            # Verify this column looks like stock codes (4-6 digit numbers)
+                            sample_vals = [
+                                str(row[i]).strip().replace('"', '')
+                                for row in data[:10] if i < len(row)
+                            ]
+                            if any(re.match(r'^\d{4,6}[A-Z]?$', v) for v in sample_vals):
+                                code_col_idx = i
+                                break
 
-            date_str = _parse_roc_date(str(last[0]))
-            ratio = None
-            if fields:
+                # Find ratio column
                 for i, nf in enumerate(norm_fields):
                     if any(kw in nf for kw in ("持股比", "比率", "比例", "Percentage")):
-                        if i < len(last):
-                            raw = str(last[i]).replace("%", "").replace(",", "").strip()
-                            if raw and re.match(r"^-?\d+(\.\d+)?$", raw):
-                                ratio = float(raw)
-                                break
+                        ratio_col_idx = i
+                        break
+
+            # -------------------------------------------------------
+            # STEP 2: Find the row for our stock
+            # -------------------------------------------------------
+            target_row = None
+            returned_stock_code = None
+
+            if code_col_idx is not None:
+                # Full-market table — FILTER by stock code
+                for row in data:
+                    if code_col_idx < len(row):
+                        row_code = str(row[code_col_idx]).strip().replace('"', '').replace(' ', '')
+                        if row_code == stock_no:
+                            target_row = row
+                            returned_stock_code = row_code
+                            break
+                if target_row is None:
+                    last_err = f"stock {stock_no} not found in {len(data)}-row table"
+                    # Log diagnostics: what codes are available?
+                    sample_codes = [
+                        str(r[code_col_idx]).strip().replace('"', '')
+                        for r in data[:5] if code_col_idx < len(r)
+                    ]
+                    last_err += f" (first codes: {sample_codes})"
+                    continue
+            else:
+                # Per-stock response (no code column) — take last row
+                # This can happen with queryType variations or API changes
+                target_row = data[-1]
+                returned_stock_code = None  # Can't verify, trust the API
+
+            # -------------------------------------------------------
+            # STEP 3: Extract ratio from the target row
+            # -------------------------------------------------------
+            date_str = _parse_roc_date(str(target_row[0]))
+            ratio = None
+
+            if ratio_col_idx is not None and ratio_col_idx < len(target_row):
+                raw = str(target_row[ratio_col_idx]).replace("%", "").replace(",", "").strip()
+                if raw and re.match(r"^-?\d+(\.\d+)?$", raw):
+                    ratio = float(raw)
+            else:
+                # Fallback: scan all cells for a percentage-like value
+                for cell in target_row[1:]:
+                    raw = str(cell).replace("%", "").replace(",", "").strip()
+                    if raw and re.match(r"^-?\d+(\.\d+)?$", raw):
+                        val = float(raw)
+                        if 0 <= val <= 100:
+                            ratio = val
+                            break
+
             if ratio is not None:
-                # [P0-A] Stock mismatch detection
-                stock_verified = (returned_stock is not None and returned_stock == stock_no)
-                # [P0-A] Sanity flag for suspicious values
+                stock_verified = (returned_stock_code is not None and returned_stock_code == stock_no)
                 suspicious = bool(ratio > 90.0 or ratio < 0.1)
                 return {
                     "ratio": ratio,
                     "date": date_str,
                     "error": None,
                     "stock_verified": stock_verified,
-                    "returned_stock": returned_stock,
+                    "returned_stock": returned_stock_code,
                     "suspicious": suspicious,
+                    "_debug": {
+                        "code_col_idx": code_col_idx,
+                        "ratio_col_idx": ratio_col_idx,
+                        "table_rows": len(data),
+                        "fields": fields[:6] if fields else None,
+                    },
                 }
-            last_err = "no ratio col"
+            last_err = "no ratio value in target row"
         except Exception as e:
             last_err = str(e)
             continue
@@ -2617,12 +2704,13 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
                         ratio = fh["ratio"]
                         verified = fh.get("stock_verified", False)
                         suspicious = fh.get("suspicious", False)
-                        # [P0-A] Hard gate: if stock mismatch detected, reject the data
-                        if fh.get("returned_stock") and fh["returned_stock"] != stock_no:
+                        returned = fh.get("returned_stock")
+                        # Hard gate: if stock mismatch detected, reject the data
+                        if returned is not None and returned != stock_no:
                             return {
                                 "foreign_holding_pct": None,
                                 "foreign_holding_available": False,
-                                "foreign_holding_warning": f"stock_mismatch: requested={stock_no} got={fh['returned_stock']}",
+                                "foreign_holding_warning": f"stock_mismatch: requested={stock_no} got={returned}",
                             }
                         return {
                             "foreign_holding_pct": ratio,
@@ -2631,9 +2719,16 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
                             "foreign_holding_suspicious": suspicious,
                             "foreign_holding_warning": "value>90%_verify_source" if suspicious else None,
                         }
+                    else:
+                        return {
+                            "foreign_holding_pct": None,
+                            "foreign_holding_available": False,
+                            "foreign_holding_warning": fh.get("error", "fetch_failed"),
+                        }
                 return {"foreign_holding_pct": None, "foreign_holding_available": False}
-            except Exception:
-                return {"foreign_holding_pct": None, "foreign_holding_available": False}
+            except Exception as e:
+                return {"foreign_holding_pct": None, "foreign_holding_available": False,
+                        "foreign_holding_warning": str(e)}
 
         def _fetch_margin():
             try:
