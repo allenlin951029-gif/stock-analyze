@@ -8,7 +8,6 @@ import io
 import json
 import math
 import re
-import time
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,12 +19,6 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-# [FIX] Import yfinance-specific rate limit error for explicit handling
-try:
-    from yfinance.exceptions import YFRateLimitError as _YFRateLimitError
-except ImportError:
-    _YFRateLimitError = None
-
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 try:
@@ -34,16 +27,6 @@ try:
     truststore.inject_into_ssl()
 except Exception:
     pass
-
-# --- Regulatory Status Tags (Attention / Disposition) ---
-try:
-    from tw_regulatory import get_regulatory_status
-    _HAS_REGULATORY_MODULE = True
-except ImportError:
-    _HAS_REGULATORY_MODULE = False
-
-    def get_regulatory_status(stock_id: str) -> dict:
-        return {"status_tags": [], "status_source": None, "status_asof": None, "status_error": "tw_regulatory module not found"}
 
 # ===================================================================
 # 0. UTILS
@@ -1745,7 +1728,12 @@ def compute_tdcc_features(tdcc_data: Dict) -> Dict[str, Any]:
 
 def calc_relative_strength(stock_df, benchmark_ticker="0050.TW", period=20):
     try:
-        bench = _download_yf(benchmark_ticker, "3mo", "1d")
+        with _yf_lock:
+            # [FIX] auto_adjust=True and ffill() to avoid missing data/unadjusted price bugs
+            bench = yf.download(benchmark_ticker, period="3mo", progress=False, auto_adjust=True)
+            bench = clean_yf_columns(_ensure_naive_index(bench))
+            if not bench.empty:
+                bench = bench.ffill().dropna(subset=["Close"])
 
         if bench.empty or len(stock_df) < period:
             return None
@@ -2005,56 +1993,18 @@ def compute_decision_fields(
 # ===================================================================
 
 
-def _download_yf(ticker: str, period: str, interval: str, max_retries: int = 3):
-    """Helper for threaded yf.download — serialised via _yf_lock with retry + backoff.
-    Falls back to yf.Ticker().history() if yf.download() returns empty.
-    """
-    for attempt in range(max_retries):
-        with _yf_lock:
-            try:
-                # Primary method: yf.download()
-                df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-                df = clean_yf_columns(_ensure_naive_index(df))
-                if not df.empty:
-                    df = df.ffill().dropna(subset=["Close"])
-                    time.sleep(0.5)
-                    return df
-
-                # [FIX] Fallback 1: yf.Ticker().history() — sometimes works when download() doesn't
-                t = yf.Ticker(ticker)
-                df = t.history(period=period, interval=interval, auto_adjust=True)
-                df = clean_yf_columns(_ensure_naive_index(df))
-                if not df.empty:
-                    df = df.ffill().dropna(subset=["Close"])
-                    time.sleep(0.5)
-                    return df
-
-                # [FIX] Fallback 2: try shorter period (Yahoo sometimes rejects "2y" for certain tickers)
-                shorter = {"2y": "1y", "1y": "6mo", "6mo": "3mo"}
-                sp = shorter.get(period)
-                if sp:
-                    df = t.history(period=sp, interval=interval, auto_adjust=True)
-                    df = clean_yf_columns(_ensure_naive_index(df))
-                    if not df.empty:
-                        df = df.ffill().dropna(subset=["Close"])
-                        time.sleep(0.5)
-                        return df
-
-                time.sleep(0.5)
-                return pd.DataFrame()
-
-            except Exception as e:
-                is_rate_limit = (
-                    (_YFRateLimitError is not None and isinstance(e, _YFRateLimitError))
-                    or any(kw in str(e).lower() for kw in ("rate", "too many", "429"))
-                )
-                if is_rate_limit and attempt < max_retries - 1:
-                    wait = 2 ** attempt + 1  # 2s, 3s, 5s
-                    time.sleep(wait)
-                    continue
-                # Non-rate-limit error or final attempt — return empty
-                return pd.DataFrame()
-    return pd.DataFrame()
+def _download_yf(ticker: str, period: str, interval: str):
+    """Helper for threaded yf.download — serialised via _yf_lock."""
+    with _yf_lock:
+        try:
+            # [FIX] auto_adjust=True and ffill() to avoid missing data/unadjusted price bugs
+            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+            df = clean_yf_columns(_ensure_naive_index(df))
+            if not df.empty:
+                df = df.ffill().dropna(subset=["Close"])
+            return df
+        except Exception:
+            return pd.DataFrame()
 
 
 def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[str, Any]:
@@ -2065,13 +2015,12 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     # -- download daily (sequential — yf.download is NOT thread-safe) --
     df_daily = _download_yf(yf_ticker, "2y", "1d")
 
-    # [FIX] Fallback: try .TWO (OTC) if .TW (TWSE) returns empty
     if df_daily.empty and yf_ticker.endswith(".TW"):
         yf_ticker = yf_ticker.replace(".TW", ".TWO")
         df_daily = _download_yf(yf_ticker, "2y", "1d")
 
     if df_daily.empty:
-        return {"error": f"not found: {stock_id} (tried {stock_no}.TW/.TWO with yf.download + Ticker.history — Yahoo may not have this ticker)", "symbol": stock_id}
+        return {"error": f"not found: {stock_id}", "symbol": stock_id}
 
     chosen_ts = _nearest_trading_ts(df_daily, as_of_date)
     if chosen_ts is None:
@@ -2725,21 +2674,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
             },
         }
 
-    # -------------------------------------------------------------------
-    # Regulatory status tags (Attention / Disposition)
-    # -------------------------------------------------------------------
-    try:
-        reg = get_regulatory_status(yf_ticker)
-        feat["status_tags"] = reg.get("status_tags", [])
-        feat["status_source"] = reg.get("status_source")
-        feat["status_asof"] = reg.get("status_asof")
-        if reg.get("status_error"):
-            feat.setdefault("data_quality", {})["reg_status_error"] = reg["status_error"]
-    except Exception:
-        feat["status_tags"] = []
-        feat["status_source"] = None
-        feat["status_asof"] = None
-
     # Final sanitize
     feat = _sanitize_numpy(feat)
     return feat
@@ -2803,13 +2737,6 @@ def format_text_report(feat: Dict[str, Any]) -> str:
     if feat.get("beta_60d") is not None:
         lines.append("  Beta(60d)：{}".format(feat["beta_60d"]))
 
-    # Regulatory status tags
-    status_tags = feat.get("status_tags", [])
-    if status_tags:
-        src = feat.get("status_source", "")
-        src_label = f" ({src.upper()})" if src else ""
-        lines.append("  ⚠ Regulatory：{}{}".format("，".join(status_tags), src_label))
-
     lines.append(SEP)
     return "\n".join(lines)
 
@@ -2858,7 +2785,6 @@ def _analyze_one_stock_for_sector(stock_id, as_of_date, mode):
             "MA20_Dev": "{:+.2f}%".format(feat.get("ma20_dev_pct", 0) or 0),
             "Vol_R": feat.get("vol_ratio_5d", "-"),
             "KD": "{:.0f}/{:.0f}".format(feat.get("kd_k", 0) or 0, feat.get("kd_d", 0) or 0),
-            "Status": ",".join(feat.get("status_tags", [])) or "-",
             "Score": score,
         }
     except Exception:
@@ -2872,9 +2798,8 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
         return f"No stocks in sector {sector_name}."
 
     # [OPT] Parallel analysis of all stocks in sector
-    # [FIX] Reduced max_workers to 3 to avoid Yahoo Finance rate limiting
     results = []
-    with ThreadPoolExecutor(max_workers=min(len(target_list), 3)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(target_list), 5)) as pool:
         futures = {
             pool.submit(_analyze_one_stock_for_sector, sid, as_of_date, mode): sid
             for sid in target_list
@@ -2890,20 +2815,19 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
     lines.append(f"Date：{d_str}")
     lines.append("-" * 35)
     lines.append(
-        "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<10} {:<4}".format(
-            "Symbol", "Price", "Trend", "MA20Dev", "VolR", "KD", "Status", "Score"))
+        "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format("Symbol", "Price", "Trend", "MA20Dev", "VolR", "KD",
+                                                              "Score"))
     lines.append("-" * 35)
 
     for r in results:
         lines.append(
-            "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<10} {:<4}".format(
+            "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format(
                 str(r.get("Symbol", "")),
                 str(r.get("Close", "")),
                 str(r.get("Trend", "")),
                 str(r.get("MA20_Dev", "")),
                 str(r.get("Vol_R", "")),
                 str(r.get("KD", "")),
-                str(r.get("Status", "-")),
                 str(r.get("Score", "")),
             )
         )
