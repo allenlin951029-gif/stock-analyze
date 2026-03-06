@@ -95,362 +95,6 @@ def _get_cached_benchmark(ttl_seconds: int = _BENCH_TTL_SECONDS) -> pd.DataFrame
     return df
 
 
-# ===================================================================
-# 0c. REGULATORY STATUS CACHE — Attention / Disposition lists
-# ===================================================================
-# Supports:
-#   1. Auto-fetch from TWSE/TPEx (may fail from cloud hosting)
-#   2. Manual override via set_manual_regulatory_codes()
-# ===================================================================
-
-_reg_cache: Dict[str, Any] = {
-    "attention": set(),
-    "disposition": set(),
-    "ts": None,
-    "debug": [],
-    "manual_attention": set(),   # Manual override
-    "manual_disposition": set(), # Manual override
-}
-_reg_cache_lock = threading.Lock()
-_REG_TTL_SECONDS = 600  # 10-minute TTL
-
-
-def set_manual_regulatory_codes(attention_codes: List[str] = None,
-                                 disposition_codes: List[str] = None) -> None:
-    """Manually set attention/disposition stock codes (called from app.py sidebar)."""
-    with _reg_cache_lock:
-        if attention_codes is not None:
-            _reg_cache["manual_attention"] = {
-                c.strip().upper() for c in attention_codes if c.strip()
-            }
-        if disposition_codes is not None:
-            _reg_cache["manual_disposition"] = {
-                c.strip().upper() for c in disposition_codes if c.strip()
-            }
-
-
-def _make_browser_session() -> requests.Session:
-    """Create a fresh session with realistic browser headers for TWSE/TPEx."""
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "X-Requested-With": "XMLHttpRequest",
-    })
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=5, pool_maxsize=10, max_retries=1
-    )
-    sess.mount("https://", adapter)
-    sess.mount("http://", adapter)
-    return sess
-
-
-def _try_fetch(sess, url, params=None, method="GET", debug_log=None,
-               headers=None) -> tuple:
-    """Try fetching data from a URL. Returns (status_code, text, codes_found)."""
-    label = f"{method} {url}"
-    try:
-        kw = {"timeout": 15}
-        if headers:
-            kw["headers"] = headers
-        if method == "POST":
-            resp = sess.post(url, data=params or {}, **kw)
-        else:
-            resp = sess.get(url, params=params, **kw)
-
-        status = resp.status_code
-        text = resp.text
-        text_len = len(text)
-
-        if debug_log is not None:
-            # Show first 200 chars of response for debugging
-            preview = text[:200].replace("\n", " ").strip()
-            debug_log.append(f"  {label} => {status} ({text_len}B)")
-            debug_log.append(f"    preview: {preview[:120]}...")
-
-        if status != 200:
-            return (status, text, set())
-
-        codes = set()
-
-        # Try JSON parse (TWSE returns {"stat":"OK", "data":[[...],...]})
-        try:
-            data = resp.json()
-            # Log JSON keys for debugging
-            if debug_log is not None and isinstance(data, dict):
-                debug_log.append(f"    JSON keys: {list(data.keys())[:8]}")
-
-            # TWSE format: data is array of arrays
-            for key in ("data", "aaData", "tables"):
-                rows = data.get(key, [])
-                if not rows:
-                    continue
-                # If it's a list of lists
-                if isinstance(rows, list) and rows:
-                    if isinstance(rows[0], list):
-                        for row in rows:
-                            if row:
-                                cell = str(row[0]).strip()
-                                m = re.search(r'(\d{4,6})', cell)
-                                if m:
-                                    codes.add(m.group(1))
-                    elif isinstance(rows[0], dict):
-                        # List of dicts — look for code-like fields
-                        for row in rows:
-                            for k in ("stkno", "stock_id", "Code", "代號",
-                                      "證券代號", "SecuritiesCompanyCode"):
-                                if k in row:
-                                    m = re.search(r'(\d{4,6})', str(row[k]))
-                                    if m:
-                                        codes.add(m.group(1))
-                                    break
-
-            if codes and debug_log is not None:
-                debug_log.append(f"    => {len(codes)} codes from JSON")
-            return (status, text, codes)
-        except (ValueError, KeyError):
-            pass
-
-        # Try CSV extraction (first column)
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split(",")
-            if parts:
-                cell = parts[0].strip().strip('"').strip("=").strip('"')
-                m = re.match(r'^(\d{4,6}[A-Z]?)$', cell)
-                if m:
-                    codes.add(m.group(1))
-
-        if codes and debug_log is not None:
-            debug_log.append(f"    => {len(codes)} codes from CSV")
-
-        # Try HTML table extraction as last resort (for pages that return HTML)
-        if not codes and "<table" in text.lower():
-            codes = set(re.findall(r'>\s*(\d{4})\s*<', text))
-            if codes and debug_log is not None:
-                debug_log.append(f"    => {len(codes)} codes from HTML table")
-
-        return (status, text, codes)
-
-    except Exception as e:
-        if debug_log is not None:
-            debug_log.append(f"  {label} => ERROR: {type(e).__name__}: {e}")
-        return (0, "", set())
-
-
-def _fetch_twse_attention(debug_log: list) -> set:
-    """Fetch TWSE (listed) attention list stock codes."""
-    sess = _make_browser_session()
-    codes = set()
-
-    # Strategy 1: Visit the HTML page first (get cookies), then POST for JSON
-    try:
-        sess.get("https://www.twse.com.tw/zh/announcement/notice.html", timeout=10)
-    except Exception:
-        pass
-
-    _, _, c = _try_fetch(sess,
-        "https://www.twse.com.tw/rwd/zh/announcement/notice",
-        params={"response": "json", "date": "", "selectType": ""},
-        method="POST", debug_log=debug_log)
-    codes |= c
-    if codes:
-        return codes
-
-    # Strategy 2: GET with Referer
-    _, _, c = _try_fetch(sess,
-        "https://www.twse.com.tw/rwd/zh/announcement/notice",
-        params={"response": "json"},
-        method="GET", debug_log=debug_log,
-        headers={"Referer": "https://www.twse.com.tw/zh/announcement/notice.html"})
-    codes |= c
-    if codes:
-        return codes
-
-    # Strategy 3: CSV export
-    _, _, c = _try_fetch(sess,
-        "https://www.twse.com.tw/rwd/zh/announcement/notice",
-        params={"response": "csv"},
-        method="GET", debug_log=debug_log)
-    codes |= c
-
-    return codes
-
-
-def _fetch_twse_disposition(debug_log: list) -> set:
-    """Fetch TWSE (listed) disposition list stock codes."""
-    sess = _make_browser_session()
-    codes = set()
-
-    try:
-        sess.get("https://www.twse.com.tw/zh/announcement/punish.html", timeout=10)
-    except Exception:
-        pass
-
-    _, _, c = _try_fetch(sess,
-        "https://www.twse.com.tw/rwd/zh/announcement/punish",
-        params={"response": "json", "date": "", "selectType": ""},
-        method="POST", debug_log=debug_log)
-    codes |= c
-    if codes:
-        return codes
-
-    _, _, c = _try_fetch(sess,
-        "https://www.twse.com.tw/rwd/zh/announcement/punish",
-        params={"response": "json"},
-        method="GET", debug_log=debug_log,
-        headers={"Referer": "https://www.twse.com.tw/zh/announcement/punish.html"})
-    codes |= c
-    if codes:
-        return codes
-
-    _, _, c = _try_fetch(sess,
-        "https://www.twse.com.tw/rwd/zh/announcement/punish",
-        params={"response": "csv"},
-        method="GET", debug_log=debug_log)
-    codes |= c
-
-    return codes
-
-
-def _fetch_tpex_attention(debug_log: list) -> set:
-    """Fetch TPEx (OTC) attention list stock codes."""
-    sess = _make_browser_session()
-    codes = set()
-
-    _, _, c = _try_fetch(sess,
-        "https://www.tpex.org.tw/www/zh-tw/announce/attention",
-        params={"response": "json", "date": ""},
-        method="POST", debug_log=debug_log)
-    codes |= c
-    if codes:
-        return codes
-
-    _, _, c = _try_fetch(sess,
-        "https://www.tpex.org.tw/openapi/v1/announce_attention",
-        method="GET", debug_log=debug_log)
-    codes |= c
-
-    return codes
-
-
-def _fetch_tpex_disposition(debug_log: list) -> set:
-    """Fetch TPEx (OTC) disposition list stock codes."""
-    sess = _make_browser_session()
-    codes = set()
-
-    _, _, c = _try_fetch(sess,
-        "https://www.tpex.org.tw/www/zh-tw/announce/disposal",
-        params={"response": "json", "date": ""},
-        method="POST", debug_log=debug_log)
-    codes |= c
-    if codes:
-        return codes
-
-    _, _, c = _try_fetch(sess,
-        "https://www.tpex.org.tw/openapi/v1/announce_disposal",
-        method="GET", debug_log=debug_log)
-    codes |= c
-
-    return codes
-
-
-def _refresh_regulatory_cache() -> None:
-    """Fetch all 4 lists in parallel, merge into cache."""
-    attention = set()
-    disposition = set()
-    debug_log = [f"[REG] Refresh at {datetime.now().strftime('%H:%M:%S')}"]
-
-    debug_twse_att = []
-    debug_tpex_att = []
-    debug_twse_dis = []
-    debug_tpex_dis = []
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        fut_att_twse = pool.submit(_fetch_twse_attention, debug_twse_att)
-        fut_att_tpex = pool.submit(_fetch_tpex_attention, debug_tpex_att)
-        fut_dis_twse = pool.submit(_fetch_twse_disposition, debug_twse_dis)
-        fut_dis_tpex = pool.submit(_fetch_tpex_disposition, debug_tpex_dis)
-
-        for fut, target, label, extra_log in [
-            (fut_att_twse, attention, "TWSE-ATT", debug_twse_att),
-            (fut_att_tpex, attention, "TPEX-ATT", debug_tpex_att),
-            (fut_dis_twse, disposition, "TWSE-DIS", debug_twse_dis),
-            (fut_dis_tpex, disposition, "TPEX-DIS", debug_tpex_dis),
-        ]:
-            try:
-                result = fut.result(timeout=25)
-                target |= result
-                debug_log.append(f"[{label}] => {len(result)} codes")
-                debug_log.extend(extra_log)
-            except Exception as e:
-                debug_log.append(f"[{label}] => FAILED: {e}")
-
-    debug_log.append(f"[REG] Auto-fetch: att={len(attention)}, dis={len(disposition)}")
-
-    with _reg_cache_lock:
-        _reg_cache["attention"] = attention
-        _reg_cache["disposition"] = disposition
-        _reg_cache["ts"] = datetime.now()
-        _reg_cache["debug"] = debug_log
-
-
-def get_regulatory_status(stock_no: str) -> List[str]:
-    """
-    Return status tags for a stock code (e.g. '2330').
-    Merges auto-fetched + manual override codes.
-    """
-    stock_no = _strip_suffix(stock_no).strip().upper()
-    now = datetime.now()
-
-    with _reg_cache_lock:
-        needs_refresh = (
-            _reg_cache["ts"] is None
-            or (now - _reg_cache["ts"]).total_seconds() > _REG_TTL_SECONDS
-        )
-
-    if needs_refresh:
-        try:
-            _refresh_regulatory_cache()
-        except Exception:
-            pass
-
-    with _reg_cache_lock:
-        att = _reg_cache["attention"] | _reg_cache["manual_attention"]
-        dis = _reg_cache["disposition"] | _reg_cache["manual_disposition"]
-
-    tags = []
-    if stock_no in att:
-        tags.append("ATTENTION")
-    if stock_no in dis:
-        tags.append("DISPOSITION")
-    return tags
-
-
-def get_regulatory_debug() -> List[str]:
-    """Return debug log from last regulatory cache refresh."""
-    with _reg_cache_lock:
-        lines = list(_reg_cache.get("debug", []))
-        m_att = _reg_cache.get("manual_attention", set())
-        m_dis = _reg_cache.get("manual_disposition", set())
-        if m_att or m_dis:
-            lines.append(f"[MANUAL] att={len(m_att)} dis={len(m_dis)}")
-            if m_att:
-                lines.append(f"  attention: {sorted(m_att)}")
-            if m_dis:
-                lines.append(f"  disposition: {sorted(m_dis)}")
-        return lines
-
-
 def _get_session() -> requests.Session:
     """Return a module-level requests.Session with connection pooling."""
     global _http_session
@@ -2350,41 +1994,17 @@ def compute_decision_fields(
 
 
 def _download_yf(ticker: str, period: str, interval: str):
-    """Helper for threaded yf.download — serialised via _yf_lock.
-    Includes retry with backoff for rate-limit errors."""
-    import time as _time
-    max_retries = 3
-    for attempt in range(max_retries):
-        with _yf_lock:
-            try:
-                # Try with raise_errors=True (yfinance >= 0.2.31)
-                try:
-                    df = yf.download(
-                        ticker, period=period, interval=interval,
-                        progress=False, auto_adjust=True,
-                        raise_errors=True,
-                    )
-                except TypeError:
-                    # Older yfinance: raise_errors not supported
-                    df = yf.download(
-                        ticker, period=period, interval=interval,
-                        progress=False, auto_adjust=True,
-                    )
-                df = clean_yf_columns(_ensure_naive_index(df))
-                if not df.empty:
-                    df = df.ffill().dropna(subset=["Close"])
-                return df
-            except Exception as e:
-                err_str = str(e).lower()
-                is_rate_limit = ("rate" in err_str or "too many" in err_str
-                                 or "429" in err_str or "ratelimit" in err_str)
-                if is_rate_limit and attempt < max_retries - 1:
-                    pass  # will retry after sleep below
-                else:
-                    return pd.DataFrame()
-        # Sleep OUTSIDE the lock so other threads aren't blocked
-        _time.sleep(2 ** attempt + 1)  # 2s, 3s, 5s
-    return pd.DataFrame()
+    """Helper for threaded yf.download — serialised via _yf_lock."""
+    with _yf_lock:
+        try:
+            # [FIX] auto_adjust=True and ffill() to avoid missing data/unadjusted price bugs
+            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+            df = clean_yf_columns(_ensure_naive_index(df))
+            if not df.empty:
+                df = df.ffill().dropna(subset=["Close"])
+            return df
+        except Exception:
+            return pd.DataFrame()
 
 
 def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[str, Any]:
@@ -2400,15 +2020,15 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         df_daily = _download_yf(yf_ticker, "2y", "1d")
 
     if df_daily.empty:
-        return {"error": f"not found: {stock_id}", "symbol": stock_id, "status_tags": get_regulatory_status(stock_no)}
+        return {"error": f"not found: {stock_id}", "symbol": stock_id}
 
     chosen_ts = _nearest_trading_ts(df_daily, as_of_date)
     if chosen_ts is None:
-        return {"error": "no data before date", "symbol": stock_id, "status_tags": get_regulatory_status(stock_no)}
+        return {"error": "no data before date", "symbol": stock_id}
 
     df = df_daily.loc[:chosen_ts].copy()
     if len(df) < 60:
-        return {"error": "less than 60 days data", "symbol": stock_id, "status_tags": get_regulatory_status(stock_no)}
+        return {"error": "less than 60 days data", "symbol": stock_id}
 
     latest = df.iloc[-1]
     trade_date = chosen_ts.date()
@@ -3034,12 +2654,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     rr = feat.get("risk_reward_ratio")
     feat["flag_poor_risk_reward"] = bool(rr is not None and rr < 1.0)
 
-    # --- Regulatory Status Tags (ATTENTION / DISPOSITION) ---
-    try:
-        feat["status_tags"] = get_regulatory_status(stock_no)
-    except Exception:
-        feat["status_tags"] = []
-
     # Data quality metadata (Item #19)
     # [P0-A] Data quality metadata — now includes external source reliability
     feat["data_quality"] = {
@@ -3057,12 +2671,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
             },
             "institutional": {
                 "available": feat.get("inst_data_available", False),
-            },
-            "regulatory": {
-                "tags": feat.get("status_tags", []),
-                "cache_populated": bool(_reg_cache.get("ts")),
-                "attention_count": len(_reg_cache.get("attention", set())),
-                "disposition_count": len(_reg_cache.get("disposition", set())),
             },
         }
 
@@ -3086,10 +2694,6 @@ def format_text_report(feat: Dict[str, Any]) -> str:
     lines.append(SEP)
     lines.append("  {}  Technical Summary".format(feat["symbol"]))
     lines.append("  Data：{}  Query：{}".format(feat["price_date"], feat["query_date"]))
-    status_tags = feat.get("status_tags", [])
-    if status_tags:
-        tag_str = ", ".join(status_tags)
-        lines.append("  *** REGULATORY: {} ***".format(tag_str))
     lines.append(SEP)
 
     lines.append("  Close：{}  Trend：{}".format(feat["close"], feat["trend_state"]))
@@ -3182,7 +2786,6 @@ def _analyze_one_stock_for_sector(stock_id, as_of_date, mode):
             "Vol_R": feat.get("vol_ratio_5d", "-"),
             "KD": "{:.0f}/{:.0f}".format(feat.get("kd_k", 0) or 0, feat.get("kd_d", 0) or 0),
             "Score": score,
-            "Status": ",".join(feat.get("status_tags", [])) or "-",
         }
     except Exception:
         return {"Symbol": stock_id, "Trend": "Exception", "Score": -1}
@@ -3210,15 +2813,15 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
     lines.append(f"Sector Scan：{sector_name}")
     d_str = str(as_of_date) if as_of_date else "Today"
     lines.append(f"Date：{d_str}")
-    lines.append("-" * 50)
+    lines.append("-" * 35)
     lines.append(
-        "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4} {:<12}".format(
-            "Symbol", "Price", "Trend", "MA20Dev", "VolR", "KD", "Score", "Status"))
-    lines.append("-" * 50)
+        "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format("Symbol", "Price", "Trend", "MA20Dev", "VolR", "KD",
+                                                              "Score"))
+    lines.append("-" * 35)
 
     for r in results:
         lines.append(
-            "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4} {:<12}".format(
+            "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format(
                 str(r.get("Symbol", "")),
                 str(r.get("Close", "")),
                 str(r.get("Trend", "")),
@@ -3226,11 +2829,10 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
                 str(r.get("Vol_R", "")),
                 str(r.get("KD", "")),
                 str(r.get("Score", "")),
-                str(r.get("Status", "-")),
             )
         )
 
-    lines.append("-" * 50)
+    lines.append("-" * 35)
     lines.append("（Score：uptrend+2，price_up_vol_up+1，KD_golden+1，inst_consensus+2）")
 
     return "\n".join(lines)
@@ -3246,18 +2848,16 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
 def analyze_stock_technical(stock_id: str, as_of_date=None, mode: str = "human") -> dict:
     """
     Main entry point.
-    mode="human" => returns {"human_report": str, "status_tags": list}
-    mode="ai"    => returns {"ai_report": dict, "status_tags": list}
-    status_tags: e.g. ["ATTENTION"], ["DISPOSITION"], ["ATTENTION","DISPOSITION"], or []
+    mode="human" => returns {"human_report": str}   (fast, no network calls)
+    mode="ai"    => returns {"ai_report": dict}     (full JSON with all data)
     """
     feat = build_ai_features(stock_id, as_of_date, mode=mode)
-    tags = feat.get("status_tags", [])
 
     if mode == "ai":
-        return {"ai_report": feat, "status_tags": tags}
+        return {"ai_report": feat}
     else:
         text = format_text_report(feat)
-        return {"human_report": text, "status_tags": tags}
+        return {"human_report": text}
 
 
 if __name__ == "__main__":
