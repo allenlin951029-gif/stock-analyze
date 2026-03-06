@@ -28,6 +28,16 @@ try:
 except Exception:
     pass
 
+# --- Regulatory Status Tags (Attention / Disposition) ---
+try:
+    from tw_regulatory import get_regulatory_status
+    _HAS_REGULATORY_MODULE = True
+except ImportError:
+    _HAS_REGULATORY_MODULE = False
+
+    def get_regulatory_status(stock_id: str) -> dict:
+        return {"status_tags": [], "status_source": None, "status_asof": None, "status_error": "tw_regulatory module not found"}
+
 # ===================================================================
 # 0. UTILS
 # ===================================================================
@@ -2674,6 +2684,21 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
             },
         }
 
+    # -------------------------------------------------------------------
+    # Regulatory status tags (Attention / Disposition)
+    # -------------------------------------------------------------------
+    try:
+        reg = get_regulatory_status(yf_ticker)
+        feat["status_tags"] = reg.get("status_tags", [])
+        feat["status_source"] = reg.get("status_source")
+        feat["status_asof"] = reg.get("status_asof")
+        if reg.get("status_error"):
+            feat.setdefault("data_quality", {})["reg_status_error"] = reg["status_error"]
+    except Exception:
+        feat["status_tags"] = []
+        feat["status_source"] = None
+        feat["status_asof"] = None
+
     # Final sanitize
     feat = _sanitize_numpy(feat)
     return feat
@@ -2737,6 +2762,13 @@ def format_text_report(feat: Dict[str, Any]) -> str:
     if feat.get("beta_60d") is not None:
         lines.append("  Beta(60d)：{}".format(feat["beta_60d"]))
 
+    # Regulatory status tags
+    status_tags = feat.get("status_tags", [])
+    if status_tags:
+        src = feat.get("status_source", "")
+        src_label = f" ({src.upper()})" if src else ""
+        lines.append("  ⚠ Regulatory：{}{}".format("，".join(status_tags), src_label))
+
     lines.append(SEP)
     return "\n".join(lines)
 
@@ -2785,6 +2817,7 @@ def _analyze_one_stock_for_sector(stock_id, as_of_date, mode):
             "MA20_Dev": "{:+.2f}%".format(feat.get("ma20_dev_pct", 0) or 0),
             "Vol_R": feat.get("vol_ratio_5d", "-"),
             "KD": "{:.0f}/{:.0f}".format(feat.get("kd_k", 0) or 0, feat.get("kd_d", 0) or 0),
+            "Status": ",".join(feat.get("status_tags", [])) or "-",
             "Score": score,
         }
     except Exception:
@@ -2815,19 +2848,20 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
     lines.append(f"Date：{d_str}")
     lines.append("-" * 35)
     lines.append(
-        "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format("Symbol", "Price", "Trend", "MA20Dev", "VolR", "KD",
-                                                              "Score"))
+        "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<10} {:<4}".format(
+            "Symbol", "Price", "Trend", "MA20Dev", "VolR", "KD", "Status", "Score"))
     lines.append("-" * 35)
 
     for r in results:
         lines.append(
-            "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format(
+            "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<10} {:<4}".format(
                 str(r.get("Symbol", "")),
                 str(r.get("Close", "")),
                 str(r.get("Trend", "")),
                 str(r.get("MA20_Dev", "")),
                 str(r.get("Vol_R", "")),
                 str(r.get("KD", "")),
+                str(r.get("Status", "-")),
                 str(r.get("Score", "")),
             )
         )
