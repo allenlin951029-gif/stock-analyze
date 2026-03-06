@@ -28,6 +28,7 @@ st.title("Stock Analyze")
 FS_COLLECTION = "stock_app_data"
 FS_DOCUMENT = "config"
 
+
 @st.cache_resource
 def get_db():
     if "firebase" in st.secrets:
@@ -41,6 +42,7 @@ def get_db():
             st.error(f"Firebase error: {e}")
             return None
     return None
+
 
 def load_sectors_from_db():
     db = get_db()
@@ -56,6 +58,7 @@ def load_sectors_from_db():
             return {}
     return st.session_state.get("_temp_local_sectors", {})
 
+
 def save_sectors_to_db(data):
     db = get_db()
     if db:
@@ -67,6 +70,7 @@ def save_sectors_to_db(data):
     else:
         st.session_state["_temp_local_sectors"] = data
         st.warning("No Firebase. Data is temporary.")
+
 
 # -------------------------
 # Cookies Configuration
@@ -81,6 +85,7 @@ if not cookies.ready():
 HIST_KEY = "history"
 CUR_KEY = "current_id"
 
+
 def load_history_from_cookie():
     raw = cookies.get(HIST_KEY)
     if not raw:
@@ -93,24 +98,30 @@ def load_history_from_cookie():
         return []
     return []
 
+
 def load_current_from_cookie():
     v = cookies.get(CUR_KEY)
     return (v or "0050").strip().upper()
 
+
 st.session_state["_cookie_saved_this_run"] = False
+
 
 def commit_cookies_once():
     if not st.session_state.get("_cookie_saved_this_run", False):
         cookies.save()
         st.session_state["_cookie_saved_this_run"] = True
 
+
 def save_history_to_cookie(history_list):
     cookies[HIST_KEY] = json.dumps(history_list, ensure_ascii=False)
     commit_cookies_once()
 
+
 def save_current_to_cookie(sid):
     cookies[CUR_KEY] = sid.strip().upper()
     commit_cookies_once()
+
 
 # -------------------------
 # Session Initialization
@@ -136,11 +147,13 @@ if "sector_as_of_date" not in st.session_state:
 if "report_mode" not in st.session_state:
     st.session_state.report_mode = "human"
 
+
 # -------------------------
 # Helper Functions
 # -------------------------
 def is_ai_mode():
     return st.session_state.report_mode == "ai"
+
 
 def push_history_cookie(stock_id):
     sid = stock_id.strip().upper()
@@ -150,6 +163,7 @@ def push_history_cookie(stock_id):
     st.session_state.history.insert(0, sid)
     st.session_state.history = st.session_state.history[:5]
     save_history_to_cookie(st.session_state.history)
+
 
 def save_to_archive(display_title, display_date, content):
     record = {
@@ -165,6 +179,7 @@ def save_to_archive(display_title, display_date, content):
         st.session_state.results_archive.pop(0)
     st.session_state.view_index = len(st.session_state.results_archive) - 1
 
+
 def run_analysis(stock_id, as_of_date, write_history):
     """
     執行個股分析的核心函式。
@@ -173,7 +188,7 @@ def run_analysis(stock_id, as_of_date, write_history):
     sid = stock_id.strip().upper()
     if not sid:
         return
-    
+
     # 1. 更新 Cookie 與 Session
     st.session_state.current_id = sid
     save_current_to_cookie(sid)
@@ -189,32 +204,37 @@ def run_analysis(stock_id, as_of_date, write_history):
         # mode="human" -> 只回傳文字，速度快 (Quick Screen)
         # mode="ai"    -> 回傳完整 JSON，速度慢 (Deep Dive)
         raw_result = analyze_stock_technical(sid, as_of_date=as_of_date, mode=current_mode)
-        
+
         if current_mode == "human":
             # Quick Screen 模式：省時間，不產生 AI 數據
             final_result["human_report"] = raw_result.get("human_report", "No report generated.")
-            final_result["ai_report"] = None 
+            final_result["ai_report"] = None
         else:
             # Deep Dive 模式：取得完整數據，並順便產生文字報告
             feat_data = raw_result.get("ai_report", {})
             final_result["ai_report"] = feat_data
-            
+
             # 手動產生文字報告，這樣使用者切換回 Quick Screen View 時也能看到內容
             if feat_data:
                 final_result["human_report"] = format_text_report(feat_data)
             else:
                 final_result["human_report"] = "Deep Dive Analysis failed (no data)."
 
+        # Propagate regulatory status tags
+        final_result["status_tags"] = raw_result.get("status_tags", [])
+
     except Exception as e:
         err_msg = f"Error: {type(e).__name__}: {e}"
         final_result = {
             "human_report": err_msg,
             "ai_report": {"error": str(e)},
+            "status_tags": [],
         }
         st.session_state._last_debug = f"exception={type(e).__name__}"
 
     # 3. 存檔
     save_to_archive(sid, as_of_date, final_result)
+
 
 def run_sector_analysis(sector_name, as_of_date, custom_list=None):
     """
@@ -230,6 +250,7 @@ def run_sector_analysis(sector_name, as_of_date, custom_list=None):
         final_report = f"Sector analysis failed: {e}"
     save_to_archive(f"Quick: {sector_name}", as_of_date, final_report)
 
+
 def run_full_sector_report(sector_name, as_of_date, custom_list=None):
     """
     類股完整報告 (根據當前模式跑迴圈)
@@ -239,9 +260,9 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
         save_to_archive(f"Full: {sector_name}", as_of_date, "No stocks.")
         return
 
-    mode = st.session_state.report_mode # 'human' or 'ai'
+    mode = st.session_state.report_mode  # 'human' or 'ai'
 
-    if mode == "ai": # Deep Dive
+    if mode == "ai":  # Deep Dive
         all_reports = {}
         for stock in target_list:
             try:
@@ -295,6 +316,7 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
         }
         save_to_archive(f"Full: {sector_name}", as_of_date, final_struct)
 
+
 # -------------------------
 # Sidebar
 # -------------------------
@@ -302,7 +324,7 @@ with st.sidebar:
     st.subheader("Settings")
     st.markdown("---")
     st.markdown("#### Report Mode")
-    
+
     # 邏輯映射：Quick Screen -> Human mode, Deep Dive -> AI mode
     idx = 0 if st.session_state.report_mode == "human" else 1
     mode_choice = st.radio(
@@ -350,9 +372,9 @@ with st.sidebar:
         st.success("Cloud DB connected")
     else:
         st.warning("No cloud DB")
-    
+
     st.info("Use pagination below to browse results.")
-# === 原本側邊欄的結尾 ===
+    # === 原本側邊欄的結尾 ===
     if "firebase" in st.secrets:
         st.success("Cloud DB connected")
     else:
@@ -366,7 +388,7 @@ with st.sidebar:
     st.divider()
     st.subheader("🤖 AI 操盤手分析指令")
     st.caption("💡 點擊右上方按鈕一鍵複製，連同下載的 JSON 貼給 AI")
-    
+
     ai_prompt = """我上傳了最新的台股快篩數據，我的交易風格是「專注於高盈虧比、跟隨法人籌碼的短波段交易」。請幫我執行嚴格的汰弱留強。並且只要分析我上傳的檔案。
 
 【第一階段：系統性過濾 (請在內心執行，不需全部列出)】
@@ -563,7 +585,26 @@ if archive_len > 0:
     # 顯示頂部的狀態 Bar (更新標籤)
     mode_badge = "Deep Dive" if is_ai_mode() else "Quick Screen"
     badge_color = "#1a73e8" if is_ai_mode() else "#2e7d32"
-    
+
+    # Regulatory status badges
+    reg_badges_html = ""
+    content_data = record.get("content", {})
+    if isinstance(content_data, dict):
+        status_tags = content_data.get("status_tags", [])
+        for tag in status_tags:
+            if tag == "ATTENTION":
+                reg_badges_html += (
+                    '<span style="background:#e65100;color:#fff;padding:2px 8px;border-radius:10px;'
+                    'font-size:0.75em;margin-left:6px;font-weight:bold;">'
+                    '\u26a0\ufe0f \u6ce8\u610f ATTENTION</span>'
+                )
+            elif tag == "DISPOSITION":
+                reg_badges_html += (
+                    '<span style="background:#b71c1c;color:#fff;padding:2px 8px;border-radius:10px;'
+                    'font-size:0.75em;margin-left:6px;font-weight:bold;">'
+                    '\u26d4 \u8655\u7f6e DISPOSITION</span>'
+                )
+
     st.markdown(
         f'<div style="text-align:center;background:#262730;padding:10px;border-radius:5px;'
         f'border:1px solid #464b5c;margin-bottom:10px;">'
@@ -571,6 +612,7 @@ if archive_len > 0:
         f'<span style="color:#ccc;font-size:0.9em;margin-left:10px;">({record["date"]})</span>'
         f'<span style="background:{badge_color};color:#fff;padding:2px 8px;border-radius:10px;'
         f'font-size:0.75em;margin-left:8px;">{mode_badge} View</span>'
+        f'{reg_badges_html}'
         f'<br><span style="font-size:0.8em;color:#aaa;">'
         f"{current_idx + 1} / {archive_len} ({record['created_at']})</span></div>",
         unsafe_allow_html=True,
@@ -582,7 +624,7 @@ if archive_len > 0:
         if st.button("Prev", disabled=(current_idx == 0), use_container_width=True):
             st.session_state.view_index -= 1
             st.rerun()
-            
+
     with c_switch:
         # 切換按鈕 (更新標籤)
         switch_label = "Switch to Quick Screen" if is_ai_mode() else "Switch to Deep Dive"
@@ -592,7 +634,7 @@ if archive_len > 0:
             else:
                 st.session_state.report_mode = "ai"
             st.rerun()
-            
+
     with c_next:
         if st.button("Next", disabled=(current_idx == archive_len - 1), use_container_width=True):
             st.session_state.view_index += 1
@@ -604,11 +646,11 @@ if archive_len > 0:
 
     # 檢查內容是否為我們定義的標準格式 (包含 human_report 與 ai_report)
     if isinstance(content, dict) and "human_report" in content and "ai_report" in content:
-        
+
         if is_ai_mode():
             st.markdown("### Deep Dive Data")
             ai_data = content["ai_report"]
-            
+
             # 檢查 Deep Dive (AI) 資料是否存在
             if ai_data is None:
                 st.warning("⚠️ 此筆紀錄為 Quick Screen 模式生成 (快速)，無 Deep Dive 詳細數據。")
@@ -652,6 +694,3 @@ if archive_len > 0:
         st.code(str(content), language="text")
 else:
     st.info("No results yet. Use the tabs above to run an analysis.")
-
-
-
