@@ -159,6 +159,36 @@ def extract_stock_number(sid: str) -> str:
     return match.group(0) if match else sid.strip().upper()
 
 
+def safe_read_exchange_csv(uploaded_file):
+    """專門處理台灣證交所/櫃買中心包含多餘表頭與表尾的 CSV 檔案"""
+    # 台灣官方 CSV 有時是 UTF-8 有時是 Big5 (cp950)，先嘗試解碼
+    try:
+        content = uploaded_file.getvalue().decode('utf-8-sig')
+    except UnicodeDecodeError:
+        content = uploaded_file.getvalue().decode('cp950', errors='replace')
+        
+    lines = content.splitlines()
+    
+    # 自動尋找真正的表頭列 (包含 '證券代號' 的那一行)
+    header_idx = 0
+    for i, line in enumerate(lines):
+        if "證券代號" in line:
+            header_idx = i
+            break
+            
+    # 將表頭開始的內容交給 Pandas 處理
+    data_str = "\n".join(lines[header_idx:])
+    df = pd.read_csv(io.StringIO(data_str))
+    
+    # 清理資料：確保代號是乾淨的字串，並濾掉表尾的「總累計次數」等廢話
+    if "證券代號" in df.columns:
+        df["證券代號"] = df["證券代號"].astype(str).str.replace('=', '').str.replace('"', '').str.strip()
+        # 只保留證券代號開頭是數字的資料列
+        df = df[df["證券代號"].str.match(r'^\d+')]
+        
+    return df
+
+
 def is_ai_mode():
     return st.session_state.report_mode == "ai"
 
@@ -209,8 +239,6 @@ def run_analysis(stock_id, as_of_date, write_history):
 
     try:
         # 呼叫 stock.py，傳入對應的 mode
-        # mode="human" -> 只回傳文字，速度快 (Quick Screen)
-        # mode="ai"    -> 回傳完整 JSON，速度慢 (Deep Dive)
         raw_result = analyze_stock_technical(sid, as_of_date=as_of_date, mode=current_mode)
 
         if current_mode == "human":
@@ -246,7 +274,6 @@ def run_sector_analysis(sector_name, as_of_date, custom_list=None):
     """
     final_report = ""
     try:
-        # Sector Scan 固定輸出文字列表 (Human mode)
         final_report = analyze_sector_performance(
             sector_name, as_of_date=as_of_date, custom_tickers=custom_list, mode="human"
         )
@@ -264,13 +291,12 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
         save_to_archive(f"Full: {sector_name}", as_of_date, "No stocks.")
         return
 
-    mode = st.session_state.report_mode  # 'human' or 'ai'
+    mode = st.session_state.report_mode
 
     if mode == "ai":  # Deep Dive
         all_reports = {}
         for stock in target_list:
             try:
-                # 強制跑 AI 模式收集數據
                 res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="ai")
                 if isinstance(res, dict):
                     all_reports[stock] = res.get("ai_report", {})
@@ -299,7 +325,6 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
 
         for stock in target_list:
             try:
-                # 跑 Human 模式 (快)
                 res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="human")
                 if isinstance(res, dict):
                     full_content.append(res.get("human_report", str(res)))
@@ -313,7 +338,6 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
                 full_content.append("-" * 60)
 
         combined_report = "\n".join(full_content)
-        # 這裡因為是純文字合併，結構稍微不同，為了統一 UI 顯示，我們包裝一下
         final_struct = {
             "human_report": combined_report,
             "ai_report": None
@@ -329,7 +353,6 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("#### Report Mode")
 
-    # 邏輯映射：Quick Screen -> Human mode, Deep Dive -> AI mode
     idx = 0 if st.session_state.report_mode == "human" else 1
     mode_choice = st.radio(
         "Select output mode:",
@@ -338,7 +361,6 @@ with st.sidebar:
         key="report_mode_radio",
         help="Quick Screen: Fast, text summary.\nDeep Dive: Slow, full JSON with all indicators.",
     )
-    # 更新 session state
     st.session_state.report_mode = "human" if mode_choice == "Quick Screen" else "ai"
 
     if is_ai_mode():
@@ -405,26 +427,37 @@ with st.sidebar:
     st.code(ai_prompt, language="text")
 
     # ==========================================
-    # 加入處置/注意股上傳區塊
+    # 加入處置/注意股上傳區塊 (支援多檔案：上市+上櫃)
     # ==========================================
     st.divider()
     st.subheader("📁 上傳處置/注意股清單")
-    punish_file = st.file_uploader("上傳處置股 CSV (punish.csv)", type=["csv"], key="punish_csv")
-    attention_file = st.file_uploader("上傳注意股 CSV (attention.csv)", type=["csv"], key="attention_csv")
+    st.caption("💡 可同時全選並拖曳「上市」與「上櫃」的檔案")
 
-    if punish_file:
+    punish_files = st.file_uploader("上傳處置股 CSV", type=["csv"], key="punish_csv", accept_multiple_files=True)
+    attention_files = st.file_uploader("上傳注意股 CSV", type=["csv"], key="attention_csv", accept_multiple_files=True)
+
+    if punish_files:
         try:
-            st.session_state.punish_df = pd.read_csv(punish_file)
-            st.success("處置股名單已載入！")
+            dfs = []
+            for f in punish_files:
+                dfs.append(safe_read_exchange_csv(f))
+            if dfs:
+                st.session_state.punish_df = pd.concat(dfs, ignore_index=True)
+                st.success(f"成功合併 {len(punish_files)} 份處置股名單！")
         except Exception as e:
             st.error(f"處置股讀取失敗: {e}")
 
-    if attention_file:
+    if attention_files:
         try:
-            st.session_state.attention_df = pd.read_csv(attention_file)
-            st.success("注意股名單已載入！")
+            dfs = []
+            for f in attention_files:
+                dfs.append(safe_read_exchange_csv(f))
+            if dfs:
+                st.session_state.attention_df = pd.concat(dfs, ignore_index=True)
+                st.success(f"成功合併 {len(attention_files)} 份注意股名單！")
         except Exception as e:
             st.error(f"注意股讀取失敗: {e}")
+
 
 # -------------------------
 # Main Content
@@ -653,7 +686,6 @@ if archive_len > 0:
     if "punish_df" in st.session_state and not st.session_state.punish_df.empty:
         p_df = st.session_state.punish_df
         if "證券代號" in p_df.columns:
-            # 轉字串比對，確保型別一致
             hit_p = p_df[p_df["證券代號"].astype(str) == target_num]
             if not hit_p.empty:
                 info = hit_p.iloc[0]
