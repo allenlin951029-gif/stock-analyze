@@ -2006,18 +2006,43 @@ def compute_decision_fields(
 
 
 def _download_yf(ticker: str, period: str, interval: str, max_retries: int = 3):
-    """Helper for threaded yf.download — serialised via _yf_lock with retry + backoff."""
+    """Helper for threaded yf.download — serialised via _yf_lock with retry + backoff.
+    Falls back to yf.Ticker().history() if yf.download() returns empty.
+    """
     for attempt in range(max_retries):
         with _yf_lock:
             try:
-                # [FIX] auto_adjust=True and ffill() to avoid missing data/unadjusted price bugs
+                # Primary method: yf.download()
                 df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
                 df = clean_yf_columns(_ensure_naive_index(df))
                 if not df.empty:
                     df = df.ffill().dropna(subset=["Close"])
-                # [OPT] Small delay between calls to avoid Yahoo rate limiting
+                    time.sleep(0.5)
+                    return df
+
+                # [FIX] Fallback 1: yf.Ticker().history() — sometimes works when download() doesn't
+                t = yf.Ticker(ticker)
+                df = t.history(period=period, interval=interval, auto_adjust=True)
+                df = clean_yf_columns(_ensure_naive_index(df))
+                if not df.empty:
+                    df = df.ffill().dropna(subset=["Close"])
+                    time.sleep(0.5)
+                    return df
+
+                # [FIX] Fallback 2: try shorter period (Yahoo sometimes rejects "2y" for certain tickers)
+                shorter = {"2y": "1y", "1y": "6mo", "6mo": "3mo"}
+                sp = shorter.get(period)
+                if sp:
+                    df = t.history(period=sp, interval=interval, auto_adjust=True)
+                    df = clean_yf_columns(_ensure_naive_index(df))
+                    if not df.empty:
+                        df = df.ffill().dropna(subset=["Close"])
+                        time.sleep(0.5)
+                        return df
+
                 time.sleep(0.5)
-                return df
+                return pd.DataFrame()
+
             except Exception as e:
                 is_rate_limit = (
                     (_YFRateLimitError is not None and isinstance(e, _YFRateLimitError))
@@ -2040,12 +2065,13 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     # -- download daily (sequential — yf.download is NOT thread-safe) --
     df_daily = _download_yf(yf_ticker, "2y", "1d")
 
+    # [FIX] Fallback: try .TWO (OTC) if .TW (TWSE) returns empty
     if df_daily.empty and yf_ticker.endswith(".TW"):
         yf_ticker = yf_ticker.replace(".TW", ".TWO")
         df_daily = _download_yf(yf_ticker, "2y", "1d")
 
     if df_daily.empty:
-        return {"error": f"not found: {stock_id}", "symbol": stock_id}
+        return {"error": f"not found: {stock_id} (tried {stock_no}.TW/.TWO with yf.download + Ticker.history — Yahoo may not have this ticker)", "symbol": stock_id}
 
     chosen_ts = _nearest_trading_ts(df_daily, as_of_date)
     if chosen_ts is None:
