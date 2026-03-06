@@ -103,116 +103,207 @@ _reg_cache: Dict[str, Any] = {
     "attention": set(),
     "disposition": set(),
     "ts": None,
+    "debug": [],       # Debug log for troubleshooting
 }
 _reg_cache_lock = threading.Lock()
 _REG_TTL_SECONDS = 600  # 10-minute TTL
 
 
-def _extract_stock_codes_from_text(text: str) -> set:
-    """Extract 4-digit Taiwan stock codes from raw text/CSV/HTML content."""
-    # Match 4-digit stock codes (possibly followed by a letter suffix for KY stocks etc.)
-    return set(re.findall(r'\b(\d{4}[A-Z]?)\b', text))
-
-
-def _fetch_twse_attention() -> set:
-    """Fetch TWSE (listed) attention list stock codes."""
+def _extract_stock_codes_from_json_rows(data: dict, code_col_idx: int = 0) -> set:
+    """Extract stock codes from TWSE/TPEx JSON 'data' field (array of arrays)."""
     codes = set()
-    sess = _get_session()
-    try:
-        # TWSE attention list CSV endpoint
-        url = "https://www.twse.com.tw/rwd/zh/announcement/notice?response=csv"
-        resp = sess.get(url, timeout=10)
-        resp.raise_for_status()
-        text = resp.text
-        codes |= _extract_stock_codes_from_text(text)
-    except Exception:
-        pass
+    rows = data.get("data", [])
+    if not rows:
+        # Also try "aaData" (some TWSE endpoints use this)
+        rows = data.get("aaData", [])
+    for row in rows:
+        if row and len(row) > code_col_idx:
+            cell = str(row[code_col_idx]).strip()
+            # Extract 4-6 digit stock code from the cell
+            m = re.search(r'(\d{4,6})', cell)
+            if m:
+                codes.add(m.group(1))
+    return codes
 
-    if not codes:
+
+def _extract_stock_codes_from_csv(text: str) -> set:
+    """Extract stock codes from first column of CSV text."""
+    codes = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('"說明') or line.startswith('說明'):
+            continue
+        parts = line.split(",")
+        if parts:
+            cell = parts[0].strip().strip('"').strip("=").strip('"')
+            m = re.match(r'^(\d{4,6}[A-Z]?)$', cell)
+            if m:
+                codes.add(m.group(1))
+    return codes
+
+
+def _try_fetch_json(sess, url, params=None, method="GET", debug_log=None) -> set:
+    """Try fetching JSON data from a URL, extract stock codes."""
+    label = f"{method} {url}"
+    try:
+        if method == "POST":
+            resp = sess.post(url, data=params or {}, timeout=12)
+        else:
+            resp = sess.get(url, params=params, timeout=12)
+        if debug_log is not None:
+            debug_log.append(f"  {label} => {resp.status_code} ({len(resp.text)} bytes)")
+        if resp.status_code != 200:
+            return set()
+        # Try JSON parse
         try:
-            # Fallback: JSON endpoint
-            url = "https://www.twse.com.tw/rwd/zh/announcement/notice?response=json"
-            resp = sess.get(url, timeout=10)
-            resp.raise_for_status()
             data = resp.json()
-            for row in data.get("data", []):
-                if row and len(row) > 0:
-                    codes |= _extract_stock_codes_from_text(str(row[0]))
+            codes = _extract_stock_codes_from_json_rows(data, 0)
+            if not codes:
+                codes = _extract_stock_codes_from_json_rows(data, 1)
+            if debug_log is not None and codes:
+                debug_log.append(f"    => found {len(codes)} codes (JSON)")
+            return codes
         except Exception:
             pass
+        # If not JSON, try CSV extraction
+        codes = _extract_stock_codes_from_csv(resp.text)
+        if debug_log is not None and codes:
+            debug_log.append(f"    => found {len(codes)} codes (CSV)")
+        return codes
+    except Exception as e:
+        if debug_log is not None:
+            debug_log.append(f"  {label} => ERROR: {type(e).__name__}: {e}")
+        return set()
+
+
+def _fetch_twse_attention(debug_log: list) -> set:
+    """Fetch TWSE (listed) attention list stock codes — multiple strategies."""
+    sess = _get_session()
+    today_str = datetime.now().strftime("%Y%m%d")
+    codes = set()
+
+    # Strategy 1: New RWD API (POST with form data)
+    codes |= _try_fetch_json(sess,
+        "https://www.twse.com.tw/rwd/zh/announcement/notice",
+        params={"response": "json", "date": "", "selectType": ""},
+        method="POST", debug_log=debug_log)
+    if codes:
+        return codes
+
+    # Strategy 2: New RWD API (GET)
+    codes |= _try_fetch_json(sess,
+        "https://www.twse.com.tw/rwd/zh/announcement/notice",
+        params={"response": "json"},
+        method="GET", debug_log=debug_log)
+    if codes:
+        return codes
+
+    # Strategy 3: Old API (GET with response=json)
+    codes |= _try_fetch_json(sess,
+        "https://www.twse.com.tw/announcement/notice",
+        params={"response": "json", "date": today_str},
+        method="GET", debug_log=debug_log)
+    if codes:
+        return codes
+
+    # Strategy 4: CSV download
+    codes |= _try_fetch_json(sess,
+        "https://www.twse.com.tw/rwd/zh/announcement/notice",
+        params={"response": "csv"},
+        method="GET", debug_log=debug_log)
+
     return codes
 
 
-def _fetch_twse_disposition() -> set:
-    """Fetch TWSE (listed) disposition list stock codes."""
-    codes = set()
+def _fetch_twse_disposition(debug_log: list) -> set:
+    """Fetch TWSE (listed) disposition list stock codes — multiple strategies."""
     sess = _get_session()
-    try:
-        url = "https://www.twse.com.tw/rwd/zh/announcement/punish?response=csv"
-        resp = sess.get(url, timeout=10)
-        resp.raise_for_status()
-        codes |= _extract_stock_codes_from_text(resp.text)
-    except Exception:
-        pass
+    today_str = datetime.now().strftime("%Y%m%d")
+    codes = set()
 
-    if not codes:
-        try:
-            url = "https://www.twse.com.tw/rwd/zh/announcement/punish?response=json"
-            resp = sess.get(url, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            for row in data.get("data", []):
-                if row and len(row) > 0:
-                    codes |= _extract_stock_codes_from_text(str(row[0]))
-        except Exception:
-            pass
+    codes |= _try_fetch_json(sess,
+        "https://www.twse.com.tw/rwd/zh/announcement/punish",
+        params={"response": "json", "date": "", "selectType": ""},
+        method="POST", debug_log=debug_log)
+    if codes:
+        return codes
+
+    codes |= _try_fetch_json(sess,
+        "https://www.twse.com.tw/rwd/zh/announcement/punish",
+        params={"response": "json"},
+        method="GET", debug_log=debug_log)
+    if codes:
+        return codes
+
+    codes |= _try_fetch_json(sess,
+        "https://www.twse.com.tw/announcement/punish",
+        params={"response": "json", "date": today_str},
+        method="GET", debug_log=debug_log)
+    if codes:
+        return codes
+
+    codes |= _try_fetch_json(sess,
+        "https://www.twse.com.tw/rwd/zh/announcement/punish",
+        params={"response": "csv"},
+        method="GET", debug_log=debug_log)
+
     return codes
 
 
-def _fetch_tpex_attention() -> set:
-    """Fetch TPEx (OTC) attention list stock codes."""
-    codes = set()
+def _fetch_tpex_attention(debug_log: list) -> set:
+    """Fetch TPEx (OTC) attention list stock codes — multiple strategies."""
     sess = _get_session()
-    try:
-        url = "https://www.tpex.org.tw/www/zh-tw/announce/attention"
-        resp = sess.get(url, timeout=10)
-        resp.raise_for_status()
-        codes |= _extract_stock_codes_from_text(resp.text)
-    except Exception:
-        pass
+    today_str = datetime.now().strftime("%Y/%m/%d")
+    codes = set()
 
-    if not codes:
-        try:
-            # Fallback: legacy CSV endpoint
-            url = "https://www.tpex.org.tw/web/stock/attention/attention_result.php?l=zh-tw"
-            resp = sess.get(url, timeout=10)
-            resp.raise_for_status()
-            codes |= _extract_stock_codes_from_text(resp.text)
-        except Exception:
-            pass
+    # Strategy 1: TPEx new API (POST)
+    codes |= _try_fetch_json(sess,
+        "https://www.tpex.org.tw/www/zh-tw/announce/attention",
+        params={"response": "json", "date": today_str},
+        method="POST", debug_log=debug_log)
+    if codes:
+        return codes
+
+    # Strategy 2: TPEx OpenAPI
+    codes |= _try_fetch_json(sess,
+        "https://www.tpex.org.tw/openapi/v1/announce_attention",
+        method="GET", debug_log=debug_log)
+    if codes:
+        return codes
+
+    # Strategy 3: Legacy
+    codes |= _try_fetch_json(sess,
+        "https://www.tpex.org.tw/web/stock/attention/attention_result.php",
+        params={"l": "zh-tw", "type": "csv"},
+        method="GET", debug_log=debug_log)
+
     return codes
 
 
-def _fetch_tpex_disposition() -> set:
-    """Fetch TPEx (OTC) disposition list stock codes."""
-    codes = set()
+def _fetch_tpex_disposition(debug_log: list) -> set:
+    """Fetch TPEx (OTC) disposition list stock codes — multiple strategies."""
     sess = _get_session()
-    try:
-        url = "https://www.tpex.org.tw/www/zh-tw/announce/disposal"
-        resp = sess.get(url, timeout=10)
-        resp.raise_for_status()
-        codes |= _extract_stock_codes_from_text(resp.text)
-    except Exception:
-        pass
+    today_str = datetime.now().strftime("%Y/%m/%d")
+    codes = set()
 
-    if not codes:
-        try:
-            url = "https://www.tpex.org.tw/web/stock/disposal/disposal_result.php?l=zh-tw"
-            resp = sess.get(url, timeout=10)
-            resp.raise_for_status()
-            codes |= _extract_stock_codes_from_text(resp.text)
-        except Exception:
-            pass
+    codes |= _try_fetch_json(sess,
+        "https://www.tpex.org.tw/www/zh-tw/announce/disposal",
+        params={"response": "json", "date": today_str},
+        method="POST", debug_log=debug_log)
+    if codes:
+        return codes
+
+    codes |= _try_fetch_json(sess,
+        "https://www.tpex.org.tw/openapi/v1/announce_disposal",
+        method="GET", debug_log=debug_log)
+    if codes:
+        return codes
+
+    codes |= _try_fetch_json(sess,
+        "https://www.tpex.org.tw/web/stock/disposal/disposal_result.php",
+        params={"l": "zh-tw", "type": "csv"},
+        method="GET", debug_log=debug_log)
+
     return codes
 
 
@@ -220,26 +311,41 @@ def _refresh_regulatory_cache() -> None:
     """Fetch all 4 lists in parallel, merge into cache."""
     attention = set()
     disposition = set()
+    debug_log = [f"[REG] Refresh started at {datetime.now().strftime('%H:%M:%S')}"]
+
+    # Each thread gets its own debug log to avoid race conditions
+    debug_twse_att = []
+    debug_tpex_att = []
+    debug_twse_dis = []
+    debug_tpex_dis = []
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        fut_att_twse = pool.submit(_fetch_twse_attention)
-        fut_att_tpex = pool.submit(_fetch_tpex_attention)
-        fut_dis_twse = pool.submit(_fetch_twse_disposition)
-        fut_dis_tpex = pool.submit(_fetch_tpex_disposition)
+        fut_att_twse = pool.submit(_fetch_twse_attention, debug_twse_att)
+        fut_att_tpex = pool.submit(_fetch_tpex_attention, debug_tpex_att)
+        fut_dis_twse = pool.submit(_fetch_twse_disposition, debug_twse_dis)
+        fut_dis_tpex = pool.submit(_fetch_tpex_disposition, debug_tpex_dis)
 
-        for fut, target in [
-            (fut_att_twse, attention), (fut_att_tpex, attention),
-            (fut_dis_twse, disposition), (fut_dis_tpex, disposition),
+        for fut, target, label, extra_log in [
+            (fut_att_twse, attention, "TWSE-ATT", debug_twse_att),
+            (fut_att_tpex, attention, "TPEX-ATT", debug_tpex_att),
+            (fut_dis_twse, disposition, "TWSE-DIS", debug_twse_dis),
+            (fut_dis_tpex, disposition, "TPEX-DIS", debug_tpex_dis),
         ]:
             try:
-                target |= fut.result(timeout=15)
-            except Exception:
-                pass
+                result = fut.result(timeout=20)
+                target |= result
+                debug_log.append(f"[{label}] => {len(result)} codes")
+                debug_log.extend(extra_log)
+            except Exception as e:
+                debug_log.append(f"[{label}] => FAILED: {e}")
+
+    debug_log.append(f"[REG] Total: attention={len(attention)}, disposition={len(disposition)}")
 
     with _reg_cache_lock:
         _reg_cache["attention"] = attention
         _reg_cache["disposition"] = disposition
         _reg_cache["ts"] = datetime.now()
+        _reg_cache["debug"] = debug_log
 
 
 def get_regulatory_status(stock_no: str) -> List[str]:
@@ -274,6 +380,12 @@ def get_regulatory_status(stock_no: str) -> List[str]:
     if stock_no in dis:
         tags.append("DISPOSITION")
     return tags
+
+
+def get_regulatory_debug() -> List[str]:
+    """Return debug log from last regulatory cache refresh."""
+    with _reg_cache_lock:
+        return list(_reg_cache.get("debug", []))
 
 
 def _get_session() -> requests.Session:
