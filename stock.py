@@ -95,6 +95,187 @@ def _get_cached_benchmark(ttl_seconds: int = _BENCH_TTL_SECONDS) -> pd.DataFrame
     return df
 
 
+# ===================================================================
+# 0c. REGULATORY STATUS CACHE — Attention / Disposition lists
+# ===================================================================
+
+_reg_cache: Dict[str, Any] = {
+    "attention": set(),
+    "disposition": set(),
+    "ts": None,
+}
+_reg_cache_lock = threading.Lock()
+_REG_TTL_SECONDS = 600  # 10-minute TTL
+
+
+def _extract_stock_codes_from_text(text: str) -> set:
+    """Extract 4-digit Taiwan stock codes from raw text/CSV/HTML content."""
+    # Match 4-digit stock codes (possibly followed by a letter suffix for KY stocks etc.)
+    return set(re.findall(r'\b(\d{4}[A-Z]?)\b', text))
+
+
+def _fetch_twse_attention() -> set:
+    """Fetch TWSE (listed) attention list stock codes."""
+    codes = set()
+    sess = _get_session()
+    try:
+        # TWSE attention list CSV endpoint
+        url = "https://www.twse.com.tw/rwd/zh/announcement/notice?response=csv"
+        resp = sess.get(url, timeout=10)
+        resp.raise_for_status()
+        text = resp.text
+        codes |= _extract_stock_codes_from_text(text)
+    except Exception:
+        pass
+
+    if not codes:
+        try:
+            # Fallback: JSON endpoint
+            url = "https://www.twse.com.tw/rwd/zh/announcement/notice?response=json"
+            resp = sess.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            for row in data.get("data", []):
+                if row and len(row) > 0:
+                    codes |= _extract_stock_codes_from_text(str(row[0]))
+        except Exception:
+            pass
+    return codes
+
+
+def _fetch_twse_disposition() -> set:
+    """Fetch TWSE (listed) disposition list stock codes."""
+    codes = set()
+    sess = _get_session()
+    try:
+        url = "https://www.twse.com.tw/rwd/zh/announcement/punish?response=csv"
+        resp = sess.get(url, timeout=10)
+        resp.raise_for_status()
+        codes |= _extract_stock_codes_from_text(resp.text)
+    except Exception:
+        pass
+
+    if not codes:
+        try:
+            url = "https://www.twse.com.tw/rwd/zh/announcement/punish?response=json"
+            resp = sess.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            for row in data.get("data", []):
+                if row and len(row) > 0:
+                    codes |= _extract_stock_codes_from_text(str(row[0]))
+        except Exception:
+            pass
+    return codes
+
+
+def _fetch_tpex_attention() -> set:
+    """Fetch TPEx (OTC) attention list stock codes."""
+    codes = set()
+    sess = _get_session()
+    try:
+        url = "https://www.tpex.org.tw/www/zh-tw/announce/attention"
+        resp = sess.get(url, timeout=10)
+        resp.raise_for_status()
+        codes |= _extract_stock_codes_from_text(resp.text)
+    except Exception:
+        pass
+
+    if not codes:
+        try:
+            # Fallback: legacy CSV endpoint
+            url = "https://www.tpex.org.tw/web/stock/attention/attention_result.php?l=zh-tw"
+            resp = sess.get(url, timeout=10)
+            resp.raise_for_status()
+            codes |= _extract_stock_codes_from_text(resp.text)
+        except Exception:
+            pass
+    return codes
+
+
+def _fetch_tpex_disposition() -> set:
+    """Fetch TPEx (OTC) disposition list stock codes."""
+    codes = set()
+    sess = _get_session()
+    try:
+        url = "https://www.tpex.org.tw/www/zh-tw/announce/disposal"
+        resp = sess.get(url, timeout=10)
+        resp.raise_for_status()
+        codes |= _extract_stock_codes_from_text(resp.text)
+    except Exception:
+        pass
+
+    if not codes:
+        try:
+            url = "https://www.tpex.org.tw/web/stock/disposal/disposal_result.php?l=zh-tw"
+            resp = sess.get(url, timeout=10)
+            resp.raise_for_status()
+            codes |= _extract_stock_codes_from_text(resp.text)
+        except Exception:
+            pass
+    return codes
+
+
+def _refresh_regulatory_cache() -> None:
+    """Fetch all 4 lists in parallel, merge into cache."""
+    attention = set()
+    disposition = set()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        fut_att_twse = pool.submit(_fetch_twse_attention)
+        fut_att_tpex = pool.submit(_fetch_tpex_attention)
+        fut_dis_twse = pool.submit(_fetch_twse_disposition)
+        fut_dis_tpex = pool.submit(_fetch_tpex_disposition)
+
+        for fut, target in [
+            (fut_att_twse, attention), (fut_att_tpex, attention),
+            (fut_dis_twse, disposition), (fut_dis_tpex, disposition),
+        ]:
+            try:
+                target |= fut.result(timeout=15)
+            except Exception:
+                pass
+
+    with _reg_cache_lock:
+        _reg_cache["attention"] = attention
+        _reg_cache["disposition"] = disposition
+        _reg_cache["ts"] = datetime.now()
+
+
+def get_regulatory_status(stock_no: str) -> List[str]:
+    """
+    Return status tags for a stock code (e.g. '2330').
+    Returns a subset of: ['ATTENTION', 'DISPOSITION'] or [].
+    Uses a cached copy of the official TWSE + TPEx lists.
+    """
+    stock_no = _strip_suffix(stock_no).strip().upper()
+    now = datetime.now()
+
+    # Check if cache needs refresh
+    with _reg_cache_lock:
+        needs_refresh = (
+            _reg_cache["ts"] is None
+            or (now - _reg_cache["ts"]).total_seconds() > _REG_TTL_SECONDS
+        )
+
+    if needs_refresh:
+        try:
+            _refresh_regulatory_cache()
+        except Exception:
+            pass  # Use stale cache on failure
+
+    with _reg_cache_lock:
+        att = _reg_cache["attention"]
+        dis = _reg_cache["disposition"]
+
+    tags = []
+    if stock_no in att:
+        tags.append("ATTENTION")
+    if stock_no in dis:
+        tags.append("DISPOSITION")
+    return tags
+
+
 def _get_session() -> requests.Session:
     """Return a module-level requests.Session with connection pooling."""
     global _http_session
@@ -2654,6 +2835,12 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
     rr = feat.get("risk_reward_ratio")
     feat["flag_poor_risk_reward"] = bool(rr is not None and rr < 1.0)
 
+    # --- Regulatory Status Tags (ATTENTION / DISPOSITION) ---
+    try:
+        feat["status_tags"] = get_regulatory_status(stock_no)
+    except Exception:
+        feat["status_tags"] = []
+
     # Data quality metadata (Item #19)
     # [P0-A] Data quality metadata — now includes external source reliability
     feat["data_quality"] = {
@@ -2694,6 +2881,10 @@ def format_text_report(feat: Dict[str, Any]) -> str:
     lines.append(SEP)
     lines.append("  {}  Technical Summary".format(feat["symbol"]))
     lines.append("  Data：{}  Query：{}".format(feat["price_date"], feat["query_date"]))
+    status_tags = feat.get("status_tags", [])
+    if status_tags:
+        tag_str = ", ".join(status_tags)
+        lines.append("  *** REGULATORY: {} ***".format(tag_str))
     lines.append(SEP)
 
     lines.append("  Close：{}  Trend：{}".format(feat["close"], feat["trend_state"]))
@@ -2786,6 +2977,7 @@ def _analyze_one_stock_for_sector(stock_id, as_of_date, mode):
             "Vol_R": feat.get("vol_ratio_5d", "-"),
             "KD": "{:.0f}/{:.0f}".format(feat.get("kd_k", 0) or 0, feat.get("kd_d", 0) or 0),
             "Score": score,
+            "Status": ",".join(feat.get("status_tags", [])) or "-",
         }
     except Exception:
         return {"Symbol": stock_id, "Trend": "Exception", "Score": -1}
@@ -2813,15 +3005,15 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
     lines.append(f"Sector Scan：{sector_name}")
     d_str = str(as_of_date) if as_of_date else "Today"
     lines.append(f"Date：{d_str}")
-    lines.append("-" * 35)
+    lines.append("-" * 50)
     lines.append(
-        "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format("Symbol", "Price", "Trend", "MA20Dev", "VolR", "KD",
-                                                              "Score"))
-    lines.append("-" * 35)
+        "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4} {:<12}".format(
+            "Symbol", "Price", "Trend", "MA20Dev", "VolR", "KD", "Score", "Status"))
+    lines.append("-" * 50)
 
     for r in results:
         lines.append(
-            "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format(
+            "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4} {:<12}".format(
                 str(r.get("Symbol", "")),
                 str(r.get("Close", "")),
                 str(r.get("Trend", "")),
@@ -2829,10 +3021,11 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
                 str(r.get("Vol_R", "")),
                 str(r.get("KD", "")),
                 str(r.get("Score", "")),
+                str(r.get("Status", "-")),
             )
         )
 
-    lines.append("-" * 35)
+    lines.append("-" * 50)
     lines.append("（Score：uptrend+2，price_up_vol_up+1，KD_golden+1，inst_consensus+2）")
 
     return "\n".join(lines)
@@ -2848,16 +3041,18 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
 def analyze_stock_technical(stock_id: str, as_of_date=None, mode: str = "human") -> dict:
     """
     Main entry point.
-    mode="human" => returns {"human_report": str}   (fast, no network calls)
-    mode="ai"    => returns {"ai_report": dict}     (full JSON with all data)
+    mode="human" => returns {"human_report": str, "status_tags": list}
+    mode="ai"    => returns {"ai_report": dict, "status_tags": list}
+    status_tags: e.g. ["ATTENTION"], ["DISPOSITION"], ["ATTENTION","DISPOSITION"], or []
     """
     feat = build_ai_features(stock_id, as_of_date, mode=mode)
+    tags = feat.get("status_tags", [])
 
     if mode == "ai":
-        return {"ai_report": feat}
+        return {"ai_report": feat, "status_tags": tags}
     else:
         text = format_text_report(feat)
-        return {"human_report": text}
+        return {"human_report": text, "status_tags": tags}
 
 
 if __name__ == "__main__":
