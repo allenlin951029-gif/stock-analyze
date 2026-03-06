@@ -98,211 +98,268 @@ def _get_cached_benchmark(ttl_seconds: int = _BENCH_TTL_SECONDS) -> pd.DataFrame
 # ===================================================================
 # 0c. REGULATORY STATUS CACHE — Attention / Disposition lists
 # ===================================================================
+# Supports:
+#   1. Auto-fetch from TWSE/TPEx (may fail from cloud hosting)
+#   2. Manual override via set_manual_regulatory_codes()
+# ===================================================================
 
 _reg_cache: Dict[str, Any] = {
     "attention": set(),
     "disposition": set(),
     "ts": None,
-    "debug": [],       # Debug log for troubleshooting
+    "debug": [],
+    "manual_attention": set(),   # Manual override
+    "manual_disposition": set(), # Manual override
 }
 _reg_cache_lock = threading.Lock()
 _REG_TTL_SECONDS = 600  # 10-minute TTL
 
 
-def _extract_stock_codes_from_json_rows(data: dict, code_col_idx: int = 0) -> set:
-    """Extract stock codes from TWSE/TPEx JSON 'data' field (array of arrays)."""
-    codes = set()
-    rows = data.get("data", [])
-    if not rows:
-        # Also try "aaData" (some TWSE endpoints use this)
-        rows = data.get("aaData", [])
-    for row in rows:
-        if row and len(row) > code_col_idx:
-            cell = str(row[code_col_idx]).strip()
-            # Extract 4-6 digit stock code from the cell
-            m = re.search(r'(\d{4,6})', cell)
-            if m:
-                codes.add(m.group(1))
-    return codes
+def set_manual_regulatory_codes(attention_codes: List[str] = None,
+                                 disposition_codes: List[str] = None) -> None:
+    """Manually set attention/disposition stock codes (called from app.py sidebar)."""
+    with _reg_cache_lock:
+        if attention_codes is not None:
+            _reg_cache["manual_attention"] = {
+                c.strip().upper() for c in attention_codes if c.strip()
+            }
+        if disposition_codes is not None:
+            _reg_cache["manual_disposition"] = {
+                c.strip().upper() for c in disposition_codes if c.strip()
+            }
 
 
-def _extract_stock_codes_from_csv(text: str) -> set:
-    """Extract stock codes from first column of CSV text."""
-    codes = set()
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith('"說明') or line.startswith('說明'):
-            continue
-        parts = line.split(",")
-        if parts:
-            cell = parts[0].strip().strip('"').strip("=").strip('"')
-            m = re.match(r'^(\d{4,6}[A-Z]?)$', cell)
-            if m:
-                codes.add(m.group(1))
-    return codes
+def _make_browser_session() -> requests.Session:
+    """Create a fresh session with realistic browser headers for TWSE/TPEx."""
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=5, pool_maxsize=10, max_retries=1
+    )
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
 
 
-def _try_fetch_json(sess, url, params=None, method="GET", debug_log=None) -> set:
-    """Try fetching JSON data from a URL, extract stock codes."""
+def _try_fetch(sess, url, params=None, method="GET", debug_log=None,
+               headers=None) -> tuple:
+    """Try fetching data from a URL. Returns (status_code, text, codes_found)."""
     label = f"{method} {url}"
     try:
+        kw = {"timeout": 15}
+        if headers:
+            kw["headers"] = headers
         if method == "POST":
-            resp = sess.post(url, data=params or {}, timeout=12)
+            resp = sess.post(url, data=params or {}, **kw)
         else:
-            resp = sess.get(url, params=params, timeout=12)
+            resp = sess.get(url, params=params, **kw)
+
+        status = resp.status_code
+        text = resp.text
+        text_len = len(text)
+
         if debug_log is not None:
-            debug_log.append(f"  {label} => {resp.status_code} ({len(resp.text)} bytes)")
-        if resp.status_code != 200:
-            return set()
-        # Try JSON parse
+            # Show first 200 chars of response for debugging
+            preview = text[:200].replace("\n", " ").strip()
+            debug_log.append(f"  {label} => {status} ({text_len}B)")
+            debug_log.append(f"    preview: {preview[:120]}...")
+
+        if status != 200:
+            return (status, text, set())
+
+        codes = set()
+
+        # Try JSON parse (TWSE returns {"stat":"OK", "data":[[...],...]})
         try:
             data = resp.json()
-            codes = _extract_stock_codes_from_json_rows(data, 0)
-            if not codes:
-                codes = _extract_stock_codes_from_json_rows(data, 1)
-            if debug_log is not None and codes:
-                debug_log.append(f"    => found {len(codes)} codes (JSON)")
-            return codes
-        except Exception:
+            # Log JSON keys for debugging
+            if debug_log is not None and isinstance(data, dict):
+                debug_log.append(f"    JSON keys: {list(data.keys())[:8]}")
+
+            # TWSE format: data is array of arrays
+            for key in ("data", "aaData", "tables"):
+                rows = data.get(key, [])
+                if not rows:
+                    continue
+                # If it's a list of lists
+                if isinstance(rows, list) and rows:
+                    if isinstance(rows[0], list):
+                        for row in rows:
+                            if row:
+                                cell = str(row[0]).strip()
+                                m = re.search(r'(\d{4,6})', cell)
+                                if m:
+                                    codes.add(m.group(1))
+                    elif isinstance(rows[0], dict):
+                        # List of dicts — look for code-like fields
+                        for row in rows:
+                            for k in ("stkno", "stock_id", "Code", "代號",
+                                      "證券代號", "SecuritiesCompanyCode"):
+                                if k in row:
+                                    m = re.search(r'(\d{4,6})', str(row[k]))
+                                    if m:
+                                        codes.add(m.group(1))
+                                    break
+
+            if codes and debug_log is not None:
+                debug_log.append(f"    => {len(codes)} codes from JSON")
+            return (status, text, codes)
+        except (ValueError, KeyError):
             pass
-        # If not JSON, try CSV extraction
-        codes = _extract_stock_codes_from_csv(resp.text)
-        if debug_log is not None and codes:
-            debug_log.append(f"    => found {len(codes)} codes (CSV)")
-        return codes
+
+        # Try CSV extraction (first column)
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",")
+            if parts:
+                cell = parts[0].strip().strip('"').strip("=").strip('"')
+                m = re.match(r'^(\d{4,6}[A-Z]?)$', cell)
+                if m:
+                    codes.add(m.group(1))
+
+        if codes and debug_log is not None:
+            debug_log.append(f"    => {len(codes)} codes from CSV")
+
+        # Try HTML table extraction as last resort (for pages that return HTML)
+        if not codes and "<table" in text.lower():
+            codes = set(re.findall(r'>\s*(\d{4})\s*<', text))
+            if codes and debug_log is not None:
+                debug_log.append(f"    => {len(codes)} codes from HTML table")
+
+        return (status, text, codes)
+
     except Exception as e:
         if debug_log is not None:
             debug_log.append(f"  {label} => ERROR: {type(e).__name__}: {e}")
-        return set()
+        return (0, "", set())
 
 
 def _fetch_twse_attention(debug_log: list) -> set:
-    """Fetch TWSE (listed) attention list stock codes — multiple strategies."""
-    sess = _get_session()
-    today_str = datetime.now().strftime("%Y%m%d")
+    """Fetch TWSE (listed) attention list stock codes."""
+    sess = _make_browser_session()
     codes = set()
 
-    # Strategy 1: New RWD API (POST with form data)
-    codes |= _try_fetch_json(sess,
+    # Strategy 1: Visit the HTML page first (get cookies), then POST for JSON
+    try:
+        sess.get("https://www.twse.com.tw/zh/announcement/notice.html", timeout=10)
+    except Exception:
+        pass
+
+    _, _, c = _try_fetch(sess,
         "https://www.twse.com.tw/rwd/zh/announcement/notice",
         params={"response": "json", "date": "", "selectType": ""},
         method="POST", debug_log=debug_log)
+    codes |= c
     if codes:
         return codes
 
-    # Strategy 2: New RWD API (GET)
-    codes |= _try_fetch_json(sess,
+    # Strategy 2: GET with Referer
+    _, _, c = _try_fetch(sess,
         "https://www.twse.com.tw/rwd/zh/announcement/notice",
         params={"response": "json"},
-        method="GET", debug_log=debug_log)
+        method="GET", debug_log=debug_log,
+        headers={"Referer": "https://www.twse.com.tw/zh/announcement/notice.html"})
+    codes |= c
     if codes:
         return codes
 
-    # Strategy 3: Old API (GET with response=json)
-    codes |= _try_fetch_json(sess,
-        "https://www.twse.com.tw/announcement/notice",
-        params={"response": "json", "date": today_str},
-        method="GET", debug_log=debug_log)
-    if codes:
-        return codes
-
-    # Strategy 4: CSV download
-    codes |= _try_fetch_json(sess,
+    # Strategy 3: CSV export
+    _, _, c = _try_fetch(sess,
         "https://www.twse.com.tw/rwd/zh/announcement/notice",
         params={"response": "csv"},
         method="GET", debug_log=debug_log)
+    codes |= c
 
     return codes
 
 
 def _fetch_twse_disposition(debug_log: list) -> set:
-    """Fetch TWSE (listed) disposition list stock codes — multiple strategies."""
-    sess = _get_session()
-    today_str = datetime.now().strftime("%Y%m%d")
+    """Fetch TWSE (listed) disposition list stock codes."""
+    sess = _make_browser_session()
     codes = set()
 
-    codes |= _try_fetch_json(sess,
+    try:
+        sess.get("https://www.twse.com.tw/zh/announcement/punish.html", timeout=10)
+    except Exception:
+        pass
+
+    _, _, c = _try_fetch(sess,
         "https://www.twse.com.tw/rwd/zh/announcement/punish",
         params={"response": "json", "date": "", "selectType": ""},
         method="POST", debug_log=debug_log)
+    codes |= c
     if codes:
         return codes
 
-    codes |= _try_fetch_json(sess,
+    _, _, c = _try_fetch(sess,
         "https://www.twse.com.tw/rwd/zh/announcement/punish",
         params={"response": "json"},
-        method="GET", debug_log=debug_log)
+        method="GET", debug_log=debug_log,
+        headers={"Referer": "https://www.twse.com.tw/zh/announcement/punish.html"})
+    codes |= c
     if codes:
         return codes
 
-    codes |= _try_fetch_json(sess,
-        "https://www.twse.com.tw/announcement/punish",
-        params={"response": "json", "date": today_str},
-        method="GET", debug_log=debug_log)
-    if codes:
-        return codes
-
-    codes |= _try_fetch_json(sess,
+    _, _, c = _try_fetch(sess,
         "https://www.twse.com.tw/rwd/zh/announcement/punish",
         params={"response": "csv"},
         method="GET", debug_log=debug_log)
+    codes |= c
 
     return codes
 
 
 def _fetch_tpex_attention(debug_log: list) -> set:
-    """Fetch TPEx (OTC) attention list stock codes — multiple strategies."""
-    sess = _get_session()
-    today_str = datetime.now().strftime("%Y/%m/%d")
+    """Fetch TPEx (OTC) attention list stock codes."""
+    sess = _make_browser_session()
     codes = set()
 
-    # Strategy 1: TPEx new API (POST)
-    codes |= _try_fetch_json(sess,
+    _, _, c = _try_fetch(sess,
         "https://www.tpex.org.tw/www/zh-tw/announce/attention",
-        params={"response": "json", "date": today_str},
+        params={"response": "json", "date": ""},
         method="POST", debug_log=debug_log)
+    codes |= c
     if codes:
         return codes
 
-    # Strategy 2: TPEx OpenAPI
-    codes |= _try_fetch_json(sess,
+    _, _, c = _try_fetch(sess,
         "https://www.tpex.org.tw/openapi/v1/announce_attention",
         method="GET", debug_log=debug_log)
-    if codes:
-        return codes
-
-    # Strategy 3: Legacy
-    codes |= _try_fetch_json(sess,
-        "https://www.tpex.org.tw/web/stock/attention/attention_result.php",
-        params={"l": "zh-tw", "type": "csv"},
-        method="GET", debug_log=debug_log)
+    codes |= c
 
     return codes
 
 
 def _fetch_tpex_disposition(debug_log: list) -> set:
-    """Fetch TPEx (OTC) disposition list stock codes — multiple strategies."""
-    sess = _get_session()
-    today_str = datetime.now().strftime("%Y/%m/%d")
+    """Fetch TPEx (OTC) disposition list stock codes."""
+    sess = _make_browser_session()
     codes = set()
 
-    codes |= _try_fetch_json(sess,
+    _, _, c = _try_fetch(sess,
         "https://www.tpex.org.tw/www/zh-tw/announce/disposal",
-        params={"response": "json", "date": today_str},
+        params={"response": "json", "date": ""},
         method="POST", debug_log=debug_log)
+    codes |= c
     if codes:
         return codes
 
-    codes |= _try_fetch_json(sess,
+    _, _, c = _try_fetch(sess,
         "https://www.tpex.org.tw/openapi/v1/announce_disposal",
         method="GET", debug_log=debug_log)
-    if codes:
-        return codes
-
-    codes |= _try_fetch_json(sess,
-        "https://www.tpex.org.tw/web/stock/disposal/disposal_result.php",
-        params={"l": "zh-tw", "type": "csv"},
-        method="GET", debug_log=debug_log)
+    codes |= c
 
     return codes
 
@@ -311,9 +368,8 @@ def _refresh_regulatory_cache() -> None:
     """Fetch all 4 lists in parallel, merge into cache."""
     attention = set()
     disposition = set()
-    debug_log = [f"[REG] Refresh started at {datetime.now().strftime('%H:%M:%S')}"]
+    debug_log = [f"[REG] Refresh at {datetime.now().strftime('%H:%M:%S')}"]
 
-    # Each thread gets its own debug log to avoid race conditions
     debug_twse_att = []
     debug_tpex_att = []
     debug_twse_dis = []
@@ -332,14 +388,14 @@ def _refresh_regulatory_cache() -> None:
             (fut_dis_tpex, disposition, "TPEX-DIS", debug_tpex_dis),
         ]:
             try:
-                result = fut.result(timeout=20)
+                result = fut.result(timeout=25)
                 target |= result
                 debug_log.append(f"[{label}] => {len(result)} codes")
                 debug_log.extend(extra_log)
             except Exception as e:
                 debug_log.append(f"[{label}] => FAILED: {e}")
 
-    debug_log.append(f"[REG] Total: attention={len(attention)}, disposition={len(disposition)}")
+    debug_log.append(f"[REG] Auto-fetch: att={len(attention)}, dis={len(disposition)}")
 
     with _reg_cache_lock:
         _reg_cache["attention"] = attention
@@ -351,13 +407,11 @@ def _refresh_regulatory_cache() -> None:
 def get_regulatory_status(stock_no: str) -> List[str]:
     """
     Return status tags for a stock code (e.g. '2330').
-    Returns a subset of: ['ATTENTION', 'DISPOSITION'] or [].
-    Uses a cached copy of the official TWSE + TPEx lists.
+    Merges auto-fetched + manual override codes.
     """
     stock_no = _strip_suffix(stock_no).strip().upper()
     now = datetime.now()
 
-    # Check if cache needs refresh
     with _reg_cache_lock:
         needs_refresh = (
             _reg_cache["ts"] is None
@@ -368,11 +422,11 @@ def get_regulatory_status(stock_no: str) -> List[str]:
         try:
             _refresh_regulatory_cache()
         except Exception:
-            pass  # Use stale cache on failure
+            pass
 
     with _reg_cache_lock:
-        att = _reg_cache["attention"]
-        dis = _reg_cache["disposition"]
+        att = _reg_cache["attention"] | _reg_cache["manual_attention"]
+        dis = _reg_cache["disposition"] | _reg_cache["manual_disposition"]
 
     tags = []
     if stock_no in att:
@@ -385,7 +439,16 @@ def get_regulatory_status(stock_no: str) -> List[str]:
 def get_regulatory_debug() -> List[str]:
     """Return debug log from last regulatory cache refresh."""
     with _reg_cache_lock:
-        return list(_reg_cache.get("debug", []))
+        lines = list(_reg_cache.get("debug", []))
+        m_att = _reg_cache.get("manual_attention", set())
+        m_dis = _reg_cache.get("manual_disposition", set())
+        if m_att or m_dis:
+            lines.append(f"[MANUAL] att={len(m_att)} dis={len(m_dis)}")
+            if m_att:
+                lines.append(f"  attention: {sorted(m_att)}")
+            if m_dis:
+                lines.append(f"  disposition: {sorted(m_dis)}")
+        return lines
 
 
 def _get_session() -> requests.Session:
