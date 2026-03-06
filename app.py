@@ -1,16 +1,18 @@
 import json
 import io
 import os
+import re
 from contextlib import redirect_stdout
 from datetime import datetime
 
+import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from streamlit_cookies_manager import EncryptedCookieManager
 from google.oauth2 import service_account
 from google.cloud import firestore
 
-# [span_0](start_span)確保 stock.py 位於同一目錄下[span_0](end_span)
+# 確保 stock.py 位於同一目錄下
 from stock import (
     analyze_stock_technical,
     analyze_sector_performance,
@@ -151,6 +153,12 @@ if "report_mode" not in st.session_state:
 # -------------------------
 # Helper Functions
 # -------------------------
+def extract_stock_number(sid: str) -> str:
+    """從 2330.TW 或 6531.TWO 中提取純數字代號"""
+    match = re.search(r'\d+', sid)
+    return match.group(0) if match else sid.strip().upper()
+
+
 def is_ai_mode():
     return st.session_state.report_mode == "ai"
 
@@ -200,7 +208,7 @@ def run_analysis(stock_id, as_of_date, write_history):
     current_mode = st.session_state.report_mode  # 'human' or 'ai'
 
     try:
-        # [span_1](start_span)呼叫 stock.py，傳入對應的 mode[span_1](end_span)
+        # 呼叫 stock.py，傳入對應的 mode
         # mode="human" -> 只回傳文字，速度快 (Quick Screen)
         # mode="ai"    -> 回傳完整 JSON，速度慢 (Deep Dive)
         raw_result = analyze_stock_technical(sid, as_of_date=as_of_date, mode=current_mode)
@@ -220,15 +228,11 @@ def run_analysis(stock_id, as_of_date, write_history):
             else:
                 final_result["human_report"] = "Deep Dive Analysis failed (no data)."
 
-        # Propagate regulatory status tags
-        final_result["status_tags"] = raw_result.get("status_tags", [])
-
     except Exception as e:
         err_msg = f"Error: {type(e).__name__}: {e}"
         final_result = {
             "human_report": err_msg,
             "ai_report": {"error": str(e)},
-            "status_tags": [],
         }
         st.session_state._last_debug = f"exception={type(e).__name__}"
 
@@ -242,7 +246,7 @@ def run_sector_analysis(sector_name, as_of_date, custom_list=None):
     """
     final_report = ""
     try:
-        # [span_2](start_span)Sector Scan 固定輸出文字列表 (Human mode)[span_2](end_span)
+        # Sector Scan 固定輸出文字列表 (Human mode)
         final_report = analyze_sector_performance(
             sector_name, as_of_date=as_of_date, custom_tickers=custom_list, mode="human"
         )
@@ -374,13 +378,6 @@ with st.sidebar:
         st.warning("No cloud DB")
 
     st.info("Use pagination below to browse results.")
-    # === 原本側邊欄的結尾 ===
-    if "firebase" in st.secrets:
-        st.success("Cloud DB connected")
-    else:
-        st.warning("No cloud DB")
-
-    st.info("")
 
     # ==========================================
     # 加入 AI 操盤手提示詞複製區
@@ -406,6 +403,29 @@ with st.sidebar:
 語氣要專業、果斷、像操盤手對老闆的精準匯報。請多用列點，並將股票代號、停損價位、盈虧比等關鍵字加粗。"""
 
     st.code(ai_prompt, language="text")
+
+    # ==========================================
+    # 加入處置/注意股上傳區塊
+    # ==========================================
+    st.divider()
+    st.subheader("📁 上傳處置/注意股清單")
+    punish_file = st.file_uploader("上傳處置股 CSV (punish.csv)", type=["csv"], key="punish_csv")
+    attention_file = st.file_uploader("上傳注意股 CSV (attention.csv)", type=["csv"], key="attention_csv")
+
+    if punish_file:
+        try:
+            st.session_state.punish_df = pd.read_csv(punish_file)
+            st.success("處置股名單已載入！")
+        except Exception as e:
+            st.error(f"處置股讀取失敗: {e}")
+
+    if attention_file:
+        try:
+            st.session_state.attention_df = pd.read_csv(attention_file)
+            st.success("注意股名單已載入！")
+        except Exception as e:
+            st.error(f"注意股讀取失敗: {e}")
+
 # -------------------------
 # Main Content
 # -------------------------
@@ -586,25 +606,6 @@ if archive_len > 0:
     mode_badge = "Deep Dive" if is_ai_mode() else "Quick Screen"
     badge_color = "#1a73e8" if is_ai_mode() else "#2e7d32"
 
-    # Regulatory status badges
-    reg_badges_html = ""
-    content_data = record.get("content", {})
-    if isinstance(content_data, dict):
-        status_tags = content_data.get("status_tags", [])
-        for tag in status_tags:
-            if tag == "ATTENTION":
-                reg_badges_html += (
-                    '<span style="background:#e65100;color:#fff;padding:2px 8px;border-radius:10px;'
-                    'font-size:0.75em;margin-left:6px;font-weight:bold;">'
-                    '\u26a0\ufe0f \u6ce8\u610f ATTENTION</span>'
-                )
-            elif tag == "DISPOSITION":
-                reg_badges_html += (
-                    '<span style="background:#b71c1c;color:#fff;padding:2px 8px;border-radius:10px;'
-                    'font-size:0.75em;margin-left:6px;font-weight:bold;">'
-                    '\u26d4 \u8655\u7f6e DISPOSITION</span>'
-                )
-
     st.markdown(
         f'<div style="text-align:center;background:#262730;padding:10px;border-radius:5px;'
         f'border:1px solid #464b5c;margin-bottom:10px;">'
@@ -612,7 +613,6 @@ if archive_len > 0:
         f'<span style="color:#ccc;font-size:0.9em;margin-left:10px;">({record["date"]})</span>'
         f'<span style="background:{badge_color};color:#fff;padding:2px 8px;border-radius:10px;'
         f'font-size:0.75em;margin-left:8px;">{mode_badge} View</span>'
-        f'{reg_badges_html}'
         f'<br><span style="font-size:0.8em;color:#aaa;">'
         f"{current_idx + 1} / {archive_len} ({record['created_at']})</span></div>",
         unsafe_allow_html=True,
@@ -643,6 +643,39 @@ if archive_len > 0:
     # 內容顯示邏輯
     content = record["content"]
     st.write("---")
+
+    # ==========================================
+    # 處置股與注意股攔截與顯示邏輯
+    # ==========================================
+    target_num = extract_stock_number(record["id"])
+
+    # 1. 檢查是否為處置股
+    if "punish_df" in st.session_state and not st.session_state.punish_df.empty:
+        p_df = st.session_state.punish_df
+        if "證券代號" in p_df.columns:
+            # 轉字串比對，確保型別一致
+            hit_p = p_df[p_df["證券代號"].astype(str) == target_num]
+            if not hit_p.empty:
+                info = hit_p.iloc[0]
+                st.error(f"🚨 **【處置股警告】 {info.get('證券名稱', '')} ({target_num})** 正在關禁閉！")
+                with st.expander("查看處置詳細資訊", expanded=True):
+                    st.markdown(f"**處置起迄時間**：{info.get('處置起迄時間', '無')}")
+                    st.markdown(f"**處置措施**：{info.get('處置措施', '無')}")
+                    st.markdown(f"**處置內容**：\n{info.get('處置內容', '無')}")
+                    st.markdown(f"**備註**：\n{info.get('備註', '無')}")
+
+    # 2. 檢查是否為注意股
+    if "attention_df" in st.session_state and not st.session_state.attention_df.empty:
+        a_df = st.session_state.attention_df
+        if "證券代號" in a_df.columns:
+            hit_a = a_df[a_df["證券代號"].astype(str) == target_num]
+            if not hit_a.empty:
+                info = hit_a.iloc[0]
+                st.warning(f"⚠️ **【注意股警告】 {info.get('證券名稱', '')} ({target_num})** 被交易所盯上了！")
+                with st.expander("查看注意交易資訊", expanded=False):
+                    st.markdown(f"**公告日期**：{info.get('公告日期', '無')}")
+                    st.markdown(f"**注意交易資訊**：\n{info.get('注意交易資訊', '無')}")
+    # ==========================================
 
     # 檢查內容是否為我們定義的標準格式 (包含 human_report 與 ai_report)
     if isinstance(content, dict) and "human_report" in content and "ai_report" in content:
