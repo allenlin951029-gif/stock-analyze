@@ -2287,17 +2287,41 @@ def compute_decision_fields(
 
 
 def _download_yf(ticker: str, period: str, interval: str):
-    """Helper for threaded yf.download — serialised via _yf_lock."""
-    with _yf_lock:
-        try:
-            # [FIX] auto_adjust=True and ffill() to avoid missing data/unadjusted price bugs
-            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-            df = clean_yf_columns(_ensure_naive_index(df))
-            if not df.empty:
-                df = df.ffill().dropna(subset=["Close"])
-            return df
-        except Exception:
-            return pd.DataFrame()
+    """Helper for threaded yf.download — serialised via _yf_lock.
+    Includes retry with backoff for rate-limit errors."""
+    import time as _time
+    max_retries = 3
+    for attempt in range(max_retries):
+        with _yf_lock:
+            try:
+                # Try with raise_errors=True (yfinance >= 0.2.31)
+                try:
+                    df = yf.download(
+                        ticker, period=period, interval=interval,
+                        progress=False, auto_adjust=True,
+                        raise_errors=True,
+                    )
+                except TypeError:
+                    # Older yfinance: raise_errors not supported
+                    df = yf.download(
+                        ticker, period=period, interval=interval,
+                        progress=False, auto_adjust=True,
+                    )
+                df = clean_yf_columns(_ensure_naive_index(df))
+                if not df.empty:
+                    df = df.ffill().dropna(subset=["Close"])
+                return df
+            except Exception as e:
+                err_str = str(e).lower()
+                is_rate_limit = ("rate" in err_str or "too many" in err_str
+                                 or "429" in err_str or "ratelimit" in err_str)
+                if is_rate_limit and attempt < max_retries - 1:
+                    pass  # will retry after sleep below
+                else:
+                    return pd.DataFrame()
+        # Sleep OUTSIDE the lock so other threads aren't blocked
+        _time.sleep(2 ** attempt + 1)  # 2s, 3s, 5s
+    return pd.DataFrame()
 
 
 def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[str, Any]:
@@ -2313,15 +2337,15 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
         df_daily = _download_yf(yf_ticker, "2y", "1d")
 
     if df_daily.empty:
-        return {"error": f"not found: {stock_id}", "symbol": stock_id}
+        return {"error": f"not found: {stock_id}", "symbol": stock_id, "status_tags": get_regulatory_status(stock_no)}
 
     chosen_ts = _nearest_trading_ts(df_daily, as_of_date)
     if chosen_ts is None:
-        return {"error": "no data before date", "symbol": stock_id}
+        return {"error": "no data before date", "symbol": stock_id, "status_tags": get_regulatory_status(stock_no)}
 
     df = df_daily.loc[:chosen_ts].copy()
     if len(df) < 60:
-        return {"error": "less than 60 days data", "symbol": stock_id}
+        return {"error": "less than 60 days data", "symbol": stock_id, "status_tags": get_regulatory_status(stock_no)}
 
     latest = df.iloc[-1]
     trade_date = chosen_ts.date()
@@ -2970,6 +2994,12 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
             },
             "institutional": {
                 "available": feat.get("inst_data_available", False),
+            },
+            "regulatory": {
+                "tags": feat.get("status_tags", []),
+                "cache_populated": bool(_reg_cache.get("ts")),
+                "attention_count": len(_reg_cache.get("attention", set())),
+                "disposition_count": len(_reg_cache.get("disposition", set())),
             },
         }
 
