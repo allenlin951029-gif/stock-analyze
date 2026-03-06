@@ -8,6 +8,7 @@ import io
 import json
 import math
 import re
+import time
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +19,12 @@ import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
+
+# [FIX] Import yfinance-specific rate limit error for explicit handling
+try:
+    from yfinance.exceptions import YFRateLimitError as _YFRateLimitError
+except ImportError:
+    _YFRateLimitError = None
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -1738,12 +1745,7 @@ def compute_tdcc_features(tdcc_data: Dict) -> Dict[str, Any]:
 
 def calc_relative_strength(stock_df, benchmark_ticker="0050.TW", period=20):
     try:
-        with _yf_lock:
-            # [FIX] auto_adjust=True and ffill() to avoid missing data/unadjusted price bugs
-            bench = yf.download(benchmark_ticker, period="3mo", progress=False, auto_adjust=True)
-            bench = clean_yf_columns(_ensure_naive_index(bench))
-            if not bench.empty:
-                bench = bench.ffill().dropna(subset=["Close"])
+        bench = _download_yf(benchmark_ticker, "3mo", "1d")
 
         if bench.empty or len(stock_df) < period:
             return None
@@ -2003,18 +2005,31 @@ def compute_decision_fields(
 # ===================================================================
 
 
-def _download_yf(ticker: str, period: str, interval: str):
-    """Helper for threaded yf.download — serialised via _yf_lock."""
-    with _yf_lock:
-        try:
-            # [FIX] auto_adjust=True and ffill() to avoid missing data/unadjusted price bugs
-            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-            df = clean_yf_columns(_ensure_naive_index(df))
-            if not df.empty:
-                df = df.ffill().dropna(subset=["Close"])
-            return df
-        except Exception:
-            return pd.DataFrame()
+def _download_yf(ticker: str, period: str, interval: str, max_retries: int = 3):
+    """Helper for threaded yf.download — serialised via _yf_lock with retry + backoff."""
+    for attempt in range(max_retries):
+        with _yf_lock:
+            try:
+                # [FIX] auto_adjust=True and ffill() to avoid missing data/unadjusted price bugs
+                df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+                df = clean_yf_columns(_ensure_naive_index(df))
+                if not df.empty:
+                    df = df.ffill().dropna(subset=["Close"])
+                # [OPT] Small delay between calls to avoid Yahoo rate limiting
+                time.sleep(0.5)
+                return df
+            except Exception as e:
+                is_rate_limit = (
+                    (_YFRateLimitError is not None and isinstance(e, _YFRateLimitError))
+                    or any(kw in str(e).lower() for kw in ("rate", "too many", "429"))
+                )
+                if is_rate_limit and attempt < max_retries - 1:
+                    wait = 2 ** attempt + 1  # 2s, 3s, 5s
+                    time.sleep(wait)
+                    continue
+                # Non-rate-limit error or final attempt — return empty
+                return pd.DataFrame()
+    return pd.DataFrame()
 
 
 def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[str, Any]:
@@ -2831,8 +2846,9 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
         return f"No stocks in sector {sector_name}."
 
     # [OPT] Parallel analysis of all stocks in sector
+    # [FIX] Reduced max_workers to 3 to avoid Yahoo Finance rate limiting
     results = []
-    with ThreadPoolExecutor(max_workers=min(len(target_list), 5)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(target_list), 3)) as pool:
         futures = {
             pool.submit(_analyze_one_stock_for_sector, sid, as_of_date, mode): sid
             for sid in target_list
