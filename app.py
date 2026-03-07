@@ -309,6 +309,10 @@ def process_and_save_upload(file, category, list_type, source_label):
 
     reg = st.session_state.regulatory_data
     
+    # 🌟 新增保護機制：預防舊的 session_state 缺少 metadata 導致 KeyError
+    if "metadata" not in reg:
+        reg["metadata"] = {}
+
     if list_type == "attention":
         reg[category] = list(codes)
     else:
