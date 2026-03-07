@@ -1,18 +1,17 @@
 import json
 import io
 import os
-import re
+import csv
 from contextlib import redirect_stdout
 from datetime import datetime
 
-import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from streamlit_cookies_manager import EncryptedCookieManager
 from google.oauth2 import service_account
 from google.cloud import firestore
 
-# 確保 stock.py 位於同一目錄下
+# [span_0](start_span)確保 stock.py 位於同一目錄下[span_0](end_span)
 from stock import (
     analyze_stock_technical,
     analyze_sector_performance,
@@ -148,47 +147,152 @@ if "sector_as_of_date" not in st.session_state:
     st.session_state.sector_as_of_date = datetime.now().date()
 if "report_mode" not in st.session_state:
     st.session_state.report_mode = "human"
+if "regulatory_data" not in st.session_state:
+    st.session_state.regulatory_data = {
+        "attention_stocks": set(),
+        "disposition_stocks": {},
+    }
+if "regulatory_upload_info" not in st.session_state:
+    st.session_state.regulatory_upload_info = {
+        "twse_attention": None,
+        "tpex_attention": None,
+        "twse_disposition": None,
+        "tpex_disposition": None,
+    }
+
+
+# -------------------------
+# CSV Parsing for Regulatory Lists
+# -------------------------
+def _detect_encoding(raw_bytes):
+    """Try common TW encodings."""
+    for enc in ("utf-8-sig", "utf-8", "big5", "cp950"):
+        try:
+            raw_bytes.decode(enc)
+            return enc
+        except (UnicodeDecodeError, ValueError):
+            continue
+    return "big5"
+
+
+def _find_header_row(rows):
+    """Return (header_row_index, headers) by looking for '證券代號'."""
+    for i, row in enumerate(rows):
+        for cell in row:
+            if "證券代號" in str(cell):
+                return i, row
+    return None, None
+
+
+def _parse_regulatory_csv(uploaded_file, list_type):
+    """
+    Parse a regulatory CSV into structured data.
+    list_type: "attention" or "disposition"
+    Returns: (stock_codes_set, disposition_details_dict, count, error_msg)
+    """
+    try:
+        raw = uploaded_file.read()
+        enc = _detect_encoding(raw)
+        text = raw.decode(enc, errors="replace")
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+
+        hdr_idx, headers = _find_header_row(rows)
+        if hdr_idx is None:
+            return set(), {}, 0, "無法找到欄位標頭 (需包含「證券代號」)"
+
+        # Build column index mapping
+        col_map = {}
+        for ci, h in enumerate(headers):
+            h_clean = h.strip()
+            col_map[h_clean] = ci
+
+        code_col = col_map.get("證券代號")
+        if code_col is None:
+            return set(), {}, 0, "找不到「證券代號」欄位"
+
+        codes = set()
+        details = {}
+
+        for row in rows[hdr_idx + 1:]:
+            if len(row) <= code_col:
+                continue
+            stock_code = row[code_col].strip()
+            if not stock_code or not any(c.isdigit() for c in stock_code):
+                continue
+
+            codes.add(stock_code)
+
+            if list_type == "disposition":
+                # Extract disposition detail fields
+                measure = ""
+                content = ""
+                remarks = ""
+                period = ""
+
+                # TWSE format: 處置措施, 處置內容, 備註, 處置起迄時間
+                # TPEx format: 處置原因, 處置內容, 處置起訖時間
+                for key in ("處置措施", "處置原因"):
+                    if key in col_map and len(row) > col_map[key]:
+                        measure = row[col_map[key]].strip()
+                        if measure:
+                            break
+
+                if "處置內容" in col_map and len(row) > col_map["處置內容"]:
+                    content = row[col_map["處置內容"]].strip()
+
+                for key in ("備註",):
+                    if key in col_map and len(row) > col_map[key]:
+                        remarks = row[col_map[key]].strip()
+
+                for key in ("處置起迄時間", "處置起訖時間"):
+                    if key in col_map and len(row) > col_map[key]:
+                        period = row[col_map[key]].strip()
+                        if period:
+                            break
+
+                # Keep only the latest entry per stock code
+                if stock_code not in details:
+                    details[stock_code] = {
+                        "measure": measure,
+                        "content": content,
+                        "remarks": remarks,
+                        "period": period,
+                    }
+
+        return codes, details, len(codes), None
+    except Exception as e:
+        return set(), {}, 0, f"解析錯誤: {e}"
+
+
+def rebuild_regulatory_data():
+    """Rebuild the merged regulatory_data from all uploads."""
+    info = st.session_state.regulatory_upload_info
+    all_attention = set()
+    all_disposition = {}
+
+    for key in ("twse_attention", "tpex_attention"):
+        data = info.get(key)
+        if data and "codes" in data:
+            all_attention.update(data["codes"])
+
+    for key, source_label in (("twse_disposition", "TWSE"), ("tpex_disposition", "TPEx")):
+        data = info.get(key)
+        if data and "details" in data:
+            for code, detail in data["details"].items():
+                detail_with_source = dict(detail, source=source_label)
+                if code not in all_disposition:
+                    all_disposition[code] = detail_with_source
+
+    st.session_state.regulatory_data = {
+        "attention_stocks": all_attention,
+        "disposition_stocks": all_disposition,
+    }
 
 
 # -------------------------
 # Helper Functions
 # -------------------------
-def extract_stock_number(sid: str) -> str:
-    """從 2330.TW 或 6531.TWO 中提取純數字代號"""
-    match = re.search(r'\d+', sid)
-    return match.group(0) if match else sid.strip().upper()
-
-
-def safe_read_exchange_csv(uploaded_file):
-    """專門處理台灣證交所/櫃買中心包含多餘表頭與表尾的 CSV 檔案"""
-    # 台灣官方 CSV 有時是 UTF-8 有時是 Big5 (cp950)，先嘗試解碼
-    try:
-        content = uploaded_file.getvalue().decode('utf-8-sig')
-    except UnicodeDecodeError:
-        content = uploaded_file.getvalue().decode('cp950', errors='replace')
-        
-    lines = content.splitlines()
-    
-    # 自動尋找真正的表頭列 (包含 '證券代號' 的那一行)
-    header_idx = 0
-    for i, line in enumerate(lines):
-        if "證券代號" in line:
-            header_idx = i
-            break
-            
-    # 將表頭開始的內容交給 Pandas 處理
-    data_str = "\n".join(lines[header_idx:])
-    df = pd.read_csv(io.StringIO(data_str))
-    
-    # 清理資料：確保代號是乾淨的字串，並濾掉表尾的「總累計次數」等廢話
-    if "證券代號" in df.columns:
-        df["證券代號"] = df["證券代號"].astype(str).str.replace('=', '').str.replace('"', '').str.strip()
-        # 只保留證券代號開頭是數字的資料列
-        df = df[df["證券代號"].str.match(r'^\d+')]
-        
-    return df
-
-
 def is_ai_mode():
     return st.session_state.report_mode == "ai"
 
@@ -238,8 +342,13 @@ def run_analysis(stock_id, as_of_date, write_history):
     current_mode = st.session_state.report_mode  # 'human' or 'ai'
 
     try:
-        # 呼叫 stock.py，傳入對應的 mode
-        raw_result = analyze_stock_technical(sid, as_of_date=as_of_date, mode=current_mode)
+        # [span_1](start_span)呼叫 stock.py，傳入對應的 mode[span_1](end_span)
+        # mode="human" -> 只回傳文字，速度快 (Quick Screen)
+        # mode="ai"    -> 回傳完整 JSON，速度慢 (Deep Dive)
+        raw_result = analyze_stock_technical(
+            sid, as_of_date=as_of_date, mode=current_mode,
+            regulatory_data=st.session_state.get("regulatory_data")
+        )
 
         if current_mode == "human":
             # Quick Screen 模式：省時間，不產生 AI 數據
@@ -274,8 +383,10 @@ def run_sector_analysis(sector_name, as_of_date, custom_list=None):
     """
     final_report = ""
     try:
+        # [span_2](start_span)Sector Scan 固定輸出文字列表 (Human mode)[span_2](end_span)
         final_report = analyze_sector_performance(
-            sector_name, as_of_date=as_of_date, custom_tickers=custom_list, mode="human"
+            sector_name, as_of_date=as_of_date, custom_tickers=custom_list, mode="human",
+            regulatory_data=st.session_state.get("regulatory_data")
         )
     except Exception as e:
         final_report = f"Sector analysis failed: {e}"
@@ -291,13 +402,15 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
         save_to_archive(f"Full: {sector_name}", as_of_date, "No stocks.")
         return
 
-    mode = st.session_state.report_mode
+    mode = st.session_state.report_mode  # 'human' or 'ai'
 
     if mode == "ai":  # Deep Dive
         all_reports = {}
         for stock in target_list:
             try:
-                res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="ai")
+                # 強制跑 AI 模式收集數據
+                res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="ai",
+                                              regulatory_data=st.session_state.get("regulatory_data"))
                 if isinstance(res, dict):
                     all_reports[stock] = res.get("ai_report", {})
                 else:
@@ -325,7 +438,9 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
 
         for stock in target_list:
             try:
-                res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="human")
+                # 跑 Human 模式 (快)
+                res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="human",
+                                              regulatory_data=st.session_state.get("regulatory_data"))
                 if isinstance(res, dict):
                     full_content.append(res.get("human_report", str(res)))
                 else:
@@ -338,6 +453,7 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
                 full_content.append("-" * 60)
 
         combined_report = "\n".join(full_content)
+        # 這裡因為是純文字合併，結構稍微不同，為了統一 UI 顯示，我們包裝一下
         final_struct = {
             "human_report": combined_report,
             "ai_report": None
@@ -353,6 +469,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("#### Report Mode")
 
+    # 邏輯映射：Quick Screen -> Human mode, Deep Dive -> AI mode
     idx = 0 if st.session_state.report_mode == "human" else 1
     mode_choice = st.radio(
         "Select output mode:",
@@ -361,6 +478,7 @@ with st.sidebar:
         key="report_mode_radio",
         help="Quick Screen: Fast, text summary.\nDeep Dive: Slow, full JSON with all indicators.",
     )
+    # 更新 session state
     st.session_state.report_mode = "human" if mode_choice == "Quick Screen" else "ai"
 
     if is_ai_mode():
@@ -400,6 +518,24 @@ with st.sidebar:
         st.warning("No cloud DB")
 
     st.info("Use pagination below to browse results.")
+    # === 原本側邊欄的結尾 ===
+    if "firebase" in st.secrets:
+        st.success("Cloud DB connected")
+    else:
+        st.warning("No cloud DB")
+
+    st.info("")
+
+    # Regulatory list status
+    _reg_attn = len(st.session_state.regulatory_data.get("attention_stocks", set()))
+    _reg_disp = len(st.session_state.regulatory_data.get("disposition_stocks", {}))
+    if _reg_attn or _reg_disp:
+        st.divider()
+        st.subheader("Regulatory Lists")
+        st.caption(f"Attention: {_reg_attn} | Disposition: {_reg_disp}")
+    else:
+        st.divider()
+        st.caption("No regulatory lists loaded")
 
     # ==========================================
     # 加入 AI 操盤手提示詞複製區
@@ -425,44 +561,10 @@ with st.sidebar:
 語氣要專業、果斷、像操盤手對老闆的精準匯報。請多用列點，並將股票代號、停損價位、盈虧比等關鍵字加粗。"""
 
     st.code(ai_prompt, language="text")
-
-    # ==========================================
-    # 加入處置/注意股上傳區塊 (支援多檔案：上市+上櫃)
-    # ==========================================
-    st.divider()
-    st.subheader("📁 上傳處置/注意股清單")
-    st.caption("💡 可同時全選並拖曳「上市」與「上櫃」的檔案")
-
-    punish_files = st.file_uploader("上傳處置股 CSV", type=["csv"], key="punish_csv", accept_multiple_files=True)
-    attention_files = st.file_uploader("上傳注意股 CSV", type=["csv"], key="attention_csv", accept_multiple_files=True)
-
-    if punish_files:
-        try:
-            dfs = []
-            for f in punish_files:
-                dfs.append(safe_read_exchange_csv(f))
-            if dfs:
-                st.session_state.punish_df = pd.concat(dfs, ignore_index=True)
-                st.success(f"成功合併 {len(punish_files)} 份處置股名單！")
-        except Exception as e:
-            st.error(f"處置股讀取失敗: {e}")
-
-    if attention_files:
-        try:
-            dfs = []
-            for f in attention_files:
-                dfs.append(safe_read_exchange_csv(f))
-            if dfs:
-                st.session_state.attention_df = pd.concat(dfs, ignore_index=True)
-                st.success(f"成功合併 {len(attention_files)} 份注意股名單！")
-        except Exception as e:
-            st.error(f"注意股讀取失敗: {e}")
-
-
 # -------------------------
 # Main Content
 # -------------------------
-tab1, tab2, tab3 = st.tabs(["Stock Analysis", "Sector Analysis", "Custom Sectors"])
+tab1, tab2, tab3, tab4 = st.tabs(["Stock Analysis", "Sector Analysis", "Custom Sectors", "Regulatory Lists"])
 
 # --- Tab 1: Stock Analysis ---
 with tab1:
@@ -610,6 +712,158 @@ with tab3:
                     save_sectors_to_db(st.session_state.custom_sectors)
                     st.rerun()
 
+# --- Tab 4: Regulatory Lists ---
+with tab4:
+    st.header("Regulatory Lists (Attention / Disposition)")
+    st.caption(
+        "Upload CSV files downloaded from TWSE or TPEx. "
+        "Stocks on these lists will be flagged during analysis."
+    )
+
+    # --- Current status summary ---
+    reg = st.session_state.regulatory_data
+    attn_count = len(reg.get("attention_stocks", set()))
+    disp_count = len(reg.get("disposition_stocks", {}))
+    both_count = len(reg.get("attention_stocks", set()) & set(reg.get("disposition_stocks", {}).keys()))
+
+    if attn_count or disp_count:
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Attention", attn_count)
+        sc2.metric("Disposition", disp_count)
+        sc3.metric("Both", both_count)
+    else:
+        st.info("No regulatory lists loaded. Upload CSVs below.")
+
+    st.markdown("---")
+
+    # --- Attention uploads ---
+    st.subheader("Attention List (注意股)")
+    att_c1, att_c2 = st.columns(2)
+
+    with att_c1:
+        with st.container(border=True):
+            st.markdown("**TWSE Attention**")
+            twse_att_file = st.file_uploader(
+                "Upload TWSE Attention CSV", type=["csv"],
+                key="upload_twse_attention"
+            )
+            info_ta = st.session_state.regulatory_upload_info.get("twse_attention")
+            if info_ta:
+                st.success(f"Loaded: {info_ta['count']} stocks  ({info_ta['filename']})")
+            if twse_att_file is not None:
+                codes, _, count, err = _parse_regulatory_csv(twse_att_file, "attention")
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.regulatory_upload_info["twse_attention"] = {
+                        "codes": codes, "count": count,
+                        "filename": twse_att_file.name,
+                    }
+                    rebuild_regulatory_data()
+                    st.success(f"Parsed {count} stocks")
+                    st.rerun()
+
+    with att_c2:
+        with st.container(border=True):
+            st.markdown("**TPEx Attention**")
+            tpex_att_file = st.file_uploader(
+                "Upload TPEx Attention CSV", type=["csv"],
+                key="upload_tpex_attention"
+            )
+            info_pa = st.session_state.regulatory_upload_info.get("tpex_attention")
+            if info_pa:
+                st.success(f"Loaded: {info_pa['count']} stocks  ({info_pa['filename']})")
+            if tpex_att_file is not None:
+                codes, _, count, err = _parse_regulatory_csv(tpex_att_file, "attention")
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.regulatory_upload_info["tpex_attention"] = {
+                        "codes": codes, "count": count,
+                        "filename": tpex_att_file.name,
+                    }
+                    rebuild_regulatory_data()
+                    st.success(f"Parsed {count} stocks")
+                    st.rerun()
+
+    st.markdown("---")
+
+    # --- Disposition uploads ---
+    st.subheader("Disposition List (處置股)")
+    disp_c1, disp_c2 = st.columns(2)
+
+    with disp_c1:
+        with st.container(border=True):
+            st.markdown("**TWSE Disposition**")
+            twse_disp_file = st.file_uploader(
+                "Upload TWSE Disposition CSV", type=["csv"],
+                key="upload_twse_disposition"
+            )
+            info_td = st.session_state.regulatory_upload_info.get("twse_disposition")
+            if info_td:
+                st.success(f"Loaded: {info_td['count']} stocks  ({info_td['filename']})")
+            if twse_disp_file is not None:
+                codes, details, count, err = _parse_regulatory_csv(twse_disp_file, "disposition")
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.regulatory_upload_info["twse_disposition"] = {
+                        "codes": codes, "details": details, "count": count,
+                        "filename": twse_disp_file.name,
+                    }
+                    rebuild_regulatory_data()
+                    st.success(f"Parsed {count} stocks")
+                    st.rerun()
+
+    with disp_c2:
+        with st.container(border=True):
+            st.markdown("**TPEx Disposition**")
+            tpex_disp_file = st.file_uploader(
+                "Upload TPEx Disposition CSV", type=["csv"],
+                key="upload_tpex_disposition"
+            )
+            info_pd = st.session_state.regulatory_upload_info.get("tpex_disposition")
+            if info_pd:
+                st.success(f"Loaded: {info_pd['count']} stocks  ({info_pd['filename']})")
+            if tpex_disp_file is not None:
+                codes, details, count, err = _parse_regulatory_csv(tpex_disp_file, "disposition")
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.regulatory_upload_info["tpex_disposition"] = {
+                        "codes": codes, "details": details, "count": count,
+                        "filename": tpex_disp_file.name,
+                    }
+                    rebuild_regulatory_data()
+                    st.success(f"Parsed {count} stocks")
+                    st.rerun()
+
+    st.markdown("---")
+
+    # --- Loaded stock codes detail ---
+    if attn_count or disp_count:
+        with st.expander("View loaded stock codes", expanded=False):
+            if attn_count:
+                attn_sorted = sorted(reg["attention_stocks"])
+                st.markdown(f"**Attention ({attn_count})**: {', '.join(attn_sorted)}")
+            if disp_count:
+                disp_sorted = sorted(reg["disposition_stocks"].keys())
+                st.markdown(f"**Disposition ({disp_count})**: {', '.join(disp_sorted)}")
+
+        # Clear all button
+        if st.button("Clear all regulatory data", type="primary"):
+            st.session_state.regulatory_data = {
+                "attention_stocks": set(),
+                "disposition_stocks": {},
+            }
+            st.session_state.regulatory_upload_info = {
+                "twse_attention": None,
+                "tpex_attention": None,
+                "twse_disposition": None,
+                "tpex_disposition": None,
+            }
+            st.rerun()
+
 # -------------------------
 # Auto Refresh Logic
 # -------------------------
@@ -676,38 +930,6 @@ if archive_len > 0:
     # 內容顯示邏輯
     content = record["content"]
     st.write("---")
-
-    # ==========================================
-    # 處置股與注意股攔截與顯示邏輯
-    # ==========================================
-    target_num = extract_stock_number(record["id"])
-
-    # 1. 檢查是否為處置股
-    if "punish_df" in st.session_state and not st.session_state.punish_df.empty:
-        p_df = st.session_state.punish_df
-        if "證券代號" in p_df.columns:
-            hit_p = p_df[p_df["證券代號"].astype(str) == target_num]
-            if not hit_p.empty:
-                info = hit_p.iloc[0]
-                st.error(f"🚨 **【處置股警告】 {info.get('證券名稱', '')} ({target_num})** 正在關禁閉！")
-                with st.expander("查看處置詳細資訊", expanded=True):
-                    st.markdown(f"**處置起迄時間**：{info.get('處置起迄時間', '無')}")
-                    st.markdown(f"**處置措施**：{info.get('處置措施', '無')}")
-                    st.markdown(f"**處置內容**：\n{info.get('處置內容', '無')}")
-                    st.markdown(f"**備註**：\n{info.get('備註', '無')}")
-
-    # 2. 檢查是否為注意股
-    if "attention_df" in st.session_state and not st.session_state.attention_df.empty:
-        a_df = st.session_state.attention_df
-        if "證券代號" in a_df.columns:
-            hit_a = a_df[a_df["證券代號"].astype(str) == target_num]
-            if not hit_a.empty:
-                info = hit_a.iloc[0]
-                st.warning(f"⚠️ **【注意股警告】 {info.get('證券名稱', '')} ({target_num})** 被交易所盯上了！")
-                with st.expander("查看注意交易資訊", expanded=False):
-                    st.markdown(f"**公告日期**：{info.get('公告日期', '無')}")
-                    st.markdown(f"**注意交易資訊**：\n{info.get('注意交易資訊', '無')}")
-    # ==========================================
 
     # 檢查內容是否為我們定義的標準格式 (包含 human_report 與 ai_report)
     if isinstance(content, dict) and "human_report" in content and "ai_report" in content:
