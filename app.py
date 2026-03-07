@@ -214,10 +214,12 @@ def _detect_encoding(raw_bytes):
 
 
 def _find_header_row(rows):
-    """Return (header_row_index, headers) by looking for '證券代號'."""
+    """Return (header_row_index, headers) by looking for '代號' related keywords."""
     for i, row in enumerate(rows):
         for cell in row:
-            if "證券代號" in str(cell):
+            # 清除空白與特殊字元後比對，包容不同交易所的命名差異
+            cell_clean = str(cell).replace(" ", "").replace("\u3000", "").strip()
+            if cell_clean in ("證券代號", "股票代號", "代號"):
                 return i, row
     return None, None
 
@@ -229,6 +231,8 @@ def _parse_regulatory_csv(uploaded_file, list_type):
     Returns: (stock_codes_set, disposition_details_dict, count, error_msg)
     """
     try:
+        # 讓檔案讀取指標回到起點，避免重複讀取變成空白
+        uploaded_file.seek(0)
         raw = uploaded_file.read()
         enc = _detect_encoding(raw)
         text = raw.decode(enc, errors="replace")
@@ -237,17 +241,23 @@ def _parse_regulatory_csv(uploaded_file, list_type):
 
         hdr_idx, headers = _find_header_row(rows)
         if hdr_idx is None:
-            return set(), {}, 0, "無法找到欄位標頭 (需包含「證券代號」)"
+            return set(), {}, 0, "無法找到欄位標頭 (需包含「證券代號」或「代號」)"
 
-        # Build column index mapping
+        # Build column index mapping (清除標頭的隱藏空白)
         col_map = {}
         for ci, h in enumerate(headers):
-            h_clean = h.strip()
+            h_clean = str(h).replace(" ", "").replace("\u3000", "").strip()
             col_map[h_clean] = ci
 
-        code_col = col_map.get("證券代號")
+        # 彈性匹配代號欄位
+        code_col = None
+        for kw in ("證券代號", "股票代號", "代號"):
+            if kw in col_map:
+                code_col = col_map[kw]
+                break
+                
         if code_col is None:
-            return set(), {}, 0, "找不到「證券代號」欄位"
+            return set(), {}, 0, "找不到「代號」相關欄位"
 
         codes = set()
         details = {}
@@ -255,7 +265,8 @@ def _parse_regulatory_csv(uploaded_file, list_type):
         for row in rows[hdr_idx + 1:]:
             if len(row) <= code_col:
                 continue
-            stock_code = row[code_col].strip()
+            stock_code = str(row[code_col]).strip()
+            # 確保是有效的股票代號 (必須包含數字)
             if not stock_code or not any(c.isdigit() for c in stock_code):
                 continue
 
@@ -268,25 +279,28 @@ def _parse_regulatory_csv(uploaded_file, list_type):
                 remarks = ""
                 period = ""
 
+                # 彈性匹配處置措施
                 for key in ("處置措施", "處置原因"):
                     if key in col_map and len(row) > col_map[key]:
-                        measure = row[col_map[key]].strip()
+                        measure = str(row[col_map[key]]).strip()
                         if measure:
                             break
 
                 if "處置內容" in col_map and len(row) > col_map["處置內容"]:
-                    content = row[col_map["處置內容"]].strip()
+                    content = str(row[col_map["處置內容"]]).strip()
 
                 for key in ("備註",):
                     if key in col_map and len(row) > col_map[key]:
-                        remarks = row[col_map[key]].strip()
+                        remarks = str(row[col_map[key]]).strip()
 
+                # 彈性匹配起迄時間
                 for key in ("處置起迄時間", "處置起訖時間"):
                     if key in col_map and len(row) > col_map[key]:
-                        period = row[col_map[key]].strip()
+                        period = str(row[col_map[key]]).strip()
                         if period:
                             break
 
+                # 確保不重複記錄
                 if stock_code not in details:
                     details[stock_code] = {
                         "measure": measure,
