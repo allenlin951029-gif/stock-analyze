@@ -73,35 +73,51 @@ def save_sectors_to_db(data):
         st.warning("No Firebase. Data is temporary.")
 
 
+# --- 獨立儲存四種類別，避免互相覆蓋，並加入 metadata 讓手機端也看得到上傳紀錄 ---
 def load_regulatory_from_db():
     db = get_db()
+    data = {
+        "twse_attention": [],
+        "tpex_attention": [],
+        "twse_disposition": {},
+        "tpex_disposition": {},
+        "metadata": {}
+    }
     if db:
         try:
             doc_ref = db.collection(FS_COLLECTION).document("regulatory_data")
             doc = doc_ref.get()
             if doc.exists:
-                data = doc.to_dict()
-                # Firestore 存的是 list，讀出來後要轉回 set 供後續高速比對
-                data["attention_stocks"] = set(data.get("attention_stocks", []))
-                return data
+                db_data = doc.to_dict()
+                data["twse_attention"] = db_data.get("twse_attention", [])
+                data["tpex_attention"] = db_data.get("tpex_attention", [])
+                data["twse_disposition"] = db_data.get("twse_disposition", {})
+                data["tpex_disposition"] = db_data.get("tpex_disposition", {})
+                data["metadata"] = db_data.get("metadata", {})
         except Exception as e:
             st.warning(f"DB read regulatory failed: {e}")
-    return {"attention_stocks": set(), "disposition_stocks": {}}
+    return data
 
 
 def save_regulatory_to_db(data):
     db = get_db()
     if db:
         try:
-            # 將 set 轉成 list 才能存入 Firestore
-            db_data = {
-                "attention_stocks": list(data.get("attention_stocks", set())),
-                "disposition_stocks": data.get("disposition_stocks", {})
-            }
             doc_ref = db.collection(FS_COLLECTION).document("regulatory_data")
-            doc_ref.set(db_data, merge=True)
+            doc_ref.set(data, merge=True)
         except Exception as e:
             st.error(f"DB write regulatory failed: {e}")
+
+
+def get_combined_regulatory_data():
+    """將 DB 中分開儲存的 4 份名單，融合成 stock.py 需要的 2 個集合"""
+    reg = st.session_state.regulatory_data
+    attention_stocks = set(reg.get("twse_attention", [])) | set(reg.get("tpex_attention", []))
+    disposition_stocks = {**reg.get("twse_disposition", {}), **reg.get("tpex_disposition", {})}
+    return {
+        "attention_stocks": attention_stocks,
+        "disposition_stocks": disposition_stocks
+    }
 
 
 # -------------------------
@@ -179,15 +195,8 @@ if "sector_as_of_date" not in st.session_state:
 if "report_mode" not in st.session_state:
     st.session_state.report_mode = "human"
 if "regulatory_data" not in st.session_state:
-    # 改為從資料庫讀取
+    # App 啟動時立刻從資料庫抓取最新資料
     st.session_state.regulatory_data = load_regulatory_from_db()
-if "regulatory_upload_info" not in st.session_state:
-    st.session_state.regulatory_upload_info = {
-        "twse_attention": None,
-        "tpex_attention": None,
-        "twse_disposition": None,
-        "tpex_disposition": None,
-    }
 
 
 # -------------------------
@@ -259,8 +268,6 @@ def _parse_regulatory_csv(uploaded_file, list_type):
                 remarks = ""
                 period = ""
 
-                # TWSE format: 處置措施, 處置內容, 備註, 處置起迄時間
-                # TPEx format: 處置原因, 處置內容, 處置起訖時間
                 for key in ("處置措施", "處置原因"):
                     if key in col_map and len(row) > col_map[key]:
                         measure = row[col_map[key]].strip()
@@ -280,7 +287,6 @@ def _parse_regulatory_csv(uploaded_file, list_type):
                         if period:
                             break
 
-                # Keep only the latest entry per stock code
                 if stock_code not in details:
                     details[stock_code] = {
                         "measure": measure,
@@ -294,33 +300,33 @@ def _parse_regulatory_csv(uploaded_file, list_type):
         return set(), {}, 0, f"解析錯誤: {e}"
 
 
-def rebuild_regulatory_data():
-    """Rebuild the merged regulatory_data from all uploads."""
-    info = st.session_state.regulatory_upload_info
-    all_attention = set()
-    all_disposition = {}
+def process_and_save_upload(file, category, list_type, source_label):
+    """處理單一檔案上傳，覆寫該類別並寫入資料庫，保留其他類別的資料"""
+    codes, details, count, err = _parse_regulatory_csv(file, list_type)
+    if err:
+        st.error(err)
+        return
 
-    for key in ("twse_attention", "tpex_attention"):
-        data = info.get(key)
-        if data and "codes" in data:
-            all_attention.update(data["codes"])
-
-    for key, source_label in (("twse_disposition", "TWSE"), ("tpex_disposition", "TPEx")):
-        data = info.get(key)
-        if data and "details" in data:
-            for code, detail in data["details"].items():
-                detail_with_source = dict(detail, source=source_label)
-                if code not in all_disposition:
-                    all_disposition[code] = detail_with_source
-
-    new_data = {
-        "attention_stocks": all_attention,
-        "disposition_stocks": all_disposition,
-    }
+    reg = st.session_state.regulatory_data
     
-    st.session_state.regulatory_data = new_data
-    # 同步寫入 Firebase
-    save_regulatory_to_db(new_data)
+    if list_type == "attention":
+        reg[category] = list(codes)
+    else:
+        for c, d in details.items():
+            d["source"] = source_label
+        reg[category] = details
+
+    # 將 metadata 存檔，方便手機端讀取顯示
+    reg["metadata"][category] = {
+        "filename": file.name,
+        "count": count,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    st.session_state.regulatory_data = reg
+    save_regulatory_to_db(reg)
+    st.success(f"Successfully updated cloud DB with {file.name}!")
+    st.rerun()
 
 
 # -------------------------
@@ -346,7 +352,6 @@ def save_to_archive(display_title, display_date, content):
         "date": str(display_date),
         "content": content,
         "created_at": datetime.now().strftime("%H:%M:%S"),
-        # 紀錄當時生成的模式，方便後續除錯或顯示
         "generated_mode": st.session_state.report_mode
     }
     st.session_state.results_archive.append(record)
@@ -356,43 +361,30 @@ def save_to_archive(display_title, display_date, content):
 
 
 def run_analysis(stock_id, as_of_date, write_history):
-    """
-    執行個股分析的核心函式。
-    根據 session_state.report_mode 決定跑 'human' (快) 還是 'ai' (慢)。
-    """
     sid = stock_id.strip().upper()
     if not sid:
         return
 
-    # 1. 更新 Cookie 與 Session
     st.session_state.current_id = sid
     save_current_to_cookie(sid)
     if write_history:
         push_history_cookie(sid)
 
-    # 2. 執行分析
     final_result = {}
-    current_mode = st.session_state.report_mode  # 'human' or 'ai'
+    current_mode = st.session_state.report_mode
 
     try:
-        # 呼叫 stock.py，傳入對應的 mode
-        # mode="human" -> 只回傳文字，速度快 (Quick Screen)
-        # mode="ai"    -> 回傳完整 JSON，速度慢 (Deep Dive)
         raw_result = analyze_stock_technical(
             sid, as_of_date=as_of_date, mode=current_mode,
-            regulatory_data=st.session_state.get("regulatory_data")
+            regulatory_data=get_combined_regulatory_data()
         )
 
         if current_mode == "human":
-            # Quick Screen 模式：省時間，不產生 AI 數據
             final_result["human_report"] = raw_result.get("human_report", "No report generated.")
             final_result["ai_report"] = None
         else:
-            # Deep Dive 模式：取得完整數據，並順便產生文字報告
             feat_data = raw_result.get("ai_report", {})
             final_result["ai_report"] = feat_data
-
-            # 手動產生文字報告，這樣使用者切換回 Quick Screen View 時也能看到內容
             if feat_data:
                 final_result["human_report"] = format_text_report(feat_data)
             else:
@@ -400,26 +392,18 @@ def run_analysis(stock_id, as_of_date, write_history):
 
     except Exception as e:
         err_msg = f"Error: {type(e).__name__}: {e}"
-        final_result = {
-            "human_report": err_msg,
-            "ai_report": {"error": str(e)},
-        }
+        final_result = {"human_report": err_msg, "ai_report": {"error": str(e)}}
         st.session_state._last_debug = f"exception={type(e).__name__}"
 
-    # 3. 存檔
     save_to_archive(sid, as_of_date, final_result)
 
 
 def run_sector_analysis(sector_name, as_of_date, custom_list=None):
-    """
-    類股快速掃描 (通常用 Quick Screen 模式顯示列表)
-    """
     final_report = ""
     try:
-        # Sector Scan 固定輸出文字列表 (Human mode)
         final_report = analyze_sector_performance(
             sector_name, as_of_date=as_of_date, custom_tickers=custom_list, mode="human",
-            regulatory_data=st.session_state.get("regulatory_data")
+            regulatory_data=get_combined_regulatory_data()
         )
     except Exception as e:
         final_report = f"Sector analysis failed: {e}"
@@ -427,23 +411,19 @@ def run_sector_analysis(sector_name, as_of_date, custom_list=None):
 
 
 def run_full_sector_report(sector_name, as_of_date, custom_list=None):
-    """
-    類股完整報告 (根據當前模式跑迴圈)
-    """
     target_list = custom_list if custom_list else SECTOR_DICT.get(sector_name, [])
     if not target_list:
         save_to_archive(f"Full: {sector_name}", as_of_date, "No stocks.")
         return
 
-    mode = st.session_state.report_mode  # 'human' or 'ai'
+    mode = st.session_state.report_mode
 
-    if mode == "ai":  # Deep Dive
+    if mode == "ai":
         all_reports = {}
         for stock in target_list:
             try:
-                # 強制跑 AI 模式收集數據
                 res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="ai",
-                                              regulatory_data=st.session_state.get("regulatory_data"))
+                                              regulatory_data=get_combined_regulatory_data())
                 if isinstance(res, dict):
                     all_reports[stock] = res.get("ai_report", {})
                 else:
@@ -461,7 +441,6 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
         }
         save_to_archive(f"Full: {sector_name}", as_of_date, combined)
     else:
-        # Quick Screen (Human Mode)
         full_content = []
         full_content.append(f"Sector [{sector_name}] Quick Screen Report")
         full_content.append(f"Date: {as_of_date}")
@@ -471,9 +450,8 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
 
         for stock in target_list:
             try:
-                # 跑 Human 模式 (快)
                 res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="human",
-                                              regulatory_data=st.session_state.get("regulatory_data"))
+                                              regulatory_data=get_combined_regulatory_data())
                 if isinstance(res, dict):
                     full_content.append(res.get("human_report", str(res)))
                 else:
@@ -486,11 +464,7 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
                 full_content.append("-" * 60)
 
         combined_report = "\n".join(full_content)
-        # 這裡因為是純文字合併，結構稍微不同，為了統一 UI 顯示，我們包裝一下
-        final_struct = {
-            "human_report": combined_report,
-            "ai_report": None
-        }
+        final_struct = {"human_report": combined_report, "ai_report": None}
         save_to_archive(f"Full: {sector_name}", as_of_date, final_struct)
 
 
@@ -502,7 +476,6 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("#### Report Mode")
 
-    # 邏輯映射：Quick Screen -> Human mode, Deep Dive -> AI mode
     idx = 0 if st.session_state.report_mode == "human" else 1
     mode_choice = st.radio(
         "Select output mode:",
@@ -511,7 +484,6 @@ with st.sidebar:
         key="report_mode_radio",
         help="Quick Screen: Fast, text summary.\nDeep Dive: Slow, full JSON with all indicators.",
     )
-    # 更新 session state
     st.session_state.report_mode = "human" if mode_choice == "Quick Screen" else "ai"
 
     if is_ai_mode():
@@ -552,9 +524,11 @@ with st.sidebar:
 
     st.info("Use pagination below to browse results.")
 
-    # Regulatory list status
-    _reg_attn = len(st.session_state.regulatory_data.get("attention_stocks", set()))
-    _reg_disp = len(st.session_state.regulatory_data.get("disposition_stocks", {}))
+    # Sidebar: Regulatory list status (Combined for display)
+    comb_reg = get_combined_regulatory_data()
+    _reg_attn = len(comb_reg["attention_stocks"])
+    _reg_disp = len(comb_reg["disposition_stocks"])
+    
     if _reg_attn or _reg_disp:
         st.divider()
         st.subheader("Regulatory Lists")
@@ -563,9 +537,6 @@ with st.sidebar:
         st.divider()
         st.caption("No regulatory lists loaded")
 
-    # ==========================================
-    # 加入 AI 操盤手提示詞複製區
-    # ==========================================
     st.divider()
     st.subheader("🤖 AI 操盤手分析指令")
     st.caption("💡 點擊右上方按鈕一鍵複製，連同下載的 JSON 貼給 AI")
@@ -585,7 +556,6 @@ with st.sidebar:
 
 【排版要求】
 語氣要專業、果斷、像操盤手對老闆的精準匯報。請多用列點，並將股票代號、停損價位、盈虧比等關鍵字加粗。"""
-
     st.code(ai_prompt, language="text")
 
 # -------------------------
@@ -651,11 +621,6 @@ with tab2:
             st.markdown(f"**Stocks**: `{', '.join(target_list)}`")
         else:
             st.markdown("**Stocks**: (none)")
-
-        if is_ai_mode():
-            st.caption("Deep Dive mode - full report outputs JSON")
-        else:
-            st.caption("Quick Screen mode - full report outputs text summary")
 
         b1, b2 = st.columns(2)
         with b1:
@@ -742,168 +707,103 @@ with tab3:
 # --- Tab 4: Regulatory Lists ---
 with tab4:
     st.header("Regulatory Lists (Attention / Disposition)")
-    st.caption(
-        "Upload CSV files downloaded from TWSE or TPEx. "
-        "Stocks on these lists will be flagged during analysis."
-    )
+    st.caption("檔案上傳後將儲存至雲端，手機端不需重新上傳。")
 
-    # --- Current status summary ---
-    reg = st.session_state.regulatory_data
-    attn_count = len(reg.get("attention_stocks", set()))
-    disp_count = len(reg.get("disposition_stocks", {}))
-    both_count = len(reg.get("attention_stocks", set()) & set(reg.get("disposition_stocks", {}).keys()))
+    comb = get_combined_regulatory_data()
+    c_attn = len(comb["attention_stocks"])
+    c_disp = len(comb["disposition_stocks"])
+    c_both = len(comb["attention_stocks"] & set(comb["disposition_stocks"].keys()))
 
-    if attn_count or disp_count:
+    if c_attn or c_disp:
         sc1, sc2, sc3 = st.columns(3)
-        sc1.metric("Attention", attn_count)
-        sc2.metric("Disposition", disp_count)
-        sc3.metric("Both", both_count)
+        sc1.metric("總計注意股", c_attn)
+        sc2.metric("總計處置股", c_disp)
+        sc3.metric("兩者皆是", c_both)
     else:
-        st.info("No regulatory lists loaded. Upload CSVs below.")
+        st.info("目前雲端無處置股/注意股資料，請上傳 CSV。")
 
     st.markdown("---")
 
-    # Helper: check if an uploaded file is the same one we already processed
-    def _is_new_file(uploaded_file, info_key):
-        """Return True only if this file hasn't been processed yet."""
-        if uploaded_file is None:
-            return False
-        existing = st.session_state.regulatory_upload_info.get(info_key)
-        if existing is None:
-            return True
-        # Compare name + size to detect a genuinely new upload
-        return (uploaded_file.name != existing.get("filename")
-                or uploaded_file.size != existing.get("filesize"))
+    reg_db = st.session_state.regulatory_data
+    meta = reg_db.get("metadata", {})
 
-    # --- Attention uploads ---
+    def display_metadata(category_key):
+        if category_key in meta:
+            m = meta[category_key]
+            st.success(f"✅ 雲端已載入：**{m['count']}** 檔\n\n📄 檔案：{m['filename']}\n\n⏱️ 更新：{m['updated_at']}")
+        else:
+            st.info("☁️ 雲端尚無此資料")
+
     st.subheader("Attention List (注意股)")
     att_c1, att_c2 = st.columns(2)
 
     with att_c1:
         with st.container(border=True):
-            st.markdown("**TWSE Attention**")
-            twse_att_file = st.file_uploader(
-                "Upload TWSE Attention CSV", type=["csv"],
-                key="upload_twse_attention"
-            )
-            info_ta = st.session_state.regulatory_upload_info.get("twse_attention")
-            if info_ta:
-                st.success(f"Loaded: {info_ta['count']} stocks  ({info_ta['filename']})")
-            if _is_new_file(twse_att_file, "twse_attention"):
-                codes, _, count, err = _parse_regulatory_csv(twse_att_file, "attention")
-                if err:
-                    st.error(err)
-                else:
-                    st.session_state.regulatory_upload_info["twse_attention"] = {
-                        "codes": codes, "count": count,
-                        "filename": twse_att_file.name,
-                        "filesize": twse_att_file.size,
-                    }
-                    rebuild_regulatory_data()
-                    st.rerun()
+            st.markdown("**TWSE Attention (上市)**")
+            display_metadata("twse_attention")
+            twse_att_file = st.file_uploader("Upload TWSE Attention CSV", type=["csv"], key="up_twse_att")
+            if twse_att_file:
+                fid = f"{twse_att_file.name}_{twse_att_file.size}"
+                if st.session_state.get("_last_twse_att") != fid:
+                    st.session_state["_last_twse_att"] = fid
+                    process_and_save_upload(twse_att_file, "twse_attention", "attention", "TWSE")
 
     with att_c2:
         with st.container(border=True):
-            st.markdown("**TPEx Attention**")
-            tpex_att_file = st.file_uploader(
-                "Upload TPEx Attention CSV", type=["csv"],
-                key="upload_tpex_attention"
-            )
-            info_pa = st.session_state.regulatory_upload_info.get("tpex_attention")
-            if info_pa:
-                st.success(f"Loaded: {info_pa['count']} stocks  ({info_pa['filename']})")
-            if _is_new_file(tpex_att_file, "tpex_attention"):
-                codes, _, count, err = _parse_regulatory_csv(tpex_att_file, "attention")
-                if err:
-                    st.error(err)
-                else:
-                    st.session_state.regulatory_upload_info["tpex_attention"] = {
-                        "codes": codes, "count": count,
-                        "filename": tpex_att_file.name,
-                        "filesize": tpex_att_file.size,
-                    }
-                    rebuild_regulatory_data()
-                    st.rerun()
+            st.markdown("**TPEx Attention (上櫃)**")
+            display_metadata("tpex_attention")
+            tpex_att_file = st.file_uploader("Upload TPEx Attention CSV", type=["csv"], key="up_tpex_att")
+            if tpex_att_file:
+                fid = f"{tpex_att_file.name}_{tpex_att_file.size}"
+                if st.session_state.get("_last_tpex_att") != fid:
+                    st.session_state["_last_tpex_att"] = fid
+                    process_and_save_upload(tpex_att_file, "tpex_attention", "attention", "TPEx")
 
     st.markdown("---")
-
-    # --- Disposition uploads ---
     st.subheader("Disposition List (處置股)")
     disp_c1, disp_c2 = st.columns(2)
 
     with disp_c1:
         with st.container(border=True):
-            st.markdown("**TWSE Disposition**")
-            twse_disp_file = st.file_uploader(
-                "Upload TWSE Disposition CSV", type=["csv"],
-                key="upload_twse_disposition"
-            )
-            info_td = st.session_state.regulatory_upload_info.get("twse_disposition")
-            if info_td:
-                st.success(f"Loaded: {info_td['count']} stocks  ({info_td['filename']})")
-            if _is_new_file(twse_disp_file, "twse_disposition"):
-                codes, details, count, err = _parse_regulatory_csv(twse_disp_file, "disposition")
-                if err:
-                    st.error(err)
-                else:
-                    st.session_state.regulatory_upload_info["twse_disposition"] = {
-                        "codes": codes, "details": details, "count": count,
-                        "filename": twse_disp_file.name,
-                        "filesize": twse_disp_file.size,
-                    }
-                    rebuild_regulatory_data()
-                    st.rerun()
+            st.markdown("**TWSE Disposition (上市)**")
+            display_metadata("twse_disposition")
+            twse_disp_file = st.file_uploader("Upload TWSE Disposition CSV", type=["csv"], key="up_twse_disp")
+            if twse_disp_file:
+                fid = f"{twse_disp_file.name}_{twse_disp_file.size}"
+                if st.session_state.get("_last_twse_disp") != fid:
+                    st.session_state["_last_twse_disp"] = fid
+                    process_and_save_upload(twse_disp_file, "twse_disposition", "disposition", "TWSE")
 
     with disp_c2:
         with st.container(border=True):
-            st.markdown("**TPEx Disposition**")
-            tpex_disp_file = st.file_uploader(
-                "Upload TPEx Disposition CSV", type=["csv"],
-                key="upload_tpex_disposition"
-            )
-            info_pd = st.session_state.regulatory_upload_info.get("tpex_disposition")
-            if info_pd:
-                st.success(f"Loaded: {info_pd['count']} stocks  ({info_pd['filename']})")
-            if _is_new_file(tpex_disp_file, "tpex_disposition"):
-                codes, details, count, err = _parse_regulatory_csv(tpex_disp_file, "disposition")
-                if err:
-                    st.error(err)
-                else:
-                    st.session_state.regulatory_upload_info["tpex_disposition"] = {
-                        "codes": codes, "details": details, "count": count,
-                        "filename": tpex_disp_file.name,
-                        "filesize": tpex_disp_file.size,
-                    }
-                    rebuild_regulatory_data()
-                    st.rerun()
+            st.markdown("**TPEx Disposition (上櫃)**")
+            display_metadata("tpex_disposition")
+            tpex_disp_file = st.file_uploader("Upload TPEx Disposition CSV", type=["csv"], key="up_tpex_disp")
+            if tpex_disp_file:
+                fid = f"{tpex_disp_file.name}_{tpex_disp_file.size}"
+                if st.session_state.get("_last_tpex_disp") != fid:
+                    st.session_state["_last_tpex_disp"] = fid
+                    process_and_save_upload(tpex_disp_file, "tpex_disposition", "disposition", "TPEx")
 
     st.markdown("---")
 
-    # --- Loaded stock codes detail ---
-    if attn_count or disp_count:
-        with st.expander("View loaded stock codes", expanded=False):
-            if attn_count:
-                attn_sorted = sorted(reg["attention_stocks"])
-                st.markdown(f"**Attention ({attn_count})**: {', '.join(attn_sorted)}")
-            if disp_count:
-                disp_sorted = sorted(reg["disposition_stocks"].keys())
-                st.markdown(f"**Disposition ({disp_count})**: {', '.join(disp_sorted)}")
+    if c_attn or c_disp:
+        with st.expander("查看已載入的股票代號", expanded=False):
+            if c_attn:
+                st.markdown(f"**Attention ({c_attn})**: {', '.join(sorted(comb['attention_stocks']))}")
+            if c_disp:
+                st.markdown(f"**Disposition ({c_disp})**: {', '.join(sorted(comb['disposition_stocks'].keys()))}")
 
-        # Clear all button
-        if st.button("Clear all regulatory data", type="primary"):
+        if st.button("🗑️ 清空所有雲端處置/注意股資料", type="primary"):
             empty_data = {
-                "attention_stocks": set(),
-                "disposition_stocks": {},
+                "twse_attention": [], "tpex_attention": [],
+                "twse_disposition": {}, "tpex_disposition": {}, "metadata": {}
             }
             st.session_state.regulatory_data = empty_data
-            st.session_state.regulatory_upload_info = {
-                "twse_attention": None,
-                "tpex_attention": None,
-                "twse_disposition": None,
-                "tpex_disposition": None,
-            }
-            # 同步寫入空資料到 Firebase
             save_regulatory_to_db(empty_data)
+            # 清除所有快取 flag
+            for k in ["_last_twse_att", "_last_tpex_att", "_last_twse_disp", "_last_tpex_disp"]:
+                st.session_state.pop(k, None)
             st.rerun()
 
 # -------------------------
@@ -931,7 +831,6 @@ if archive_len > 0:
     current_idx = st.session_state.view_index
     record = st.session_state.results_archive[current_idx]
 
-    # 顯示頂部的狀態 Bar (更新標籤)
     mode_badge = "Deep Dive" if is_ai_mode() else "Quick Screen"
     badge_color = "#1a73e8" if is_ai_mode() else "#2e7d32"
 
@@ -947,7 +846,6 @@ if archive_len > 0:
         unsafe_allow_html=True,
     )
 
-    # 導覽按鈕 + 模式切換按鈕
     c_prev, c_switch, c_next = st.columns([1, 1, 1])
     with c_prev:
         if st.button("Prev", disabled=(current_idx == 0), use_container_width=True):
@@ -955,7 +853,6 @@ if archive_len > 0:
             st.rerun()
 
     with c_switch:
-        # 切換按鈕 (更新標籤)
         switch_label = "Switch to Quick Screen" if is_ai_mode() else "Switch to Deep Dive"
         if st.button(switch_label, use_container_width=True, key="inline_mode_switch"):
             if is_ai_mode():
@@ -969,25 +866,19 @@ if archive_len > 0:
             st.session_state.view_index += 1
             st.rerun()
 
-    # 內容顯示邏輯
     content = record["content"]
     st.write("---")
 
-    # 檢查內容是否為我們定義的標準格式 (包含 human_report 與 ai_report)
     if isinstance(content, dict) and "human_report" in content and "ai_report" in content:
-
         if is_ai_mode():
             st.markdown("### Deep Dive Data")
             ai_data = content["ai_report"]
 
-            # 檢查 Deep Dive (AI) 資料是否存在
             if ai_data is None:
                 st.warning("⚠️ 此筆紀錄為 Quick Screen 模式生成 (快速)，無 Deep Dive 詳細數據。")
                 st.info("若需查看詳細籌碼/指標數據，請將左側模式切換為 'Deep Dive' 並重新按 Analyze。")
             else:
-                # 正常顯示 AI 數據
                 if isinstance(ai_data, dict) and "stocks" in ai_data:
-                    # 這是 Sector Report
                     st.markdown(f"**Sector**: {ai_data.get('sector', '?')} | **Date**: {ai_data.get('date', '?')}")
                     st.markdown(f"**{len(ai_data['stocks'])} stocks**")
 
@@ -1004,7 +895,6 @@ if archive_len > 0:
                         key=f"dl_sector_json_{current_idx}",
                     )
                 else:
-                    # 這是 Single Stock Report
                     st.json(ai_data)
                     json_str = json.dumps(ai_data, indent=2, default=str, ensure_ascii=False)
                     st.download_button(
@@ -1015,11 +905,9 @@ if archive_len > 0:
                         key=f"dl_json_{current_idx}",
                     )
         else:
-            # Human Mode 顯示
             st.markdown("### Quick Screen Report")
             st.code(content["human_report"], language="text")
     else:
-        # 非標準格式 (例如舊資料或錯誤訊息)
         st.code(str(content), language="text")
 else:
     st.info("No results yet. Use the tabs above to run an analysis.")
