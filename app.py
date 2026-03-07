@@ -11,7 +11,7 @@ from streamlit_cookies_manager import EncryptedCookieManager
 from google.oauth2 import service_account
 from google.cloud import firestore
 
-# [span_0](start_span)確保 stock.py 位於同一目錄下[span_0](end_span)
+# 確保 stock.py 位於同一目錄下
 from stock import (
     analyze_stock_technical,
     analyze_sector_performance,
@@ -71,6 +71,37 @@ def save_sectors_to_db(data):
     else:
         st.session_state["_temp_local_sectors"] = data
         st.warning("No Firebase. Data is temporary.")
+
+
+def load_regulatory_from_db():
+    db = get_db()
+    if db:
+        try:
+            doc_ref = db.collection(FS_COLLECTION).document("regulatory_data")
+            doc = doc_ref.get()
+            if doc.exists:
+                data = doc.to_dict()
+                # Firestore 存的是 list，讀出來後要轉回 set 供後續高速比對
+                data["attention_stocks"] = set(data.get("attention_stocks", []))
+                return data
+        except Exception as e:
+            st.warning(f"DB read regulatory failed: {e}")
+    return {"attention_stocks": set(), "disposition_stocks": {}}
+
+
+def save_regulatory_to_db(data):
+    db = get_db()
+    if db:
+        try:
+            # 將 set 轉成 list 才能存入 Firestore
+            db_data = {
+                "attention_stocks": list(data.get("attention_stocks", set())),
+                "disposition_stocks": data.get("disposition_stocks", {})
+            }
+            doc_ref = db.collection(FS_COLLECTION).document("regulatory_data")
+            doc_ref.set(db_data, merge=True)
+        except Exception as e:
+            st.error(f"DB write regulatory failed: {e}")
 
 
 # -------------------------
@@ -148,10 +179,8 @@ if "sector_as_of_date" not in st.session_state:
 if "report_mode" not in st.session_state:
     st.session_state.report_mode = "human"
 if "regulatory_data" not in st.session_state:
-    st.session_state.regulatory_data = {
-        "attention_stocks": set(),
-        "disposition_stocks": {},
-    }
+    # 改為從資料庫讀取
+    st.session_state.regulatory_data = load_regulatory_from_db()
 if "regulatory_upload_info" not in st.session_state:
     st.session_state.regulatory_upload_info = {
         "twse_attention": None,
@@ -284,10 +313,14 @@ def rebuild_regulatory_data():
                 if code not in all_disposition:
                     all_disposition[code] = detail_with_source
 
-    st.session_state.regulatory_data = {
+    new_data = {
         "attention_stocks": all_attention,
         "disposition_stocks": all_disposition,
     }
+    
+    st.session_state.regulatory_data = new_data
+    # 同步寫入 Firebase
+    save_regulatory_to_db(new_data)
 
 
 # -------------------------
@@ -342,7 +375,7 @@ def run_analysis(stock_id, as_of_date, write_history):
     current_mode = st.session_state.report_mode  # 'human' or 'ai'
 
     try:
-        # [span_1](start_span)呼叫 stock.py，傳入對應的 mode[span_1](end_span)
+        # 呼叫 stock.py，傳入對應的 mode
         # mode="human" -> 只回傳文字，速度快 (Quick Screen)
         # mode="ai"    -> 回傳完整 JSON，速度慢 (Deep Dive)
         raw_result = analyze_stock_technical(
@@ -383,7 +416,7 @@ def run_sector_analysis(sector_name, as_of_date, custom_list=None):
     """
     final_report = ""
     try:
-        # [span_2](start_span)Sector Scan 固定輸出文字列表 (Human mode)[span_2](end_span)
+        # Sector Scan 固定輸出文字列表 (Human mode)
         final_report = analyze_sector_performance(
             sector_name, as_of_date=as_of_date, custom_tickers=custom_list, mode="human",
             regulatory_data=st.session_state.get("regulatory_data")
@@ -518,13 +551,6 @@ with st.sidebar:
         st.warning("No cloud DB")
 
     st.info("Use pagination below to browse results.")
-    # === 原本側邊欄的結尾 ===
-    if "firebase" in st.secrets:
-        st.success("Cloud DB connected")
-    else:
-        st.warning("No cloud DB")
-
-    st.info("")
 
     # Regulatory list status
     _reg_attn = len(st.session_state.regulatory_data.get("attention_stocks", set()))
@@ -561,6 +587,7 @@ with st.sidebar:
 語氣要專業、果斷、像操盤手對老闆的精準匯報。請多用列點，並將股票代號、停損價位、盈虧比等關鍵字加粗。"""
 
     st.code(ai_prompt, language="text")
+
 # -------------------------
 # Main Content
 # -------------------------
@@ -864,16 +891,19 @@ with tab4:
 
         # Clear all button
         if st.button("Clear all regulatory data", type="primary"):
-            st.session_state.regulatory_data = {
+            empty_data = {
                 "attention_stocks": set(),
                 "disposition_stocks": {},
             }
+            st.session_state.regulatory_data = empty_data
             st.session_state.regulatory_upload_info = {
                 "twse_attention": None,
                 "tpex_attention": None,
                 "twse_disposition": None,
                 "tpex_disposition": None,
             }
+            # 同步寫入空資料到 Firebase
+            save_regulatory_to_db(empty_data)
             st.rerun()
 
 # -------------------------
