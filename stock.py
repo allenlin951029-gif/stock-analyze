@@ -2007,7 +2007,8 @@ def _download_yf(ticker: str, period: str, interval: str):
             return pd.DataFrame()
 
 
-def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[str, Any]:
+def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
+                      regulatory_data: dict = None) -> Dict[str, Any]:
     stock_id = stock_id.strip().upper()
     yf_ticker = _resolve_yf_ticker(stock_id)
     stock_no = _strip_suffix(stock_id)
@@ -2674,6 +2675,34 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai") -> Dict[
             },
         }
 
+    # ---- Regulatory list flags (Attention / Disposition) ----
+    _reg = regulatory_data or {}
+    _attn_set = _reg.get("attention_stocks", set())
+    _disp_dict = _reg.get("disposition_stocks", {})
+    _is_attention = stock_no in _attn_set
+    _is_disposition = stock_no in _disp_dict
+
+    feat["regulatory_attention"] = _is_attention
+    feat["regulatory_disposition"] = _is_disposition
+    if _is_attention and _is_disposition:
+        feat["regulatory_status"] = "BOTH"
+    elif _is_attention:
+        feat["regulatory_status"] = "ATTENTION"
+    elif _is_disposition:
+        feat["regulatory_status"] = "DISPOSITION"
+    else:
+        feat["regulatory_status"] = None
+
+    if _is_disposition and mode == "ai":
+        disp_info = _disp_dict[stock_no]
+        feat["disposition_detail"] = {
+            "measure": disp_info.get("measure", ""),
+            "content": disp_info.get("content", ""),
+            "remarks": disp_info.get("remarks", ""),
+            "period": disp_info.get("period", ""),
+            "source": disp_info.get("source", ""),
+        }
+
     # Final sanitize
     feat = _sanitize_numpy(feat)
     return feat
@@ -2694,6 +2723,16 @@ def format_text_report(feat: Dict[str, Any]) -> str:
     lines.append(SEP)
     lines.append("  {}  Technical Summary".format(feat["symbol"]))
     lines.append("  Data：{}  Query：{}".format(feat["price_date"], feat["query_date"]))
+
+    # Regulatory status badge
+    reg_status = feat.get("regulatory_status")
+    if reg_status == "BOTH":
+        lines.append("  *** [ATTENTION] + [DISPOSITION] ***")
+    elif reg_status == "ATTENTION":
+        lines.append("  *** [ATTENTION] ***")
+    elif reg_status == "DISPOSITION":
+        lines.append("  *** [DISPOSITION] ***")
+
     lines.append(SEP)
 
     lines.append("  Close：{}  Trend：{}".format(feat["close"], feat["trend_state"]))
@@ -2756,10 +2795,11 @@ SECTOR_DICT = {
 }
 
 
-def _analyze_one_stock_for_sector(stock_id, as_of_date, mode):
+def _analyze_one_stock_for_sector(stock_id, as_of_date, mode, regulatory_data=None):
     """Helper for parallel sector analysis."""
     try:
-        feat = build_ai_features(stock_id, as_of_date=as_of_date, mode=mode)
+        feat = build_ai_features(stock_id, as_of_date=as_of_date, mode=mode,
+                                 regulatory_data=regulatory_data)
         if feat.get("error"):
             return {
                 "Symbol": _strip_suffix(stock_id),
@@ -2785,13 +2825,15 @@ def _analyze_one_stock_for_sector(stock_id, as_of_date, mode):
             "MA20_Dev": "{:+.2f}%".format(feat.get("ma20_dev_pct", 0) or 0),
             "Vol_R": feat.get("vol_ratio_5d", "-"),
             "KD": "{:.0f}/{:.0f}".format(feat.get("kd_k", 0) or 0, feat.get("kd_d", 0) or 0),
+            "Reg": feat.get("regulatory_status") or "",
             "Score": score,
         }
     except Exception:
-        return {"Symbol": stock_id, "Trend": "Exception", "Score": -1}
+        return {"Symbol": stock_id, "Trend": "Exception", "Reg": "", "Score": -1}
 
 
-def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers=None, mode: str = "human") -> str:
+def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers=None,
+                               mode: str = "human", regulatory_data: dict = None) -> str:
     target_list = custom_tickers if custom_tickers else SECTOR_DICT.get(sector_name, [])
 
     if not target_list:
@@ -2801,7 +2843,8 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
     results = []
     with ThreadPoolExecutor(max_workers=min(len(target_list), 5)) as pool:
         futures = {
-            pool.submit(_analyze_one_stock_for_sector, sid, as_of_date, mode): sid
+            pool.submit(_analyze_one_stock_for_sector, sid, as_of_date, mode,
+                        regulatory_data): sid
             for sid in target_list
         }
         for fut in as_completed(futures):
@@ -2815,19 +2858,20 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
     lines.append(f"Date：{d_str}")
     lines.append("-" * 35)
     lines.append(
-        "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format("Symbol", "Price", "Trend", "MA20Dev", "VolR", "KD",
-                                                              "Score"))
+        "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<12} {:<4}".format(
+            "Symbol", "Price", "Trend", "MA20Dev", "VolR", "KD", "Regulatory", "Score"))
     lines.append("-" * 35)
 
     for r in results:
         lines.append(
-            "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<4}".format(
+            "{:<10} {:<8} {:<12} {:<10} {:<6} {:<8} {:<12} {:<4}".format(
                 str(r.get("Symbol", "")),
                 str(r.get("Close", "")),
                 str(r.get("Trend", "")),
                 str(r.get("MA20_Dev", "")),
                 str(r.get("Vol_R", "")),
                 str(r.get("KD", "")),
+                str(r.get("Reg", "")),
                 str(r.get("Score", "")),
             )
         )
@@ -2845,13 +2889,26 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
 # ===================================================================
 
 
-def analyze_stock_technical(stock_id: str, as_of_date=None, mode: str = "human") -> dict:
+def analyze_stock_technical(stock_id: str, as_of_date=None, mode: str = "human",
+                            regulatory_data: dict = None) -> dict:
     """
     Main entry point.
     mode="human" => returns {"human_report": str}   (fast, no network calls)
     mode="ai"    => returns {"ai_report": dict}     (full JSON with all data)
+
+    regulatory_data (optional): {
+        "attention_stocks": set of stock codes on attention list,
+        "disposition_stocks": dict of stock_code -> {
+            "measure": str,
+            "content": str,
+            "remarks": str,
+            "period": str,
+            "source": str,   # "TWSE" or "TPEx"
+        }
+    }
     """
-    feat = build_ai_features(stock_id, as_of_date, mode=mode)
+    feat = build_ai_features(stock_id, as_of_date, mode=mode,
+                             regulatory_data=regulatory_data)
 
     if mode == "ai":
         return {"ai_report": feat}
