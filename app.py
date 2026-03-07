@@ -736,6 +736,18 @@ with tab4:
 
     st.markdown("---")
 
+    # Helper: check if an uploaded file is the same one we already processed
+    def _is_new_file(uploaded_file, info_key):
+        """Return True only if this file hasn't been processed yet."""
+        if uploaded_file is None:
+            return False
+        existing = st.session_state.regulatory_upload_info.get(info_key)
+        if existing is None:
+            return True
+        # Compare name + size to detect a genuinely new upload
+        return (uploaded_file.name != existing.get("filename")
+                or uploaded_file.size != existing.get("filesize"))
+
     # --- Attention uploads ---
     st.subheader("Attention List (注意股)")
     att_c1, att_c2 = st.columns(2)
@@ -750,7 +762,7 @@ with tab4:
             info_ta = st.session_state.regulatory_upload_info.get("twse_attention")
             if info_ta:
                 st.success(f"Loaded: {info_ta['count']} stocks  ({info_ta['filename']})")
-            if twse_att_file is not None:
+            if _is_new_file(twse_att_file, "twse_attention"):
                 codes, _, count, err = _parse_regulatory_csv(twse_att_file, "attention")
                 if err:
                     st.error(err)
@@ -758,9 +770,9 @@ with tab4:
                     st.session_state.regulatory_upload_info["twse_attention"] = {
                         "codes": codes, "count": count,
                         "filename": twse_att_file.name,
+                        "filesize": twse_att_file.size,
                     }
                     rebuild_regulatory_data()
-                    st.success(f"Parsed {count} stocks")
                     st.rerun()
 
     with att_c2:
@@ -773,7 +785,7 @@ with tab4:
             info_pa = st.session_state.regulatory_upload_info.get("tpex_attention")
             if info_pa:
                 st.success(f"Loaded: {info_pa['count']} stocks  ({info_pa['filename']})")
-            if tpex_att_file is not None:
+            if _is_new_file(tpex_att_file, "tpex_attention"):
                 codes, _, count, err = _parse_regulatory_csv(tpex_att_file, "attention")
                 if err:
                     st.error(err)
@@ -781,9 +793,9 @@ with tab4:
                     st.session_state.regulatory_upload_info["tpex_attention"] = {
                         "codes": codes, "count": count,
                         "filename": tpex_att_file.name,
+                        "filesize": tpex_att_file.size,
                     }
                     rebuild_regulatory_data()
-                    st.success(f"Parsed {count} stocks")
                     st.rerun()
 
     st.markdown("---")
@@ -802,7 +814,7 @@ with tab4:
             info_td = st.session_state.regulatory_upload_info.get("twse_disposition")
             if info_td:
                 st.success(f"Loaded: {info_td['count']} stocks  ({info_td['filename']})")
-            if twse_disp_file is not None:
+            if _is_new_file(twse_disp_file, "twse_disposition"):
                 codes, details, count, err = _parse_regulatory_csv(twse_disp_file, "disposition")
                 if err:
                     st.error(err)
@@ -810,9 +822,9 @@ with tab4:
                     st.session_state.regulatory_upload_info["twse_disposition"] = {
                         "codes": codes, "details": details, "count": count,
                         "filename": twse_disp_file.name,
+                        "filesize": twse_disp_file.size,
                     }
                     rebuild_regulatory_data()
-                    st.success(f"Parsed {count} stocks")
                     st.rerun()
 
     with disp_c2:
@@ -825,7 +837,7 @@ with tab4:
             info_pd = st.session_state.regulatory_upload_info.get("tpex_disposition")
             if info_pd:
                 st.success(f"Loaded: {info_pd['count']} stocks  ({info_pd['filename']})")
-            if tpex_disp_file is not None:
+            if _is_new_file(tpex_disp_file, "tpex_disposition"):
                 codes, details, count, err = _parse_regulatory_csv(tpex_disp_file, "disposition")
                 if err:
                     st.error(err)
@@ -833,9 +845,9 @@ with tab4:
                     st.session_state.regulatory_upload_info["tpex_disposition"] = {
                         "codes": codes, "details": details, "count": count,
                         "filename": tpex_disp_file.name,
+                        "filesize": tpex_disp_file.size,
                     }
                     rebuild_regulatory_data()
-                    st.success(f"Parsed {count} stocks")
                     st.rerun()
 
     st.markdown("---")
