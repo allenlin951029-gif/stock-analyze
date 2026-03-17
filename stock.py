@@ -9,6 +9,7 @@ import json
 import math
 import re
 import threading
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -77,6 +78,10 @@ _BENCH_TTL_SECONDS = 300  # 5-minute TTL
 # [P1] Institutional full-market CSV cache — one download per (market, date)
 _inst_csv_cache: Dict[tuple, Any] = {}
 _inst_cache_lock = threading.Lock()
+
+# [FIX] Serialize TWSE/TPEx API requests to avoid rate-limiting
+# Only 1 thread can make an uncached TWSE request at a time
+_twse_request_semaphore = threading.Semaphore(1)
 
 
 def _get_cached_benchmark(ttl_seconds: int = _BENCH_TTL_SECONDS) -> pd.DataFrame:
@@ -1168,13 +1173,29 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
                     return None, "TWSE cached no-data"
                 return cached, None
 
-        url = f"https://www.twse.com.tw/fund/T86?response=csv&date={d_.strftime('%Y%m%d')}&selectType=ALLBUT0999"
-        r = sess.get(url, headers=headers, timeout=15)
-        if r.status_code != 200 or len(r.text) < 200:
+        # [FIX] Rate-limit guard: sleep before TWSE request to avoid 429/block
+        # [FIX] Serialize TWSE requests across all threads
+        with _twse_request_semaphore:
+            time.sleep(0.35)
+            url = f"https://www.twse.com.tw/fund/T86?response=csv&date={d_.strftime('%Y%m%d')}&selectType=ALLBUT0999"
+            # [FIX] Double-check cache inside semaphore (another thread may have fetched it)
             with _inst_cache_lock:
-                _inst_csv_cache[cache_key] = None
+                if cache_key in _inst_csv_cache:
+                    cached = _inst_csv_cache[cache_key]
+                    if cached is None:
+                        return None, "TWSE cached no-data"
+                    return cached, None
+            try:
+                r = sess.get(url, headers=headers, timeout=15)
+            except Exception as e:
+                # [FIX] Network error → do NOT cache, allow retry on next stock
+                return None, f"TWSE request error: {e}"
+        if r.status_code != 200 or len(r.text) < 200:
+            # [FIX] HTTP error (rate-limit etc.) → do NOT cache as None
+            # Only cache legitimate "no data" responses, not transient failures
             return None, f"TWSE HTTP {r.status_code}"
         if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
+            # This IS a legitimate no-data response → safe to cache
             with _inst_cache_lock:
                 _inst_csv_cache[cache_key] = None
             return None, "TWSE no data"
@@ -1195,16 +1216,28 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
                     return None, "TPEx cached no-data"
                 return cached, None
 
-        url = (
-            "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php"
-            f"?l=zh-tw&o=csv&se=EW&t=D&d={roc_date}&s=0,asc"
-        )
-        h2 = dict(headers)
-        h2["Referer"] = "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge.php"
-        r = sess.get(url, headers=h2, timeout=15)
-        if r.status_code != 200 or len(r.text) < 200:
+        # [FIX] Rate-limit guard + serialize
+        with _twse_request_semaphore:
+            time.sleep(0.2)
+            url = (
+                "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php"
+                f"?l=zh-tw&o=csv&se=EW&t=D&d={roc_date}&s=0,asc"
+            )
+            h2 = dict(headers)
+            h2["Referer"] = "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge.php"
+            # [FIX] Double-check cache inside semaphore
             with _inst_cache_lock:
-                _inst_csv_cache[cache_key] = None
+                if cache_key in _inst_csv_cache:
+                    cached = _inst_csv_cache[cache_key]
+                    if cached is None:
+                        return None, "TPEx cached no-data"
+                    return cached, None
+            try:
+                r = sess.get(url, headers=h2, timeout=15)
+            except Exception as e:
+                return None, f"TPEx request error: {e}"
+        if r.status_code != 200 or len(r.text) < 200:
+            # [FIX] HTTP error → do NOT cache, allow retry
             return None, f"TPEx HTTP {r.status_code}"
         if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
             with _inst_cache_lock:
