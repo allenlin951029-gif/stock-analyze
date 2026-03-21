@@ -1061,7 +1061,7 @@ with tab5:
             with h_c2:
                 h_avg_price = st.number_input("成交均價", min_value=0.0, step=0.1, format="%.2f", key="h_avg_price")
             with h_c3:
-                h_shares = st.number_input("股數（張）", min_value=0, step=1, key="h_shares")
+                h_shares = st.number_input("股數（股）", min_value=0, step=1, key="h_shares")
 
             if st.button("➕ 新增", key="h_add_btn", use_container_width=True):
                 h_val = h_stock.strip().upper()
@@ -1105,14 +1105,14 @@ with tab5:
         hdr1, hdr2, hdr3, hdr4, hdr5 = st.columns([2, 2, 2, 2, 1])
         hdr1.markdown("**股票代碼**")
         hdr2.markdown("**成交均價**")
-        hdr3.markdown("**股數（張）**")
+        hdr3.markdown("**股數（股）**")
         hdr4.markdown("**成本金額**")
         hdr5.markdown("**操作**")
 
         total_cost = 0.0
         indices_to_delete = []
         for i, h in enumerate(st.session_state.holdings):
-            cost = h["avg_price"] * h["shares"] * 1000
+            cost = h["avg_price"] * h["shares"]
             total_cost += cost
             r1, r2, r3, r4, r5 = st.columns([2, 2, 2, 2, 1])
             r1.text(h["stock_id"])
@@ -1256,5 +1256,3 @@ if archive_len > 0:
         st.code(str(content), language="text")
 else:
     st.info("No results yet. Use the tabs above to run an analysis.")
-
-
