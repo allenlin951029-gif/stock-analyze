@@ -1,6 +1,7 @@
 import json
 import io
 import os
+import csv
 from contextlib import redirect_stdout
 from datetime import datetime
 
@@ -59,21 +60,6 @@ def load_sectors_from_db():
     return st.session_state.get("_temp_local_sectors", {})
 
 
-def load_holdings_from_db():
-    db = get_db()
-    if db:
-        try:
-            doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
-            doc = doc_ref.get()
-            if doc.exists:
-                return doc.to_dict().get("holdings", [])
-            return []
-        except Exception as e:
-            st.warning(f"DB read (holdings) failed: {e}")
-            return []
-    return st.session_state.get("_temp_local_holdings", [])
-
-
 def save_sectors_to_db(data):
     db = get_db()
     if db:
@@ -87,6 +73,20 @@ def save_sectors_to_db(data):
         st.warning("No Firebase. Data is temporary.")
 
 
+def load_holdings_from_db():
+    db = get_db()
+    if db:
+        try:
+            doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
+            doc = doc_ref.get()
+            if doc.exists:
+                return doc.to_dict().get("holdings", [])
+            return []
+        except Exception:
+            return []
+    return st.session_state.get("_temp_local_holdings", [])
+
+
 def save_holdings_to_db(data):
     db = get_db()
     if db:
@@ -97,7 +97,6 @@ def save_holdings_to_db(data):
             st.error(f"DB write (holdings) failed: {e}")
     else:
         st.session_state["_temp_local_holdings"] = data
-        st.warning("No Firebase. Data is temporary.")
 
 
 # -------------------------
@@ -176,6 +175,147 @@ if "sector_as_of_date" not in st.session_state:
     st.session_state.sector_as_of_date = datetime.now().date()
 if "report_mode" not in st.session_state:
     st.session_state.report_mode = "human"
+if "regulatory_data" not in st.session_state:
+    st.session_state.regulatory_data = {
+        "attention_stocks": set(),
+        "disposition_stocks": {},
+    }
+if "regulatory_upload_info" not in st.session_state:
+    st.session_state.regulatory_upload_info = {
+        "twse_attention": None,
+        "tpex_attention": None,
+        "twse_disposition": None,
+        "tpex_disposition": None,
+    }
+
+
+# -------------------------
+# CSV Parsing for Regulatory Lists
+# -------------------------
+def _detect_encoding(raw_bytes):
+    """Try common TW encodings."""
+    for enc in ("utf-8-sig", "utf-8", "big5", "cp950"):
+        try:
+            raw_bytes.decode(enc)
+            return enc
+        except (UnicodeDecodeError, ValueError):
+            continue
+    return "big5"
+
+
+def _find_header_row(rows):
+    """Return (header_row_index, headers) by looking for '證券代號'."""
+    for i, row in enumerate(rows):
+        for cell in row:
+            if "證券代號" in str(cell):
+                return i, row
+    return None, None
+
+
+def _parse_regulatory_csv(uploaded_file, list_type):
+    """
+    Parse a regulatory CSV into structured data.
+    list_type: "attention" or "disposition"
+    Returns: (stock_codes_set, disposition_details_dict, count, error_msg)
+    """
+    try:
+        raw = uploaded_file.read()
+        enc = _detect_encoding(raw)
+        text = raw.decode(enc, errors="replace")
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+
+        hdr_idx, headers = _find_header_row(rows)
+        if hdr_idx is None:
+            return set(), {}, 0, "無法找到欄位標頭 (需包含「證券代號」)"
+
+        # Build column index mapping
+        col_map = {}
+        for ci, h in enumerate(headers):
+            h_clean = h.strip()
+            col_map[h_clean] = ci
+
+        code_col = col_map.get("證券代號")
+        if code_col is None:
+            return set(), {}, 0, "找不到「證券代號」欄位"
+
+        codes = set()
+        details = {}
+
+        for row in rows[hdr_idx + 1:]:
+            if len(row) <= code_col:
+                continue
+            stock_code = row[code_col].strip()
+            if not stock_code or not any(c.isdigit() for c in stock_code):
+                continue
+
+            codes.add(stock_code)
+
+            if list_type == "disposition":
+                # Extract disposition detail fields
+                measure = ""
+                content = ""
+                remarks = ""
+                period = ""
+
+                # TWSE format: 處置措施, 處置內容, 備註, 處置起迄時間
+                # TPEx format: 處置原因, 處置內容, 處置起訖時間
+                for key in ("處置措施", "處置原因"):
+                    if key in col_map and len(row) > col_map[key]:
+                        measure = row[col_map[key]].strip()
+                        if measure:
+                            break
+
+                if "處置內容" in col_map and len(row) > col_map["處置內容"]:
+                    content = row[col_map["處置內容"]].strip()
+
+                for key in ("備註",):
+                    if key in col_map and len(row) > col_map[key]:
+                        remarks = row[col_map[key]].strip()
+
+                for key in ("處置起迄時間", "處置起訖時間"):
+                    if key in col_map and len(row) > col_map[key]:
+                        period = row[col_map[key]].strip()
+                        if period:
+                            break
+
+                # Keep only the latest entry per stock code
+                if stock_code not in details:
+                    details[stock_code] = {
+                        "measure": measure,
+                        "content": content,
+                        "remarks": remarks,
+                        "period": period,
+                    }
+
+        return codes, details, len(codes), None
+    except Exception as e:
+        return set(), {}, 0, f"解析錯誤: {e}"
+
+
+def rebuild_regulatory_data():
+    """Rebuild the merged regulatory_data from all uploads."""
+    info = st.session_state.regulatory_upload_info
+    all_attention = set()
+    all_disposition = {}
+
+    for key in ("twse_attention", "tpex_attention"):
+        data = info.get(key)
+        if data and "codes" in data:
+            all_attention.update(data["codes"])
+
+    for key, source_label in (("twse_disposition", "TWSE"), ("tpex_disposition", "TPEx")):
+        data = info.get(key)
+        if data and "details" in data:
+            for code, detail in data["details"].items():
+                detail_with_source = dict(detail, source=source_label)
+                if code not in all_disposition:
+                    all_disposition[code] = detail_with_source
+
+    st.session_state.regulatory_data = {
+        "attention_stocks": all_attention,
+        "disposition_stocks": all_disposition,
+    }
 
 
 # -------------------------
@@ -233,7 +373,10 @@ def run_analysis(stock_id, as_of_date, write_history):
         # [span_1](start_span)呼叫 stock.py，傳入對應的 mode[span_1](end_span)
         # mode="human" -> 只回傳文字，速度快 (Quick Screen)
         # mode="ai"    -> 回傳完整 JSON，速度慢 (Deep Dive)
-        raw_result = analyze_stock_technical(sid, as_of_date=as_of_date, mode=current_mode)
+        raw_result = analyze_stock_technical(
+            sid, as_of_date=as_of_date, mode=current_mode,
+            regulatory_data=st.session_state.get("regulatory_data")
+        )
 
         if current_mode == "human":
             # Quick Screen 模式：省時間，不產生 AI 數據
@@ -270,7 +413,8 @@ def run_sector_analysis(sector_name, as_of_date, custom_list=None):
     try:
         # [span_2](start_span)Sector Scan 固定輸出文字列表 (Human mode)[span_2](end_span)
         final_report = analyze_sector_performance(
-            sector_name, as_of_date=as_of_date, custom_tickers=custom_list, mode="human"
+            sector_name, as_of_date=as_of_date, custom_tickers=custom_list, mode="human",
+            regulatory_data=st.session_state.get("regulatory_data")
         )
     except Exception as e:
         final_report = f"Sector analysis failed: {e}"
@@ -293,7 +437,8 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
         for stock in target_list:
             try:
                 # 強制跑 AI 模式收集數據
-                res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="ai")
+                res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="ai",
+                                              regulatory_data=st.session_state.get("regulatory_data"))
                 if isinstance(res, dict):
                     all_reports[stock] = res.get("ai_report", {})
                 else:
@@ -322,7 +467,8 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
         for stock in target_list:
             try:
                 # 跑 Human 模式 (快)
-                res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="human")
+                res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="human",
+                                              regulatory_data=st.session_state.get("regulatory_data"))
                 if isinstance(res, dict):
                     full_content.append(res.get("human_report", str(res)))
                 else:
@@ -399,6 +545,17 @@ with st.sidebar:
     else:
         st.warning("No cloud DB")
 
+    # Regulatory list status
+    _reg_attn = len(st.session_state.regulatory_data.get("attention_stocks", set()))
+    _reg_disp = len(st.session_state.regulatory_data.get("disposition_stocks", {}))
+    if _reg_attn or _reg_disp:
+        st.divider()
+        st.subheader("Regulatory Lists")
+        st.caption(f"Attention: {_reg_attn} | Disposition: {_reg_disp}")
+    else:
+        st.divider()
+        st.caption("No regulatory lists loaded")
+
     # ==========================================
     # AI 操盤手提示詞複製區（可折疊）
     # ==========================================
@@ -406,7 +563,6 @@ with st.sidebar:
     st.subheader("🤖 AI 提示詞")
     st.caption("展開複製，連同 JSON 貼給 AI")
 
-    # --- Prompt A: 潛力股篩選 ---
     with st.expander("📋 提示詞 A：潛力股篩選", expanded=False):
         prompt_a = r"""你是一位台股技術分析專家，擅長多時間框架趨勢分析與量價結構判讀。
 我將上傳一份 JSON 格式的候選股技術面資料，請依照以下框架嚴格篩選出具潛力的標的。
@@ -432,236 +588,150 @@ with st.sidebar:
 - flag_price_up_vol_up = true（價量齊揚）
 - vol_ratio_5d > 1.0，up_down_vol_ratio_20d > 1.0
 - obv_slope_5d > 0 且 obv_slope_20d > 0
-⚠️ 反向審計：價格上漲但 vol_ratio_5d < 0.8 或 obv_slope_20d < 0 → 標註「量能不足，突破可信度存疑」
+⚠️ 反向審計：價格上漲但 vol_ratio_5d < 0.8 或 obv_slope_20d < 0 → 標註「量能不足」
 
 【第四層：籌碼面 — 修正項，非決定項】
 - foreign_20d_net > 0 或 trust_20d_net > 0
 - flag_inst_consensus_buy = true 最佳
 - flag_foreign_divergence = true → 標註背離
-- flag_inst_consensus_sell = true → 降級
 
 【第五層：風險評估】
 - risk_reward_ratio ≥ 1.5 合格，≥ 2.0 優秀
 - flag_poor_risk_reward = true 直接排除
-- atr_stop_loss_pct < -15%、max_drawdown_20d > -20% 需警示
 - beta_60d > 2.0 標註「高 Beta」
 
-═══ 輸出格式 ═══
-每檔股票：潛力評級（5星制）、趨勢/動能/量價/籌碼/風險一句話摘要、綜合判斷、風險提醒。
-最後做排序總表。
+═══ 輸出 ═══
+每檔：5星評級、趨勢/動能/量價/籌碼/風險摘要、綜合判斷、風險提醒。最後排序總表。
 
-═══ 重要規則 ═══
-1. 必須交叉驗證至少 3 個維度
-2. 每個看多結論附反面檢查：「如果我看錯了，最可能錯在哪？」
-3. supertrend_bullish = false 必須標註
-4. entry_trigger_veto 不為空時逐條列出
+═══ 規則 ═══
+1. 交叉驗證至少 3 維度
+2. 每個看多附反面檢查
+3. supertrend_bullish=false 必須標註
+4. entry_trigger_veto 不為空逐條列出
 
-═══ 我的資料如下 ═══
+═══ 資料 ═══
 【貼上 sector_候選名單 JSON】"""
         st.code(prompt_a, language="text")
 
-    # --- Prompt B: 進攻名單（含網頁搜尋 + 川普推文）---
     with st.expander("🔥 提示詞 B：進攻名單與買點（需開網頁搜尋）", expanded=False):
-        prompt_b = r"""你是一位台股短中線交易策略師，風格為「灌溉鮮花、砍掉雜草」。
-我將提供候選股技術面 JSON + 前一輪篩選結果，請制定進攻名單與買點。
-
-⚠️ 請先開啟「網頁搜尋」功能，分析前先完成以下搜尋任務。
-
-═══ 第零步：網頁搜尋任務（先做完再分析）═══
-
-【搜尋 1：國際市場與恐慌指標】
-- "VIX index today"
-- "S&P 500 this week"、"美股 本週"、"台股 大盤 本週"
-- "Fed interest rate latest"
-→ VIX > 25 標註警戒，VIX > 40 標註「恐慌 — CTA 大逃殺買點」
-
-【搜尋 2：地緣政治與總經風險】
-- "geopolitical risk 2026"、"台海 地緣政治 最新"
-- "oil price today"、"global supply chain disruption"
-
-【搜尋 3：川普社群發文與市場反應 🇺🇸】
-- "Trump Truth Social latest post"
-- "Trump tariff latest"
-- "Trump trade policy 2026"
-- "川普 關稅 最新"
-- "Trump statement market reaction"
-目的：
-a) 川普最近是否有發文提及關稅、制裁、中國/台灣、科技業、Fed？
-b) 這些發文是否已引發市場反應（美股期貨波動、特定板塊暴跌/暴漲）？
-c) 對我候選名單中的標的有無直接衝擊？（例如加徵半導體關稅 → 影響台積電供應鏈）
-⚠️ 川普發文的特性：時間不固定、內容經常反覆、市場反應可能過度。
-→ 已反映在股價的舊消息不算新風險
-→ 但剛發布且市場尚未完全反應的新推文 = 重大變數
-
-【搜尋 4：個股產業消息（Bottom-up 供應鏈研調）】
-每檔候選股搜尋：
-- "[股票代號] [公司名] 最新消息 2026"
-- "[公司名] 供應鏈 拉貨"、"[公司名] 營收 EPS"
-- "[所屬產業] 產業趨勢 2026"
-
-【搜尋 5：逆風觀點（Contrarian View）】
-- "[公司名] 利空 風險"、"[所屬產業] 泡沫 過熱"
-
-⚠️ 搜尋紀律：忽略社群農場文，優先採信法說會/財報/供應鏈數據/官方統計。
-
-═══ 搜尋結果彙整（先輸出）═══
-
-## 📡 市場環境掃描
-**VIX**：XX | **狀態**：正常/警戒/恐慌
-**美股**：[摘要] | **台股**：[摘要]
-**地緣風險**：[摘要] | **油價**：$XX
-
-## 🇺🇸 川普動態
-**最近發文摘要**：[關鍵推文內容與時間]
-**涉及議題**：[關稅/Fed/中國/科技業/其他]
-**市場已反應程度**：[已充分反應/部分反應/尚未反應]
-**對候選名單影響**：[直接衝擊/間接影響/無關]
-
-## 📰 個股消息面
-（每檔：產業趨勢、驅動力🟢🟡🔴、重大消息、供應鏈拉貨、利多出盡風險、逆風觀點）
-
-═══ 選股與買入邏輯 ═══
-1. 只收鮮花：trend_state="uptrend" + aligned_bull 首選，pos_52w_pct > 70
-2. 需求驅動優先：🟢需求驅動 > 🟡成本改善 > 🔴成本轉嫁
-3. 基本面搭配技術面：有 EPS 支撐的突破更安心
-4. 捕捉市場犯錯：大跌但基本面無惡化 → 「潛在錯殺」
-5. 利多出盡檢查：搜尋到利多但 stock_ret_20d ≤ 0 → 「⚠️ overhyped」
-6. 川普風險折價：若川普最新發文直接衝擊某標的所屬產業且市場尚未反應 → 該標的部位自動打 5 折或暫緩進場
-7. 禁止在 downtrend 攤平
-
-【買點】依序：AVWAP → POC → Fibonacci → 均線 → 缺口
-【停損】atr_stop_loss | 【目標】target_resistance → fib_ext_1272/1618
-【部位】VIX > 30 → 所有部位打 7 折；川普新推文衝擊 → 再打折
-
-═══ 輸出 ═══
-Tier 1（立即進場）/ Tier 2（監控中）/ ❌ 排除
-每檔含：進場區間、停損、目標、RR、驅動力、消息面、逆風觀點、川普風險、最大隱憂
-最後：資金配置建議（含現金部位 15-20%，高風險時 25%+）
-
-═══ 重要規則 ═══
-1. RR < 1.5 禁入進攻名單
-2. 全部不合格就直接說「建議觀望持有現金」
-3. 每個買入建議附最壞情境
-4. 搜尋結果全是看多 → 標註「擁擠風險」
-5. 消息必須標明來源，不編造新聞
-
-═══ 前一輪篩選結果 ═══
-【貼上提示詞 A 輸出】
-
-═══ 原始技術面資料 ═══
-【貼上 sector_候選名單 JSON】"""
-        st.code(prompt_b, language="text")
-
-    # --- Prompt C: 持股賣/抱決策（含網頁搜尋 + 川普推文）---
-    with st.expander("🌸 提示詞 C：持股賣/抱決策（需開網頁搜尋）", expanded=False):
-        prompt_c = r"""你是一位台股投資組合風控專家，核心原則「灌溉鮮花、砍掉雜草」。
-我將上傳持股技術面 JSON，請對每檔做「賣出 vs 續抱」決策分析。
-
+        prompt_b = r"""你是一位台股短中線交易策略師，風格「灌溉鮮花、砍掉雜草」。
 ⚠️ 請先開啟「網頁搜尋」功能。
 
-═══ 第零步：網頁搜尋任務 ═══
+═══ 第零步：網頁搜尋 ═══
 
-【搜尋 1：系統性風險掃描】
-- "VIX index today"、"台股加權指數 本週"、"Fed 利率 最新"
-- "美中關係 最新"、"oil price today"
-→ 風險等級：🟢低 / 🟡中 / 🔴高
+【搜尋 1：市場與恐慌指標】
+"VIX index today"、"S&P 500 this week"、"台股 大盤 本週"
+→ VIX>25 警戒，VIX>40「CTA大逃殺買點」
 
-【搜尋 2：川普社群發文 🇺🇸】
-- "Trump Truth Social latest post"
-- "Trump tariff latest 2026"
-- "川普 關稅 最新"
-- "Trump China Taiwan semiconductor"
-- "Trump statement market impact"
-重點關注：
-a) 最近 48 小時內是否有新發文？涉及什麼議題？
-b) 對我的持股產業有無直接衝擊？
-c) 市場已反應多少？（已消化 vs 剛發布）
-d) 過去類似發文後市場的反應模式（通常過度反應後回彈？還是趨勢性轉變？）
-⚠️ 判斷原則：
-→ 川普推文引發的恐慌殺盤 ≠ 基本面崩壞，不要因此建議賣出基本面無虞的持股
-→ 但如果推文內容是「實質政策變化」（如正式簽署行政命令）而非口頭威脅 → 風險等級上調
+【搜尋 2：地緣政治】
+"geopolitical risk 2026"、"台海 最新"、"oil price today"
 
-【搜尋 3：每檔持股個股消息】
-每檔搜尋：
-- "[股票代號] [公司名] 最新消息 2026"
-- "[公司名] 法說會 財報"、"[公司名] 供應鏈 訂單 拉貨"
+【搜尋 3：川普社群發文 🇺🇸】
+"Trump Truth Social latest"、"Trump tariff latest"、"川普 關稅 最新"
+"Trump statement market reaction"
+→ 是否提及關稅/制裁/中國/台灣/科技業/Fed？
+→ 市場已反應程度？對候選標的有無衝擊？
+⚠️ 口頭威脅 vs 正式行政命令要區分
 
-【搜尋 4：逆風觀點】
-- "[公司名] 風險 利空"、"[所屬產業] 衰退 泡沫"
-→ 找不到任何看空觀點 = 過度擁擠警訊
+【搜尋 4：個股消息（Bottom-up）】
+每檔搜："[代號] 最新消息"、"[公司] 供應鏈 拉貨"、"[產業] 趨勢 2026"
+
+【搜尋 5：逆風觀點】
+"[公司] 利空 風險"、"[產業] 泡沫 過熱"
+⚠️ 忽略社群農場文，優先法說會/財報/供應鏈數據
 
 ═══ 搜尋結果彙整（先輸出）═══
+📡 市場環境（VIX/美股/台股/地緣/油價）
+🇺🇸 川普動態（發文摘要/議題/反應程度/性質/對候選影響）
+📰 每檔消息面（驅動力🟢🟡🔴/重大消息/供應鏈/利多出盡/逆風觀點）
 
-## 📡 系統性風險
-**VIX**：XX | **等級**：🟢/🟡/🔴
-**美股**：[摘要] | **台股**：[摘要] | **地緣**：[摘要]
+═══ 選股邏輯 ═══
+1. 只收鮮花：uptrend + aligned_bull，pos_52w_pct>70
+2. 需求驅動優先：🟢需求>🟡成本改善>🔴成本轉嫁
+3. 基本面+技術面：有EPS支撐的突破更安心
+4. 捕捉市場犯錯：大跌但基本面無虞→「錯殺」
+5. 利多出盡：利多但ret≤0→「overhyped」
+6. 川普風險折價：正式政策衝擊→部位打5折或暫緩
+7. 禁止在downtrend攤平
 
-## 🇺🇸 川普動態
-**最近發文**：[時間 + 內容摘要]
-**性質判斷**：[口頭威脅 / 政策預告 / 正式行政命令]
-**影響持股**：[列出直接受衝擊的持股代號及影響路徑]
-**歷史模式**：[過去類似推文後市場表現]
-**建議應對**：[不需反應 / 密切觀察 / 高beta先減碼]
+【買點】AVWAP→POC→Fib→均線→缺口
+【部位】VIX>30打7折；川普衝擊再折
 
-## 📰 個股消息面
-（每檔：重大消息、供應鏈狀況、利多出盡、逆風觀點、消息vs技術一致性）
+═══ 輸出 ═══
+Tier1/Tier2/排除，每檔含：進場區間、停損、目標、RR、驅動力、川普風險、最大隱憂
+資金配置（現金15-20%，高風險25%+）
 
-═══ 技術面分析框架 ═══
+═══ 規則 ═══
+1. RR<1.5禁入 2. 全不合格就「建議觀望」
+3. 川普推文恐慌≠基本面崩壞 4. 消息標來源不編造
 
-【鮮花指標】trend_state=uptrend、aligned_bull、supertrend_bullish=true、rs_vs_bench_20d>0、
-flag_price_up_vol_up=true、RR≥1.5、法人買超
+═══ 前一輪結果 ═══
+【貼上提示詞A輸出】
+═══ 技術面資料 ═══
+【貼上 JSON】"""
+        st.code(prompt_b, language="text")
 
-【雜草指標】downtrend、aligned_bear、supertrend_bullish=false、頂背離、
-rs弱於大盤且惡化、RR<1.0、flag_poor_risk_reward=true、法人共識賣超、放量殺盤
+    with st.expander("🌸 提示詞 C：持股賣/抱決策（需開網頁搜尋）", expanded=False):
+        prompt_c = r"""你是一位台股投資組合風控專家，核心原則「灌溉鮮花、砍掉雜草」。
+⚠️ 請先開啟「網頁搜尋」功能。
+
+═══ 第零步：網頁搜尋 ═══
+
+【搜尋 1：系統性風險】
+"VIX index today"、"台股 本週"、"Fed 利率"、"美中關係"、"oil price"
+→ 🟢低/🟡中/🔴高
+
+【搜尋 2：川普發文 🇺🇸】
+"Trump Truth Social latest"、"Trump tariff 2026"、"川普 關稅 最新"
+"Trump China Taiwan semiconductor"
+→ 48hr內新發文？對持股產業衝擊？口頭vs行政命令？
+→ 川普推文恐慌 ≠ 基本面崩壞
+
+【搜尋 3：每檔持股消息】
+"[代號] 最新消息"、"[公司] 法說會 財報"、"[公司] 供應鏈"
+
+【搜尋 4：逆風觀點】
+"[公司] 風險 利空"、"[產業] 衰退 泡沫"
+→ 找不到看空觀點 = 過度擁擠
+
+═══ 搜尋結果（先輸出）═══
+📡 系統性風險（VIX/等級/美股/台股/地緣）
+🇺🇸 川普動態（發文/性質/影響持股/歷史模式/應對建議）
+📰 每檔消息面
+
+═══ 分析框架 ═══
+【鮮花】uptrend+aligned_bull+supertrend_bullish+跑贏大盤+價量齊揚+RR≥1.5+法人買超
+【雜草】downtrend+aligned_bear+supertrend翻空+頂背離+弱於大盤+RR<1.0+法人賣超+放量殺盤
 
 ═══ 消息面交叉驗證 ═══
+- 利多不漲⚠️：利多+ret≤0+量縮 → overhyped
+- 利空不跌✅：利空+trend仍uptrend → 籌碼穩定
+- 川普衝擊：推文但技術未破→觀察；技術已破+推文加壓→減碼
+- 擁擠風險：beta>1.5+high_vol+無逆風觀點 → 連鎖停損
+- 戰略彈性：供應鏈實際拉貨支撐→可短轉長；weekly也轉空→出場
 
-【利多不漲⚠️】搜尋到利多 + stock_ret_20d ≤ 0 + 量縮 → overhyped
-【利空不跌✅】搜尋到利空 + trend仍uptrend + 量穩 → 籌碼穩定已消化
-【川普衝擊判斷】推文衝擊但技術面未破 → 觀察；技術面已破 + 推文加壓 → 減碼
-【擁擠風險】beta>1.5 + high_vol + 找不到逆風觀點 → 連鎖停損風險高
-【戰略彈性】技術弱但供應鏈拉貨實際數據支撐 → 可短轉長；weekly也轉空+消息面無支撐 → 出場
+═══ 輸出 ═══
+每檔：🌸鮮花/⚠️邊緣/🪓雜草
+含趨勢、鮮花vs雜草計分、風險、籌碼、消息面、川普影響
+決策表：基本/轉強/惡化/系統性風險/川普升級 各情境
+反向審計：續抱最大風險？賣出可能錯過？
+持股總表（含消息面+川普風險欄位）
+整體組合建議（鮮花雜草比/川普曝險度/現金部位/集中度）
 
-═══ 輸出格式 ═══
+═══ 規則 ═══
+1. 全面轉空不續抱 2. 續抱必附停損
+3. 雜草>50%→「組合需大幅調整」
+4. VIX>40+CTA殺盤→不恐慌賣基本面好的（阿呆谷）
+5. 但擁擠高槓桿股仍先砍部分（風控成本）
+6. 川普口頭威脅≠實質政策 7. 農場文不算依據
 
-每檔持股：
-### [代號] — 🌸鮮花 / ⚠️邊緣 / 🪓雜草
-- 趨勢：日線/週線/MTF/Supertrend
-- 鮮花 vs 雜草計分
-- 風險：RR、停損、目標、Beta、回撤
-- 籌碼：外資/投信 20d、法人共識
-- 📰 消息面：驅動力🟢🟡🔴、利多出盡、技術vs消息一致性、逆風觀點
-- 🇺🇸 川普影響：[無/間接/直接] — [說明]
-- 決策表：基本情境/轉強/惡化/系統性風險/川普升級 各情境的動作與觸發條件
-- 反向審計：續抱最大風險？賣出可能錯過什麼？
-
-持股體質總表（含消息面與川普影響欄位）
-
-整體組合建議：
-- 鮮花/雜草比例
-- 川普政策風險曝險度（幾檔持股在衝擊範圍內）
-- 系統性風險等級對應的行動
-- 現金部位建議（🔴時 ≥ 25%）
-
-═══ 重要規則 ═══
-1. 技術面全面轉空不要續抱
-2. 戰略彈性只限週線仍完好的持股
-3. 每個續抱必附停損價位
-4. 雜草超過 50% → 「組合需大幅調整」
-5. ETF 側重趨勢 + 總經判斷
-6. VIX>40 + CTA大逃殺 → 不恐慌賣出基本面無虞的持股（阿呆谷）
-7. 但擁擠高槓桿股仍建議先砍部分部位（風控成本）
-8. 川普推文恐慌 ≠ 基本面崩壞 → 區分口頭威脅與實質政策
-9. 社群農場文不算分析依據
-10. 消息必須標明來源
-
-═══ 我的持股資料如下 ═══
+═══ 持股資料 ═══
 【貼上 sector_持股 JSON】"""
         st.code(prompt_c, language="text")
 # -------------------------
 # Main Content
 # -------------------------
-tab1, tab2, tab3, tab4 = st.tabs(["Stock Analysis", "Sector Analysis", "Custom Sectors", "Holdings"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Stock Analysis", "Sector Analysis", "Custom Sectors", "Regulatory Lists", "Holdings"])
 
 # --- Tab 1: Stock Analysis ---
 with tab1:
@@ -807,15 +877,178 @@ with tab3:
                 if st.button("Delete this sector", type="primary"):
                     del st.session_state.custom_sectors[edit_group]
                     save_sectors_to_db(st.session_state.custom_sectors)
-                    # Clear stale selectbox key to prevent KeyError on rerun
                     if "mgmt_select" in st.session_state:
                         del st.session_state["mgmt_select"]
                     st.rerun()
 
-# --- Tab 4: Holdings ---
+# --- Tab 4: Regulatory Lists ---
 with tab4:
+    st.header("Regulatory Lists (Attention / Disposition)")
+    st.caption(
+        "Upload CSV files downloaded from TWSE or TPEx. "
+        "Stocks on these lists will be flagged during analysis."
+    )
+
+    # --- Current status summary ---
+    reg = st.session_state.regulatory_data
+    attn_count = len(reg.get("attention_stocks", set()))
+    disp_count = len(reg.get("disposition_stocks", {}))
+    both_count = len(reg.get("attention_stocks", set()) & set(reg.get("disposition_stocks", {}).keys()))
+
+    if attn_count or disp_count:
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Attention", attn_count)
+        sc2.metric("Disposition", disp_count)
+        sc3.metric("Both", both_count)
+    else:
+        st.info("No regulatory lists loaded. Upload CSVs below.")
+
+    st.markdown("---")
+
+    # Helper: check if an uploaded file is the same one we already processed
+    def _is_new_file(uploaded_file, info_key):
+        """Return True only if this file hasn't been processed yet."""
+        if uploaded_file is None:
+            return False
+        existing = st.session_state.regulatory_upload_info.get(info_key)
+        if existing is None:
+            return True
+        # Compare name + size to detect a genuinely new upload
+        return (uploaded_file.name != existing.get("filename")
+                or uploaded_file.size != existing.get("filesize"))
+
+    # --- Attention uploads ---
+    st.subheader("Attention List (注意股)")
+    att_c1, att_c2 = st.columns(2)
+
+    with att_c1:
+        with st.container(border=True):
+            st.markdown("**TWSE Attention**")
+            twse_att_file = st.file_uploader(
+                "Upload TWSE Attention CSV", type=["csv"],
+                key="upload_twse_attention"
+            )
+            info_ta = st.session_state.regulatory_upload_info.get("twse_attention")
+            if info_ta:
+                st.success(f"Loaded: {info_ta['count']} stocks  ({info_ta['filename']})")
+            if _is_new_file(twse_att_file, "twse_attention"):
+                codes, _, count, err = _parse_regulatory_csv(twse_att_file, "attention")
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.regulatory_upload_info["twse_attention"] = {
+                        "codes": codes, "count": count,
+                        "filename": twse_att_file.name,
+                        "filesize": twse_att_file.size,
+                    }
+                    rebuild_regulatory_data()
+                    st.rerun()
+
+    with att_c2:
+        with st.container(border=True):
+            st.markdown("**TPEx Attention**")
+            tpex_att_file = st.file_uploader(
+                "Upload TPEx Attention CSV", type=["csv"],
+                key="upload_tpex_attention"
+            )
+            info_pa = st.session_state.regulatory_upload_info.get("tpex_attention")
+            if info_pa:
+                st.success(f"Loaded: {info_pa['count']} stocks  ({info_pa['filename']})")
+            if _is_new_file(tpex_att_file, "tpex_attention"):
+                codes, _, count, err = _parse_regulatory_csv(tpex_att_file, "attention")
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.regulatory_upload_info["tpex_attention"] = {
+                        "codes": codes, "count": count,
+                        "filename": tpex_att_file.name,
+                        "filesize": tpex_att_file.size,
+                    }
+                    rebuild_regulatory_data()
+                    st.rerun()
+
+    st.markdown("---")
+
+    # --- Disposition uploads ---
+    st.subheader("Disposition List (處置股)")
+    disp_c1, disp_c2 = st.columns(2)
+
+    with disp_c1:
+        with st.container(border=True):
+            st.markdown("**TWSE Disposition**")
+            twse_disp_file = st.file_uploader(
+                "Upload TWSE Disposition CSV", type=["csv"],
+                key="upload_twse_disposition"
+            )
+            info_td = st.session_state.regulatory_upload_info.get("twse_disposition")
+            if info_td:
+                st.success(f"Loaded: {info_td['count']} stocks  ({info_td['filename']})")
+            if _is_new_file(twse_disp_file, "twse_disposition"):
+                codes, details, count, err = _parse_regulatory_csv(twse_disp_file, "disposition")
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.regulatory_upload_info["twse_disposition"] = {
+                        "codes": codes, "details": details, "count": count,
+                        "filename": twse_disp_file.name,
+                        "filesize": twse_disp_file.size,
+                    }
+                    rebuild_regulatory_data()
+                    st.rerun()
+
+    with disp_c2:
+        with st.container(border=True):
+            st.markdown("**TPEx Disposition**")
+            tpex_disp_file = st.file_uploader(
+                "Upload TPEx Disposition CSV", type=["csv"],
+                key="upload_tpex_disposition"
+            )
+            info_pd = st.session_state.regulatory_upload_info.get("tpex_disposition")
+            if info_pd:
+                st.success(f"Loaded: {info_pd['count']} stocks  ({info_pd['filename']})")
+            if _is_new_file(tpex_disp_file, "tpex_disposition"):
+                codes, details, count, err = _parse_regulatory_csv(tpex_disp_file, "disposition")
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.regulatory_upload_info["tpex_disposition"] = {
+                        "codes": codes, "details": details, "count": count,
+                        "filename": tpex_disp_file.name,
+                        "filesize": tpex_disp_file.size,
+                    }
+                    rebuild_regulatory_data()
+                    st.rerun()
+
+    st.markdown("---")
+
+    # --- Loaded stock codes detail ---
+    if attn_count or disp_count:
+        with st.expander("View loaded stock codes", expanded=False):
+            if attn_count:
+                attn_sorted = sorted(reg["attention_stocks"])
+                st.markdown(f"**Attention ({attn_count})**: {', '.join(attn_sorted)}")
+            if disp_count:
+                disp_sorted = sorted(reg["disposition_stocks"].keys())
+                st.markdown(f"**Disposition ({disp_count})**: {', '.join(disp_sorted)}")
+
+        # Clear all button
+        if st.button("Clear all regulatory data", type="primary"):
+            st.session_state.regulatory_data = {
+                "attention_stocks": set(),
+                "disposition_stocks": {},
+            }
+            st.session_state.regulatory_upload_info = {
+                "twse_attention": None,
+                "tpex_attention": None,
+                "twse_disposition": None,
+                "tpex_disposition": None,
+            }
+            st.rerun()
+
+# --- Tab 5: Holdings ---
+with tab5:
     st.header("📊 Holdings Management")
-    st.caption("管理你的持股清單（股票代碼、成交均價、股數），方便搭配分析器使用")
+    st.caption("管理持股清單（股票代碼、成交均價、股數），方便搭配分析器使用")
 
     col_h1, col_h2 = st.columns([1, 1])
 
@@ -839,7 +1072,6 @@ with tab4:
                 elif h_shares <= 0:
                     st.error("股數須 > 0")
                 else:
-                    # Check duplicate
                     existing = [h["stock_id"] for h in st.session_state.holdings]
                     if h_val in existing:
                         st.error(f"{h_val} 已存在，請先刪除再重新新增")
@@ -857,11 +1089,9 @@ with tab4:
         with st.container(border=True):
             st.subheader("快速操作")
             if st.session_state.holdings:
-                # Build holdings as custom sector for quick analysis
                 holdings_tickers = [h["stock_id"] for h in st.session_state.holdings]
                 st.markdown(f"**持股清單**：`{', '.join(holdings_tickers)}`")
-                if st.button("🔍 用分析器跑持股報告", key="h_run_sector", use_container_width=True):
-                    # Temporarily inject holdings as a custom sector and run
+                if st.button("🔍 建立「持股」族群", key="h_run_sector", use_container_width=True):
                     st.session_state.custom_sectors["持股"] = holdings_tickers
                     save_sectors_to_db(st.session_state.custom_sectors)
                     st.success("已建立「持股」族群，請切到 Sector Analysis → Custom → 持股 執行分析")
@@ -869,12 +1099,9 @@ with tab4:
             else:
                 st.info("尚無持股資料")
 
-    # Holdings table display
     st.divider()
     if st.session_state.holdings:
         st.subheader("目前持股")
-
-        # Table header
         hdr1, hdr2, hdr3, hdr4, hdr5 = st.columns([2, 2, 2, 2, 1])
         hdr1.markdown("**股票代碼**")
         hdr2.markdown("**成交均價**")
@@ -884,9 +1111,8 @@ with tab4:
 
         total_cost = 0.0
         indices_to_delete = []
-
         for i, h in enumerate(st.session_state.holdings):
-            cost = h["avg_price"] * h["shares"] * 1000  # 1張 = 1000股
+            cost = h["avg_price"] * h["shares"] * 1000
             total_cost += cost
             r1, r2, r3, r4, r5 = st.columns([2, 2, 2, 2, 1])
             r1.text(h["stock_id"])
@@ -897,17 +1123,15 @@ with tab4:
                 if st.button("🗑️", key=f"h_del_{i}_{h['stock_id']}"):
                     indices_to_delete.append(i)
 
-        # Process deletions
         if indices_to_delete:
             for idx in sorted(indices_to_delete, reverse=True):
-                removed = st.session_state.holdings.pop(idx)
+                st.session_state.holdings.pop(idx)
             save_holdings_to_db(st.session_state.holdings)
             st.rerun()
 
         st.divider()
         st.markdown(f"**持股總成本**：`${total_cost:,.0f}`　|　**持股檔數**：`{len(st.session_state.holdings)}`")
 
-        # Clear all
         if st.button("🗑️ 清空全部持股", type="primary", key="h_clear_all"):
             st.session_state.holdings = []
             save_holdings_to_db([])
