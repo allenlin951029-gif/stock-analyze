@@ -953,13 +953,18 @@ with tab3:
     with col_mgmt_2:
         with st.container(border=True):
             st.subheader("Edit Sector")
+
+            # Handle pending deletion from previous run
+            if st.session_state.get("_pending_delete_sector"):
+                sect_to_del = st.session_state.pop("_pending_delete_sector")
+                if sect_to_del in st.session_state.custom_sectors:
+                    del st.session_state.custom_sectors[sect_to_del]
+                    save_sectors_to_db(st.session_state.custom_sectors)
+
             if not st.session_state.custom_sectors:
                 st.info("No data")
             else:
                 sector_keys = list(st.session_state.custom_sectors.keys())
-                # Guard: if widget remembers a deleted key, reset it
-                if st.session_state.get("mgmt_select") not in sector_keys:
-                    st.session_state["mgmt_select"] = sector_keys[0] if sector_keys else None
 
                 edit_group = st.selectbox(
                     "Select sector",
@@ -1000,10 +1005,8 @@ with tab3:
 
                     st.divider()
                     if st.button("Delete this sector", type="primary"):
-                        del st.session_state.custom_sectors[edit_group]
-                        save_sectors_to_db(st.session_state.custom_sectors)
-                        # Force widget to forget the deleted value
-                        st.session_state["mgmt_select"] = None
+                        # Schedule deletion for next rerun (before widget renders)
+                        st.session_state["_pending_delete_sector"] = edit_group
                         st.rerun()
 
 # --- Tab 4: Regulatory Lists ---
