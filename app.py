@@ -100,7 +100,7 @@ def save_holdings_to_db(data):
 
 
 def load_regulatory_from_db():
-    """Load attention & disposition lists from Firestore."""
+    """Load attention & disposition lists from Firestore so they survive restarts."""
     db = get_db()
     if db:
         try:
@@ -108,36 +108,33 @@ def load_regulatory_from_db():
             doc = doc_ref.get()
             if doc.exists:
                 d = doc.to_dict()
-                attn_list = d.get("regulatory_attention", [])
-                disp_dict = d.get("regulatory_disposition", {})
+                attn = d.get("regulatory_attention", [])
+                disp = d.get("regulatory_disposition", {})
                 return {
-                    "attention_stocks": set(attn_list),
-                    "disposition_stocks": disp_dict,
+                    "attention_stocks": set(attn) if isinstance(attn, list) else set(),
+                    "disposition_stocks": disp if isinstance(disp, dict) else {},
                 }
         except Exception:
             pass
-    return st.session_state.get("_temp_local_regulatory", {
-        "attention_stocks": set(),
-        "disposition_stocks": {},
-    })
+    return {"attention_stocks": set(), "disposition_stocks": {}}
 
 
-def save_regulatory_to_db(reg_data):
-    """Save attention & disposition lists to Firestore."""
+def save_regulatory_to_db():
+    """Save current attention & disposition lists to Firestore."""
     db = get_db()
-    attn = list(reg_data.get("attention_stocks", set()))
-    disp = reg_data.get("disposition_stocks", {})
+    reg = st.session_state.get("regulatory_data", {})
+    # Firestore can't store Python set, convert to list
+    attn_list = sorted(reg.get("attention_stocks", set()))
+    disp_dict = reg.get("disposition_stocks", {})
     if db:
         try:
             doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
             doc_ref.set({
-                "regulatory_attention": attn,
-                "regulatory_disposition": disp,
+                "regulatory_attention": attn_list,
+                "regulatory_disposition": disp_dict,
             }, merge=True)
         except Exception as e:
             st.error(f"DB write (regulatory) failed: {e}")
-    else:
-        st.session_state["_temp_local_regulatory"] = reg_data
 
 
 # -------------------------
@@ -354,7 +351,8 @@ def rebuild_regulatory_data():
         "attention_stocks": all_attention,
         "disposition_stocks": all_disposition,
     }
-    save_regulatory_to_db(st.session_state.regulatory_data)
+    # Persist to Firestore so data survives browser close
+    save_regulatory_to_db()
 
 
 # -------------------------
@@ -461,63 +459,48 @@ def run_sector_analysis(sector_name, as_of_date, custom_list=None):
 
 
 def _get_holdings_lookup():
-    """Build a lookup dict: stock_id -> {avg_price, shares} from holdings."""
+    """Build stock_id -> {avg_price, shares} from holdings tab."""
     lookup = {}
     for h in st.session_state.get("holdings", []):
         sid = h.get("stock_id", "").strip().upper()
         if sid:
-            lookup[sid] = {
-                "avg_price": h.get("avg_price", 0),
-                "shares": h.get("shares", 0),
-            }
+            lookup[sid] = {"avg_price": h.get("avg_price", 0), "shares": h.get("shares", 0)}
     return lookup
 
 
-def _inject_holdings_info(report_data, stock_id, holdings_lookup):
-    """Inject holdings info (avg_price, shares, return_pct) into a report dict."""
+def _inject_holdings_into_json(data, stock_id, lookup):
+    """Add holding_* fields to a stock's AI JSON dict."""
     sid = stock_id.strip().upper()
-    h = holdings_lookup.get(sid)
-    if not h or not isinstance(report_data, dict):
-        return report_data
-
-    avg_price = h["avg_price"]
+    h = lookup.get(sid)
+    if not h or not isinstance(data, dict):
+        return data
+    avg = h["avg_price"]
     shares = h["shares"]
-    close = report_data.get("close")
-
-    report_data["holding_avg_price"] = avg_price
-    report_data["holding_shares"] = shares
-    report_data["holding_cost"] = round(avg_price * shares, 2)
-
-    if close and avg_price > 0:
-        ret_pct = round((close - avg_price) / avg_price * 100, 2)
-        report_data["holding_return_pct"] = ret_pct
-        report_data["holding_unrealized_pnl"] = round((close - avg_price) * shares, 2)
-    else:
-        report_data["holding_return_pct"] = None
-        report_data["holding_unrealized_pnl"] = None
-
-    return report_data
+    close = data.get("close")
+    data["holding_avg_price"] = avg
+    data["holding_shares"] = shares
+    data["holding_cost"] = round(avg * shares, 2)
+    if close and avg > 0:
+        data["holding_return_pct"] = round((close - avg) / avg * 100, 2)
+        data["holding_unrealized_pnl"] = round((close - avg) * shares, 2)
+    return data
 
 
-def _holdings_text_block(stock_id, close, holdings_lookup):
+def _holdings_text_line(stock_id, close, lookup):
     """Generate a text block for holdings info to append to human reports."""
     sid = stock_id.strip().upper()
-    h = holdings_lookup.get(sid)
+    h = lookup.get(sid)
     if not h:
         return ""
-
-    avg_price = h["avg_price"]
+    avg = h["avg_price"]
     shares = h["shares"]
-    cost = avg_price * shares
-    lines = []
-    lines.append(f"  ── Holdings Info ──")
-    lines.append(f"  Avg Price：{avg_price:.2f}  |  Shares：{shares}")
-    lines.append(f"  Cost：{cost:,.0f}")
-    if close and avg_price > 0:
-        ret_pct = (close - avg_price) / avg_price * 100
-        pnl = (close - avg_price) * shares
-        emoji = "📈" if ret_pct >= 0 else "📉"
-        lines.append(f"  {emoji} Return：{ret_pct:+.2f}%  |  P&L：{pnl:+,.0f}")
+    lines = [f"  ── Holdings ──",
+             f"  Avg：{avg:.2f}  Shares：{shares}  Cost：{avg * shares:,.0f}"]
+    if close and avg > 0:
+        ret = (close - avg) / avg * 100
+        pnl = (close - avg) * shares
+        e = "📈" if ret >= 0 else "📉"
+        lines.append(f"  {e} Return：{ret:+.2f}%  P&L：{pnl:+,.0f}")
     return "\n".join(lines)
 
 
@@ -537,13 +520,12 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
         all_reports = {}
         for stock in target_list:
             try:
-                # 強制跑 AI 模式收集數據
                 res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="ai",
                                               regulatory_data=st.session_state.get("regulatory_data"))
                 if isinstance(res, dict):
                     stock_data = res.get("ai_report", {})
-                    # Inject holdings info if this stock is in holdings
-                    stock_data = _inject_holdings_info(stock_data, stock, holdings_lookup)
+                    # Inject holdings info (avg_price, shares, return%) into JSON
+                    stock_data = _inject_holdings_into_json(stock_data, stock, holdings_lookup)
                     all_reports[stock] = stock_data
                 else:
                     all_reports[stock] = {"error": "unexpected format"}
@@ -570,23 +552,20 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
 
         for stock in target_list:
             try:
-                # 跑 Human 模式 (快)
                 res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="human",
                                               regulatory_data=st.session_state.get("regulatory_data"))
                 if isinstance(res, dict):
                     report_text = res.get("human_report", str(res))
                     full_content.append(report_text)
-                    # Append holdings info if available
-                    # Extract close price from report text
+                    # Append holdings info if this stock is in our holdings
                     close_val = None
                     for line in report_text.split("\n"):
                         if "Close" in line and "：" in line:
                             try:
-                                close_str = line.split("Close：")[1].split()[0]
-                                close_val = float(close_str)
+                                close_val = float(line.split("Close：")[1].split()[0])
                             except (IndexError, ValueError):
                                 pass
-                    h_block = _holdings_text_block(stock, close_val, holdings_lookup)
+                    h_block = _holdings_text_line(stock, close_val, holdings_lookup)
                     if h_block:
                         full_content.append(h_block)
                 else:
@@ -953,61 +932,53 @@ with tab3:
     with col_mgmt_2:
         with st.container(border=True):
             st.subheader("Edit Sector")
-
-            # Handle pending deletion from previous run
-            if st.session_state.get("_pending_delete_sector"):
-                sect_to_del = st.session_state.pop("_pending_delete_sector")
-                if sect_to_del in st.session_state.custom_sectors:
-                    del st.session_state.custom_sectors[sect_to_del]
-                    save_sectors_to_db(st.session_state.custom_sectors)
-
             if not st.session_state.custom_sectors:
                 st.info("No data")
             else:
-                sector_keys = list(st.session_state.custom_sectors.keys())
-
+                # Dynamic key: increments on delete so Streamlit forgets old selection
+                _sel_ver = st.session_state.get("_mgmt_select_ver", 0)
                 edit_group = st.selectbox(
                     "Select sector",
-                    sector_keys,
-                    key="mgmt_select",
+                    list(st.session_state.custom_sectors.keys()),
+                    key=f"mgmt_select_{_sel_ver}",
                 )
+                current_list = st.session_state.custom_sectors[edit_group]
 
-                if edit_group and edit_group in st.session_state.custom_sectors:
-                    current_list = st.session_state.custom_sectors[edit_group]
+                c_add1, c_add2 = st.columns([3, 1])
+                with c_add1:
+                    stock_to_add = st.text_input("Stock ID", key="mgmt_add_input")
+                with c_add2:
+                    st.write("")
+                    st.write("")
+                    if st.button("Add"):
+                        val = stock_to_add.strip().upper()
+                        if val and val not in current_list:
+                            current_list.append(val)
+                            save_sectors_to_db(st.session_state.custom_sectors)
+                            st.success(f"Added {val}")
+                            st.rerun()
 
-                    c_add1, c_add2 = st.columns([3, 1])
-                    with c_add1:
-                        stock_to_add = st.text_input("Stock ID", key="mgmt_add_input")
-                    with c_add2:
-                        st.write("")
-                        st.write("")
-                        if st.button("Add"):
-                            val = stock_to_add.strip().upper()
-                            if val and val not in current_list:
-                                current_list.append(val)
+                st.divider()
+                if not current_list:
+                    st.caption("(empty)")
+                else:
+                    for s in current_list:
+                        cr1, cr2 = st.columns([4, 1])
+                        with cr1:
+                            st.text(f"  {s}")
+                        with cr2:
+                            if st.button("Remove", key=f"del_{edit_group}_{s}"):
+                                current_list.remove(s)
                                 save_sectors_to_db(st.session_state.custom_sectors)
-                                st.success(f"Added {val}")
                                 st.rerun()
 
-                    st.divider()
-                    if not current_list:
-                        st.caption("(empty)")
-                    else:
-                        for s in current_list:
-                            cr1, cr2 = st.columns([4, 1])
-                            with cr1:
-                                st.text(f"  {s}")
-                            with cr2:
-                                if st.button("Remove", key=f"del_{edit_group}_{s}"):
-                                    current_list.remove(s)
-                                    save_sectors_to_db(st.session_state.custom_sectors)
-                                    st.rerun()
-
-                    st.divider()
-                    if st.button("Delete this sector", type="primary"):
-                        # Schedule deletion for next rerun (before widget renders)
-                        st.session_state["_pending_delete_sector"] = edit_group
-                        st.rerun()
+                st.divider()
+                if st.button("Delete this sector", type="primary"):
+                    del st.session_state.custom_sectors[edit_group]
+                    save_sectors_to_db(st.session_state.custom_sectors)
+                    # Bump version so selectbox gets a fresh key next run
+                    st.session_state["_mgmt_select_ver"] = _sel_ver + 1
+                    st.rerun()
 
 # --- Tab 4: Regulatory Lists ---
 with tab4:
@@ -1171,7 +1142,7 @@ with tab4:
                 "twse_disposition": None,
                 "tpex_disposition": None,
             }
-            save_regulatory_to_db(st.session_state.regulatory_data)
+            save_regulatory_to_db()
             st.rerun()
 
 # --- Tab 5: Holdings ---
