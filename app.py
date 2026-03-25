@@ -99,6 +99,47 @@ def save_holdings_to_db(data):
         st.session_state["_temp_local_holdings"] = data
 
 
+def load_regulatory_from_db():
+    """Load attention & disposition lists from Firestore."""
+    db = get_db()
+    if db:
+        try:
+            doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
+            doc = doc_ref.get()
+            if doc.exists:
+                d = doc.to_dict()
+                attn_list = d.get("regulatory_attention", [])
+                disp_dict = d.get("regulatory_disposition", {})
+                return {
+                    "attention_stocks": set(attn_list),
+                    "disposition_stocks": disp_dict,
+                }
+        except Exception:
+            pass
+    return st.session_state.get("_temp_local_regulatory", {
+        "attention_stocks": set(),
+        "disposition_stocks": {},
+    })
+
+
+def save_regulatory_to_db(reg_data):
+    """Save attention & disposition lists to Firestore."""
+    db = get_db()
+    attn = list(reg_data.get("attention_stocks", set()))
+    disp = reg_data.get("disposition_stocks", {})
+    if db:
+        try:
+            doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
+            doc_ref.set({
+                "regulatory_attention": attn,
+                "regulatory_disposition": disp,
+            }, merge=True)
+        except Exception as e:
+            st.error(f"DB write (regulatory) failed: {e}")
+    else:
+        st.session_state["_temp_local_regulatory"] = reg_data
+
+
 # -------------------------
 # Cookies Configuration
 # -------------------------
@@ -176,10 +217,7 @@ if "sector_as_of_date" not in st.session_state:
 if "report_mode" not in st.session_state:
     st.session_state.report_mode = "human"
 if "regulatory_data" not in st.session_state:
-    st.session_state.regulatory_data = {
-        "attention_stocks": set(),
-        "disposition_stocks": {},
-    }
+    st.session_state.regulatory_data = load_regulatory_from_db()
 if "regulatory_upload_info" not in st.session_state:
     st.session_state.regulatory_upload_info = {
         "twse_attention": None,
@@ -316,6 +354,7 @@ def rebuild_regulatory_data():
         "attention_stocks": all_attention,
         "disposition_stocks": all_disposition,
     }
+    save_regulatory_to_db(st.session_state.regulatory_data)
 
 
 # -------------------------
@@ -421,6 +460,67 @@ def run_sector_analysis(sector_name, as_of_date, custom_list=None):
     save_to_archive(f"Quick: {sector_name}", as_of_date, final_report)
 
 
+def _get_holdings_lookup():
+    """Build a lookup dict: stock_id -> {avg_price, shares} from holdings."""
+    lookup = {}
+    for h in st.session_state.get("holdings", []):
+        sid = h.get("stock_id", "").strip().upper()
+        if sid:
+            lookup[sid] = {
+                "avg_price": h.get("avg_price", 0),
+                "shares": h.get("shares", 0),
+            }
+    return lookup
+
+
+def _inject_holdings_info(report_data, stock_id, holdings_lookup):
+    """Inject holdings info (avg_price, shares, return_pct) into a report dict."""
+    sid = stock_id.strip().upper()
+    h = holdings_lookup.get(sid)
+    if not h or not isinstance(report_data, dict):
+        return report_data
+
+    avg_price = h["avg_price"]
+    shares = h["shares"]
+    close = report_data.get("close")
+
+    report_data["holding_avg_price"] = avg_price
+    report_data["holding_shares"] = shares
+    report_data["holding_cost"] = round(avg_price * shares, 2)
+
+    if close and avg_price > 0:
+        ret_pct = round((close - avg_price) / avg_price * 100, 2)
+        report_data["holding_return_pct"] = ret_pct
+        report_data["holding_unrealized_pnl"] = round((close - avg_price) * shares, 2)
+    else:
+        report_data["holding_return_pct"] = None
+        report_data["holding_unrealized_pnl"] = None
+
+    return report_data
+
+
+def _holdings_text_block(stock_id, close, holdings_lookup):
+    """Generate a text block for holdings info to append to human reports."""
+    sid = stock_id.strip().upper()
+    h = holdings_lookup.get(sid)
+    if not h:
+        return ""
+
+    avg_price = h["avg_price"]
+    shares = h["shares"]
+    cost = avg_price * shares
+    lines = []
+    lines.append(f"  ── Holdings Info ──")
+    lines.append(f"  Avg Price：{avg_price:.2f}  |  Shares：{shares}")
+    lines.append(f"  Cost：{cost:,.0f}")
+    if close and avg_price > 0:
+        ret_pct = (close - avg_price) / avg_price * 100
+        pnl = (close - avg_price) * shares
+        emoji = "📈" if ret_pct >= 0 else "📉"
+        lines.append(f"  {emoji} Return：{ret_pct:+.2f}%  |  P&L：{pnl:+,.0f}")
+    return "\n".join(lines)
+
+
 def run_full_sector_report(sector_name, as_of_date, custom_list=None):
     """
     類股完整報告 (根據當前模式跑迴圈)
@@ -431,6 +531,7 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
         return
 
     mode = st.session_state.report_mode  # 'human' or 'ai'
+    holdings_lookup = _get_holdings_lookup()
 
     if mode == "ai":  # Deep Dive
         all_reports = {}
@@ -440,7 +541,10 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
                 res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="ai",
                                               regulatory_data=st.session_state.get("regulatory_data"))
                 if isinstance(res, dict):
-                    all_reports[stock] = res.get("ai_report", {})
+                    stock_data = res.get("ai_report", {})
+                    # Inject holdings info if this stock is in holdings
+                    stock_data = _inject_holdings_info(stock_data, stock, holdings_lookup)
+                    all_reports[stock] = stock_data
                 else:
                     all_reports[stock] = {"error": "unexpected format"}
             except Exception as e:
@@ -470,7 +574,21 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
                 res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="human",
                                               regulatory_data=st.session_state.get("regulatory_data"))
                 if isinstance(res, dict):
-                    full_content.append(res.get("human_report", str(res)))
+                    report_text = res.get("human_report", str(res))
+                    full_content.append(report_text)
+                    # Append holdings info if available
+                    # Extract close price from report text
+                    close_val = None
+                    for line in report_text.split("\n"):
+                        if "Close" in line and "：" in line:
+                            try:
+                                close_str = line.split("Close：")[1].split()[0]
+                                close_val = float(close_str)
+                            except (IndexError, ValueError):
+                                pass
+                    h_block = _holdings_text_block(stock, close_val, holdings_lookup)
+                    if h_block:
+                        full_content.append(h_block)
                 else:
                     full_content.append(str(res))
                 full_content.append("")
@@ -838,48 +956,55 @@ with tab3:
             if not st.session_state.custom_sectors:
                 st.info("No data")
             else:
+                sector_keys = list(st.session_state.custom_sectors.keys())
+                # Guard: if widget remembers a deleted key, reset it
+                if st.session_state.get("mgmt_select") not in sector_keys:
+                    st.session_state["mgmt_select"] = sector_keys[0] if sector_keys else None
+
                 edit_group = st.selectbox(
                     "Select sector",
-                    list(st.session_state.custom_sectors.keys()),
+                    sector_keys,
                     key="mgmt_select",
                 )
-                current_list = st.session_state.custom_sectors[edit_group]
 
-                c_add1, c_add2 = st.columns([3, 1])
-                with c_add1:
-                    stock_to_add = st.text_input("Stock ID", key="mgmt_add_input")
-                with c_add2:
-                    st.write("")
-                    st.write("")
-                    if st.button("Add"):
-                        val = stock_to_add.strip().upper()
-                        if val and val not in current_list:
-                            current_list.append(val)
-                            save_sectors_to_db(st.session_state.custom_sectors)
-                            st.success(f"Added {val}")
-                            st.rerun()
+                if edit_group and edit_group in st.session_state.custom_sectors:
+                    current_list = st.session_state.custom_sectors[edit_group]
 
-                st.divider()
-                if not current_list:
-                    st.caption("(empty)")
-                else:
-                    for s in current_list:
-                        cr1, cr2 = st.columns([4, 1])
-                        with cr1:
-                            st.text(f"  {s}")
-                        with cr2:
-                            if st.button("Remove", key=f"del_{edit_group}_{s}"):
-                                current_list.remove(s)
+                    c_add1, c_add2 = st.columns([3, 1])
+                    with c_add1:
+                        stock_to_add = st.text_input("Stock ID", key="mgmt_add_input")
+                    with c_add2:
+                        st.write("")
+                        st.write("")
+                        if st.button("Add"):
+                            val = stock_to_add.strip().upper()
+                            if val and val not in current_list:
+                                current_list.append(val)
                                 save_sectors_to_db(st.session_state.custom_sectors)
+                                st.success(f"Added {val}")
                                 st.rerun()
 
-                st.divider()
-                if st.button("Delete this sector", type="primary"):
-                    del st.session_state.custom_sectors[edit_group]
-                    save_sectors_to_db(st.session_state.custom_sectors)
-                    if "mgmt_select" in st.session_state:
-                        del st.session_state["mgmt_select"]
-                    st.rerun()
+                    st.divider()
+                    if not current_list:
+                        st.caption("(empty)")
+                    else:
+                        for s in current_list:
+                            cr1, cr2 = st.columns([4, 1])
+                            with cr1:
+                                st.text(f"  {s}")
+                            with cr2:
+                                if st.button("Remove", key=f"del_{edit_group}_{s}"):
+                                    current_list.remove(s)
+                                    save_sectors_to_db(st.session_state.custom_sectors)
+                                    st.rerun()
+
+                    st.divider()
+                    if st.button("Delete this sector", type="primary"):
+                        del st.session_state.custom_sectors[edit_group]
+                        save_sectors_to_db(st.session_state.custom_sectors)
+                        # Force widget to forget the deleted value
+                        st.session_state["mgmt_select"] = None
+                        st.rerun()
 
 # --- Tab 4: Regulatory Lists ---
 with tab4:
@@ -1043,6 +1168,7 @@ with tab4:
                 "twse_disposition": None,
                 "tpex_disposition": None,
             }
+            save_regulatory_to_db(st.session_state.regulatory_data)
             st.rerun()
 
 # --- Tab 5: Holdings ---
