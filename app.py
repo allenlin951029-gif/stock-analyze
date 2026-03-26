@@ -11,7 +11,7 @@ from streamlit_cookies_manager import EncryptedCookieManager
 from google.oauth2 import service_account
 from google.cloud import firestore
 
-# [span_0](start_span)確保 stock.py 位於同一目錄下[span_0](end_span)
+# 確保 stock.py 位於同一目錄下
 from stock import (
     analyze_stock_technical,
     analyze_sector_performance,
@@ -65,9 +65,11 @@ def save_sectors_to_db(data):
     if db:
         try:
             doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
+            # 【修復】使用 update 完全覆蓋欄位，避免 merge=True 導致被刪除的字典 Key 殘留
+            doc_ref.update({"custom_sectors": data})
+        except Exception:
+            # 若文件不存在，則改用 set 建立
             doc_ref.set({"custom_sectors": data}, merge=True)
-        except Exception as e:
-            st.error(f"DB write failed: {e}")
     else:
         st.session_state["_temp_local_sectors"] = data
         st.warning("No Firebase. Data is temporary.")
@@ -92,15 +94,26 @@ def save_holdings_to_db(data):
     if db:
         try:
             doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
+            doc_ref.update({"holdings": data})
+        except Exception:
             doc_ref.set({"holdings": data}, merge=True)
-        except Exception as e:
-            st.error(f"DB write (holdings) failed: {e}")
     else:
         st.session_state["_temp_local_holdings"] = data
 
 
 def load_regulatory_from_db():
+    """
+    【修復】同時載入 解析後的清單 與 上傳檔案資訊，避免休眠後狀態重置
+    """
     db = get_db()
+    res_data = {"attention_stocks": set(), "disposition_stocks": {}}
+    res_info = {
+        "twse_attention": None,
+        "tpex_attention": None,
+        "twse_disposition": None,
+        "tpex_disposition": None,
+    }
+    
     if db:
         try:
             doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
@@ -109,28 +122,61 @@ def load_regulatory_from_db():
                 d = doc.to_dict()
                 attn = d.get("regulatory_attention", [])
                 disp = d.get("regulatory_disposition", {})
-                return {
-                    "attention_stocks": set(attn) if isinstance(attn, list) else set(),
-                    "disposition_stocks": disp if isinstance(disp, dict) else {},
-                }
+                res_data["attention_stocks"] = set(attn) if isinstance(attn, list) else set()
+                res_data["disposition_stocks"] = disp if isinstance(disp, dict) else {}
+                
+                # 載入上傳資訊，並將裡面的 codes list 轉回 set
+                db_info = d.get("regulatory_upload_info", {})
+                if db_info:
+                    for k in res_info.keys():
+                        if db_info.get(k):
+                            item = db_info[k]
+                            if "codes" in item and isinstance(item["codes"], list):
+                                item["codes"] = set(item["codes"])
+                            res_info[k] = item
         except Exception:
             pass
-    return {"attention_stocks": set(), "disposition_stocks": {}}
+            
+    return res_data, res_info
 
 
 def save_regulatory_to_db():
+    """
+    【修復】將上傳檔案的紀錄 (regulatory_upload_info) 一併存入資料庫
+    """
     db = get_db()
     if not db:
         return
     reg = st.session_state.get("regulatory_data", {})
+    info = st.session_state.get("regulatory_upload_info", {})
+    
+    # 準備可 JSON 序列化的 info (將 set 轉為 list)
+    safe_info = {}
+    for k, v in info.items():
+        if v is None:
+            safe_info[k] = None
+        else:
+            safe_dict = dict(v)
+            if "codes" in safe_dict and isinstance(safe_dict["codes"], set):
+                safe_dict["codes"] = list(safe_dict["codes"])
+            safe_info[k] = safe_dict
+
     try:
         doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
-        doc_ref.set({
+        doc_ref.update({
             "regulatory_attention": sorted(reg.get("attention_stocks", set())),
             "regulatory_disposition": reg.get("disposition_stocks", {}),
-        }, merge=True)
-    except Exception as e:
-        st.error(f"DB write (regulatory) failed: {e}")
+            "regulatory_upload_info": safe_info
+        })
+    except Exception:
+        try:
+            doc_ref.set({
+                "regulatory_attention": sorted(reg.get("attention_stocks", set())),
+                "regulatory_disposition": reg.get("disposition_stocks", {}),
+                "regulatory_upload_info": safe_info
+            }, merge=True)
+        except Exception as e:
+            st.error(f"DB write (regulatory) failed: {e}")
 
 
 # -------------------------
@@ -195,6 +241,13 @@ if "custom_sectors" not in st.session_state:
     st.session_state.custom_sectors = load_sectors_from_db()
 if "holdings" not in st.session_state:
     st.session_state.holdings = load_holdings_from_db()
+
+# 【修復】解構載入資料與上傳資訊
+if "regulatory_data" not in st.session_state or "regulatory_upload_info" not in st.session_state:
+    r_data, r_info = load_regulatory_from_db()
+    st.session_state.regulatory_data = r_data
+    st.session_state.regulatory_upload_info = r_info
+
 if "results_archive" not in st.session_state:
     st.session_state.results_archive = []
 if "view_index" not in st.session_state:
@@ -209,15 +262,6 @@ if "sector_as_of_date" not in st.session_state:
     st.session_state.sector_as_of_date = datetime.now().date()
 if "report_mode" not in st.session_state:
     st.session_state.report_mode = "human"
-if "regulatory_data" not in st.session_state:
-    st.session_state.regulatory_data = load_regulatory_from_db()
-if "regulatory_upload_info" not in st.session_state:
-    st.session_state.regulatory_upload_info = {
-        "twse_attention": None,
-        "tpex_attention": None,
-        "twse_disposition": None,
-        "tpex_disposition": None,
-    }
 
 
 # -------------------------
@@ -373,7 +417,6 @@ def save_to_archive(display_title, display_date, content):
         "date": str(display_date),
         "content": content,
         "created_at": datetime.now().strftime("%H:%M:%S"),
-        # 紀錄當時生成的模式，方便後續除錯或顯示
         "generated_mode": st.session_state.report_mode
     }
     st.session_state.results_archive.append(record)
@@ -383,43 +426,30 @@ def save_to_archive(display_title, display_date, content):
 
 
 def run_analysis(stock_id, as_of_date, write_history):
-    """
-    執行個股分析的核心函式。
-    根據 session_state.report_mode 決定跑 'human' (快) 還是 'ai' (慢)。
-    """
     sid = stock_id.strip().upper()
     if not sid:
         return
 
-    # 1. 更新 Cookie 與 Session
     st.session_state.current_id = sid
     save_current_to_cookie(sid)
     if write_history:
         push_history_cookie(sid)
 
-    # 2. 執行分析
     final_result = {}
-    current_mode = st.session_state.report_mode  # 'human' or 'ai'
+    current_mode = st.session_state.report_mode
 
     try:
-        # [span_1](start_span)呼叫 stock.py，傳入對應的 mode[span_1](end_span)
-        # mode="human" -> 只回傳文字，速度快 (Quick Screen)
-        # mode="ai"    -> 回傳完整 JSON，速度慢 (Deep Dive)
         raw_result = analyze_stock_technical(
             sid, as_of_date=as_of_date, mode=current_mode,
             regulatory_data=st.session_state.get("regulatory_data")
         )
 
         if current_mode == "human":
-            # Quick Screen 模式：省時間，不產生 AI 數據
             final_result["human_report"] = raw_result.get("human_report", "No report generated.")
             final_result["ai_report"] = None
         else:
-            # Deep Dive 模式：取得完整數據，並順便產生文字報告
             feat_data = raw_result.get("ai_report", {})
             final_result["ai_report"] = feat_data
-
-            # 手動產生文字報告，這樣使用者切換回 Quick Screen View 時也能看到內容
             if feat_data:
                 final_result["human_report"] = format_text_report(feat_data)
             else:
@@ -433,17 +463,12 @@ def run_analysis(stock_id, as_of_date, write_history):
         }
         st.session_state._last_debug = f"exception={type(e).__name__}"
 
-    # 3. 存檔
     save_to_archive(sid, as_of_date, final_result)
 
 
 def run_sector_analysis(sector_name, as_of_date, custom_list=None):
-    """
-    類股快速掃描 (通常用 Quick Screen 模式顯示列表)
-    """
     final_report = ""
     try:
-        # [span_2](start_span)Sector Scan 固定輸出文字列表 (Human mode)[span_2](end_span)
         final_report = analyze_sector_performance(
             sector_name, as_of_date=as_of_date, custom_tickers=custom_list, mode="human",
             regulatory_data=st.session_state.get("regulatory_data")
@@ -454,7 +479,6 @@ def run_sector_analysis(sector_name, as_of_date, custom_list=None):
 
 
 def _get_holdings_map():
-    """stock_id -> {avg_price, shares}"""
     m = {}
     for h in st.session_state.get("holdings", []):
         sid = h.get("stock_id", "").strip().upper()
@@ -464,19 +488,15 @@ def _get_holdings_map():
 
 
 def run_full_sector_report(sector_name, as_of_date, custom_list=None):
-    """
-    類股完整報告 (根據當前模式跑迴圈)
-    持股族群分析時，JSON 會注入 holding_avg_price / holding_shares / holding_return_pct
-    """
     target_list = custom_list if custom_list else SECTOR_DICT.get(sector_name, [])
     if not target_list:
         save_to_archive(f"Full: {sector_name}", as_of_date, "No stocks.")
         return
 
-    mode = st.session_state.report_mode  # 'human' or 'ai'
+    mode = st.session_state.report_mode
     h_map = _get_holdings_map()
 
-    if mode == "ai":  # Deep Dive
+    if mode == "ai":
         all_reports = {}
         for stock in target_list:
             try:
@@ -484,7 +504,6 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
                                               regulatory_data=st.session_state.get("regulatory_data"))
                 if isinstance(res, dict):
                     feat = res.get("ai_report", {})
-                    # === Inject holdings info ===
                     hinfo = h_map.get(stock.strip().upper())
                     if hinfo and isinstance(feat, dict):
                         avg = hinfo["avg_price"]
@@ -512,7 +531,6 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
         }
         save_to_archive(f"Full: {sector_name}", as_of_date, combined)
     else:
-        # Quick Screen (Human Mode)
         full_content = []
         full_content.append(f"Sector [{sector_name}] Quick Screen Report")
         full_content.append(f"Date: {as_of_date}")
@@ -527,12 +545,10 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
                 if isinstance(res, dict):
                     txt = res.get("human_report", str(res))
                     full_content.append(txt)
-                    # === Append holdings info ===
                     hinfo = h_map.get(stock.strip().upper())
                     if hinfo:
                         avg = hinfo["avg_price"]
                         shares = hinfo["shares"]
-                        # Try to extract close price from report
                         close_val = None
                         for line in txt.split("\n"):
                             if "Close：" in line:
@@ -573,7 +589,6 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("#### Report Mode")
 
-    # 邏輯映射：Quick Screen -> Human mode, Deep Dive -> AI mode
     idx = 0 if st.session_state.report_mode == "human" else 1
     mode_choice = st.radio(
         "Select output mode:",
@@ -582,7 +597,6 @@ with st.sidebar:
         key="report_mode_radio",
         help="Quick Screen: Fast, text summary.\nDeep Dive: Slow, full JSON with all indicators.",
     )
-    # 更新 session state
     st.session_state.report_mode = "human" if mode_choice == "Quick Screen" else "ai"
 
     if is_ai_mode():
@@ -621,7 +635,6 @@ with st.sidebar:
     else:
         st.warning("No cloud DB")
 
-    # Regulatory list status
     _reg_attn = len(st.session_state.regulatory_data.get("attention_stocks", set()))
     _reg_disp = len(st.session_state.regulatory_data.get("disposition_stocks", {}))
     if _reg_attn or _reg_disp:
@@ -804,6 +817,7 @@ Tier1/Tier2/排除，每檔含：進場區間、停損、目標、RR、驅動力
 ═══ 持股資料 ═══
 【貼上 sector_持股 JSON】"""
         st.code(prompt_c, language="text")
+
 # -------------------------
 # Main Content
 # -------------------------
@@ -914,8 +928,6 @@ with tab3:
             if not st.session_state.custom_sectors:
                 st.info("No data")
             else:
-                # Use a versioned key: on delete we bump the version
-                # so Streamlit creates a brand-new selectbox widget
                 _v = st.session_state.get("_sect_ver", 0)
                 edit_group = st.selectbox(
                     "Select sector",
@@ -969,7 +981,6 @@ with tab4:
         "Stocks on these lists will be flagged during analysis."
     )
 
-    # --- Current status summary ---
     reg = st.session_state.regulatory_data
     attn_count = len(reg.get("attention_stocks", set()))
     disp_count = len(reg.get("disposition_stocks", {}))
@@ -985,7 +996,6 @@ with tab4:
 
     st.markdown("---")
 
-    # Helper: check if an uploaded file is the same one we already processed
     def _is_new_file(uploaded_file, info_key):
         """Return True only if this file hasn't been processed yet."""
         if uploaded_file is None:
@@ -993,7 +1003,6 @@ with tab4:
         existing = st.session_state.regulatory_upload_info.get(info_key)
         if existing is None:
             return True
-        # Compare name + size to detect a genuinely new upload
         return (uploaded_file.name != existing.get("filename")
                 or uploaded_file.size != existing.get("filesize"))
 
@@ -1101,7 +1110,6 @@ with tab4:
 
     st.markdown("---")
 
-    # --- Loaded stock codes detail ---
     if attn_count or disp_count:
         with st.expander("View loaded stock codes", expanded=False):
             if attn_count:
@@ -1111,7 +1119,6 @@ with tab4:
                 disp_sorted = sorted(reg["disposition_stocks"].keys())
                 st.markdown(f"**Disposition ({disp_count})**: {', '.join(disp_sorted)}")
 
-        # Clear all button
         if st.button("Clear all regulatory data", type="primary"):
             st.session_state.regulatory_data = {
                 "attention_stocks": set(),
@@ -1245,7 +1252,6 @@ if archive_len > 0:
     current_idx = st.session_state.view_index
     record = st.session_state.results_archive[current_idx]
 
-    # 顯示頂部的狀態 Bar (更新標籤)
     mode_badge = "Deep Dive" if is_ai_mode() else "Quick Screen"
     badge_color = "#1a73e8" if is_ai_mode() else "#2e7d32"
 
@@ -1261,7 +1267,6 @@ if archive_len > 0:
         unsafe_allow_html=True,
     )
 
-    # 導覽按鈕 + 模式切換按鈕
     c_prev, c_switch, c_next = st.columns([1, 1, 1])
     with c_prev:
         if st.button("Prev", disabled=(current_idx == 0), use_container_width=True):
@@ -1269,7 +1274,6 @@ if archive_len > 0:
             st.rerun()
 
     with c_switch:
-        # 切換按鈕 (更新標籤)
         switch_label = "Switch to Quick Screen" if is_ai_mode() else "Switch to Deep Dive"
         if st.button(switch_label, use_container_width=True, key="inline_mode_switch"):
             if is_ai_mode():
@@ -1283,25 +1287,19 @@ if archive_len > 0:
             st.session_state.view_index += 1
             st.rerun()
 
-    # 內容顯示邏輯
     content = record["content"]
     st.write("---")
 
-    # 檢查內容是否為我們定義的標準格式 (包含 human_report 與 ai_report)
     if isinstance(content, dict) and "human_report" in content and "ai_report" in content:
-
         if is_ai_mode():
             st.markdown("### Deep Dive Data")
             ai_data = content["ai_report"]
 
-            # 檢查 Deep Dive (AI) 資料是否存在
             if ai_data is None:
                 st.warning("⚠️ 此筆紀錄為 Quick Screen 模式生成 (快速)，無 Deep Dive 詳細數據。")
                 st.info("若需查看詳細籌碼/指標數據，請將左側模式切換為 'Deep Dive' 並重新按 Analyze。")
             else:
-                # 正常顯示 AI 數據
                 if isinstance(ai_data, dict) and "stocks" in ai_data:
-                    # 這是 Sector Report
                     st.markdown(f"**Sector**: {ai_data.get('sector', '?')} | **Date**: {ai_data.get('date', '?')}")
                     st.markdown(f"**{len(ai_data['stocks'])} stocks**")
 
@@ -1318,7 +1316,6 @@ if archive_len > 0:
                         key=f"dl_sector_json_{current_idx}",
                     )
                 else:
-                    # 這是 Single Stock Report
                     st.json(ai_data)
                     json_str = json.dumps(ai_data, indent=2, default=str, ensure_ascii=False)
                     st.download_button(
@@ -1329,11 +1326,9 @@ if archive_len > 0:
                         key=f"dl_json_{current_idx}",
                     )
         else:
-            # Human Mode 顯示
             st.markdown("### Quick Screen Report")
             st.code(content["human_report"], language="text")
     else:
-        # 非標準格式 (例如舊資料或錯誤訊息)
         st.code(str(content), language="text")
 else:
     st.info("No results yet. Use the tabs above to run an analysis.")
