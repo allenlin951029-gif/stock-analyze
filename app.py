@@ -100,7 +100,6 @@ def save_holdings_to_db(data):
 
 
 def load_regulatory_from_db():
-    """Load attention & disposition lists from Firestore so they survive restarts."""
     db = get_db()
     if db:
         try:
@@ -120,21 +119,18 @@ def load_regulatory_from_db():
 
 
 def save_regulatory_to_db():
-    """Save current attention & disposition lists to Firestore."""
     db = get_db()
+    if not db:
+        return
     reg = st.session_state.get("regulatory_data", {})
-    # Firestore can't store Python set, convert to list
-    attn_list = sorted(reg.get("attention_stocks", set()))
-    disp_dict = reg.get("disposition_stocks", {})
-    if db:
-        try:
-            doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
-            doc_ref.set({
-                "regulatory_attention": attn_list,
-                "regulatory_disposition": disp_dict,
-            }, merge=True)
-        except Exception as e:
-            st.error(f"DB write (regulatory) failed: {e}")
+    try:
+        doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
+        doc_ref.set({
+            "regulatory_attention": sorted(reg.get("attention_stocks", set())),
+            "regulatory_disposition": reg.get("disposition_stocks", {}),
+        }, merge=True)
+    except Exception as e:
+        st.error(f"DB write (regulatory) failed: {e}")
 
 
 # -------------------------
@@ -351,7 +347,6 @@ def rebuild_regulatory_data():
         "attention_stocks": all_attention,
         "disposition_stocks": all_disposition,
     }
-    # Persist to Firestore so data survives browser close
     save_regulatory_to_db()
 
 
@@ -458,55 +453,20 @@ def run_sector_analysis(sector_name, as_of_date, custom_list=None):
     save_to_archive(f"Quick: {sector_name}", as_of_date, final_report)
 
 
-def _get_holdings_lookup():
-    """Build stock_id -> {avg_price, shares} from holdings tab."""
-    lookup = {}
+def _get_holdings_map():
+    """stock_id -> {avg_price, shares}"""
+    m = {}
     for h in st.session_state.get("holdings", []):
         sid = h.get("stock_id", "").strip().upper()
         if sid:
-            lookup[sid] = {"avg_price": h.get("avg_price", 0), "shares": h.get("shares", 0)}
-    return lookup
-
-
-def _inject_holdings_into_json(data, stock_id, lookup):
-    """Add holding_* fields to a stock's AI JSON dict."""
-    sid = stock_id.strip().upper()
-    h = lookup.get(sid)
-    if not h or not isinstance(data, dict):
-        return data
-    avg = h["avg_price"]
-    shares = h["shares"]
-    close = data.get("close")
-    data["holding_avg_price"] = avg
-    data["holding_shares"] = shares
-    data["holding_cost"] = round(avg * shares, 2)
-    if close and avg > 0:
-        data["holding_return_pct"] = round((close - avg) / avg * 100, 2)
-        data["holding_unrealized_pnl"] = round((close - avg) * shares, 2)
-    return data
-
-
-def _holdings_text_line(stock_id, close, lookup):
-    """Generate a text block for holdings info to append to human reports."""
-    sid = stock_id.strip().upper()
-    h = lookup.get(sid)
-    if not h:
-        return ""
-    avg = h["avg_price"]
-    shares = h["shares"]
-    lines = [f"  ── Holdings ──",
-             f"  Avg：{avg:.2f}  Shares：{shares}  Cost：{avg * shares:,.0f}"]
-    if close and avg > 0:
-        ret = (close - avg) / avg * 100
-        pnl = (close - avg) * shares
-        e = "📈" if ret >= 0 else "📉"
-        lines.append(f"  {e} Return：{ret:+.2f}%  P&L：{pnl:+,.0f}")
-    return "\n".join(lines)
+            m[sid] = {"avg_price": h.get("avg_price", 0), "shares": h.get("shares", 0)}
+    return m
 
 
 def run_full_sector_report(sector_name, as_of_date, custom_list=None):
     """
     類股完整報告 (根據當前模式跑迴圈)
+    持股族群分析時，JSON 會注入 holding_avg_price / holding_shares / holding_return_pct
     """
     target_list = custom_list if custom_list else SECTOR_DICT.get(sector_name, [])
     if not target_list:
@@ -514,7 +474,7 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
         return
 
     mode = st.session_state.report_mode  # 'human' or 'ai'
-    holdings_lookup = _get_holdings_lookup()
+    h_map = _get_holdings_map()
 
     if mode == "ai":  # Deep Dive
         all_reports = {}
@@ -523,10 +483,20 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
                 res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="ai",
                                               regulatory_data=st.session_state.get("regulatory_data"))
                 if isinstance(res, dict):
-                    stock_data = res.get("ai_report", {})
-                    # Inject holdings info (avg_price, shares, return%) into JSON
-                    stock_data = _inject_holdings_into_json(stock_data, stock, holdings_lookup)
-                    all_reports[stock] = stock_data
+                    feat = res.get("ai_report", {})
+                    # === Inject holdings info ===
+                    hinfo = h_map.get(stock.strip().upper())
+                    if hinfo and isinstance(feat, dict):
+                        avg = hinfo["avg_price"]
+                        shares = hinfo["shares"]
+                        feat["holding_avg_price"] = avg
+                        feat["holding_shares"] = shares
+                        feat["holding_cost"] = round(avg * shares, 2)
+                        c = feat.get("close")
+                        if c and avg > 0:
+                            feat["holding_return_pct"] = round((c - avg) / avg * 100, 2)
+                            feat["holding_unrealized_pnl"] = round((c - avg) * shares, 2)
+                    all_reports[stock] = feat
                 else:
                     all_reports[stock] = {"error": "unexpected format"}
             except Exception as e:
@@ -555,19 +525,29 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
                 res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="human",
                                               regulatory_data=st.session_state.get("regulatory_data"))
                 if isinstance(res, dict):
-                    report_text = res.get("human_report", str(res))
-                    full_content.append(report_text)
-                    # Append holdings info if this stock is in our holdings
-                    close_val = None
-                    for line in report_text.split("\n"):
-                        if "Close" in line and "：" in line:
-                            try:
-                                close_val = float(line.split("Close：")[1].split()[0])
-                            except (IndexError, ValueError):
-                                pass
-                    h_block = _holdings_text_line(stock, close_val, holdings_lookup)
-                    if h_block:
-                        full_content.append(h_block)
+                    txt = res.get("human_report", str(res))
+                    full_content.append(txt)
+                    # === Append holdings info ===
+                    hinfo = h_map.get(stock.strip().upper())
+                    if hinfo:
+                        avg = hinfo["avg_price"]
+                        shares = hinfo["shares"]
+                        # Try to extract close price from report
+                        close_val = None
+                        for line in txt.split("\n"):
+                            if "Close：" in line:
+                                try:
+                                    close_val = float(line.split("Close：")[1].split()[0])
+                                except (IndexError, ValueError):
+                                    pass
+                        h_lines = [f"  ── Holdings ──",
+                                   f"  Avg：{avg:.2f}  Shares：{shares}  Cost：{avg * shares:,.0f}"]
+                        if close_val and avg > 0:
+                            ret = (close_val - avg) / avg * 100
+                            pnl = (close_val - avg) * shares
+                            emoji = "📈" if ret >= 0 else "📉"
+                            h_lines.append(f"  {emoji} Return：{ret:+.2f}%  P&L：{pnl:+,.0f}")
+                        full_content.append("\n".join(h_lines))
                 else:
                     full_content.append(str(res))
                 full_content.append("")
@@ -578,7 +558,6 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
                 full_content.append("-" * 60)
 
         combined_report = "\n".join(full_content)
-        # 這裡因為是純文字合併，結構稍微不同，為了統一 UI 顯示，我們包裝一下
         final_struct = {
             "human_report": combined_report,
             "ai_report": None
@@ -935,14 +914,15 @@ with tab3:
             if not st.session_state.custom_sectors:
                 st.info("No data")
             else:
-                # Dynamic key: increments on delete so Streamlit forgets old selection
-                _sel_ver = st.session_state.get("_mgmt_select_ver", 0)
+                # Use a versioned key: on delete we bump the version
+                # so Streamlit creates a brand-new selectbox widget
+                _v = st.session_state.get("_sect_ver", 0)
                 edit_group = st.selectbox(
                     "Select sector",
                     list(st.session_state.custom_sectors.keys()),
-                    key=f"mgmt_select_{_sel_ver}",
+                    key=f"mgmt_select_v{_v}",
                 )
-                current_list = st.session_state.custom_sectors[edit_group]
+                current_list = st.session_state.custom_sectors.get(edit_group, [])
 
                 c_add1, c_add2 = st.columns([3, 1])
                 with c_add1:
@@ -954,6 +934,7 @@ with tab3:
                         val = stock_to_add.strip().upper()
                         if val and val not in current_list:
                             current_list.append(val)
+                            st.session_state.custom_sectors[edit_group] = current_list
                             save_sectors_to_db(st.session_state.custom_sectors)
                             st.success(f"Added {val}")
                             st.rerun()
@@ -969,6 +950,7 @@ with tab3:
                         with cr2:
                             if st.button("Remove", key=f"del_{edit_group}_{s}"):
                                 current_list.remove(s)
+                                st.session_state.custom_sectors[edit_group] = current_list
                                 save_sectors_to_db(st.session_state.custom_sectors)
                                 st.rerun()
 
@@ -976,8 +958,7 @@ with tab3:
                 if st.button("Delete this sector", type="primary"):
                     del st.session_state.custom_sectors[edit_group]
                     save_sectors_to_db(st.session_state.custom_sectors)
-                    # Bump version so selectbox gets a fresh key next run
-                    st.session_state["_mgmt_select_ver"] = _sel_ver + 1
+                    st.session_state["_sect_ver"] = _v + 1
                     st.rerun()
 
 # --- Tab 4: Regulatory Lists ---
