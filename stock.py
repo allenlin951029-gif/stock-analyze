@@ -82,6 +82,11 @@ _BENCH_TTL_SECONDS = 300  # 5-minute TTL
 _inst_csv_cache: Dict[tuple, Any] = {}
 _inst_cache_lock = threading.Lock()
 
+# [FIX] Margin full-market cache — same pattern as institutional cache.
+# One download per (market, date) for ALL stocks, avoids repeated TWSE requests.
+_margin_csv_cache: Dict[tuple, Any] = {}
+_margin_cache_lock = threading.Lock()
+
 # [FIX] Serialize TWSE/TPEx API requests to avoid rate-limiting
 # Only 1 thread can make an uncached TWSE request at a time
 _twse_request_semaphore = threading.Semaphore(1)
@@ -1456,7 +1461,23 @@ def _parse_twse_json_table(obj):
 
 
 def _twse_margin_json(date_yyyymmdd: str, headers: dict):
+    """Fetch TWSE margin data for ALL stocks on a given date.
+
+    [FIX] Added full-market cache (like _inst_csv_cache) so that multiple
+    stocks on the same date share a single HTTP request. This eliminates
+    the rate-limit problem where 7 TWSE stocks = 7 identical requests.
+    """
     sess = _get_session()  # [OPT]
+
+    # [FIX] Check cache first
+    cache_key = ("twse_margin", date_yyyymmdd)
+    with _margin_cache_lock:
+        if cache_key in _margin_csv_cache:
+            cached = _margin_csv_cache[cache_key]
+            if cached is None:
+                return None, "TWSE margin cached no-data"
+            return cached, None
+
     urls = [
         f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
         f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
@@ -1464,19 +1485,40 @@ def _twse_margin_json(date_yyyymmdd: str, headers: dict):
     h2 = dict(headers)
     h2["Referer"] = "https://www.twse.com.tw/zh/page/trading/exchange/MI_MARGN.html"
     last_err = None
-    for url in urls:
-        try:
-            r = sess.get(url, headers=h2, timeout=15)
-            if r.status_code != 200:
-                last_err = f"HTTP {r.status_code}"
-                continue
-            j = r.json()
-            df = pd.DataFrame(j) if isinstance(j, list) else _parse_twse_json_table(j)
-            if df is not None and not df.empty:
-                return df, None
-            last_err = "empty"
-        except Exception as e:
-            last_err = str(e)
+
+    # [FIX] Serialize via semaphore to avoid hammering TWSE
+    with _twse_request_semaphore:
+        time.sleep(0.35)
+        # Double-check cache inside semaphore (another thread may have fetched it)
+        with _margin_cache_lock:
+            if cache_key in _margin_csv_cache:
+                cached = _margin_csv_cache[cache_key]
+                if cached is None:
+                    return None, "TWSE margin cached no-data"
+                return cached, None
+
+        for url in urls:
+            try:
+                r = sess.get(url, headers=h2, timeout=15)
+                if r.status_code != 200:
+                    last_err = f"HTTP {r.status_code}"
+                    continue
+                j = r.json()
+                df = pd.DataFrame(j) if isinstance(j, list) else _parse_twse_json_table(j)
+                if df is not None and not df.empty:
+                    with _margin_cache_lock:
+                        _margin_csv_cache[cache_key] = df
+                    return df, None
+                last_err = "empty"
+            except Exception as e:
+                last_err = str(e)
+
+    # All URLs failed — check if it's a legitimate no-data day vs rate-limit
+    # Only cache as None if we got a 200 but empty (legitimate no-data)
+    if last_err == "empty":
+        with _margin_cache_lock:
+            _margin_csv_cache[cache_key] = None
+    # Don't cache HTTP errors or exceptions — allow retry on next stock
     return None, last_err or "failed"
 
 
@@ -1509,9 +1551,53 @@ def _parse_tpex_margin_csv(text: str):
         return None
 
 
+def _tpex_margin_csv_cached(roc_date: str, headers: dict):
+    """Fetch TPEx margin data for ALL stocks on a given date.
+
+    [FIX] Added full-market cache (like TWSE margin) so that multiple
+    TPEx stocks on the same date share a single HTTP request.
+    """
+    sess = _get_session()
+    cache_key = ("tpex_margin", roc_date)
+    with _margin_cache_lock:
+        if cache_key in _margin_csv_cache:
+            cached = _margin_csv_cache[cache_key]
+            if cached is None:
+                return None, "TPEx margin cached no-data"
+            return cached, None
+
+    with _twse_request_semaphore:
+        time.sleep(0.2)
+        # Double-check cache inside semaphore
+        with _margin_cache_lock:
+            if cache_key in _margin_csv_cache:
+                cached = _margin_csv_cache[cache_key]
+                if cached is None:
+                    return None, "TPEx margin cached no-data"
+                return cached, None
+        url_csv = (
+            "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
+            f"?l=zh-tw&d={roc_date}&o=csv&s=0,asc"
+        )
+        try:
+            r = sess.get(url_csv, headers=headers, timeout=15)
+            if r.status_code != 200 or len(r.text) < 200:
+                return None, f"TPEx margin HTTP {r.status_code}"
+            df = _parse_tpex_margin_csv(r.text)
+            if df is not None and not df.empty:
+                with _margin_cache_lock:
+                    _margin_csv_cache[cache_key] = df
+                return df, None
+            # Legitimate no-data
+            with _margin_cache_lock:
+                _margin_csv_cache[cache_key] = None
+            return None, "TPEx margin empty"
+        except Exception as e:
+            return None, f"TPEx margin: {e}"
+
+
 def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, max_back: int = 10):
     stock_no = _strip_suffix(stock_id)
-    sess = _get_session()  # [OPT]
     headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-TW,zh;q=0.9"}
     is_two = isinstance(market_hint, str) and market_hint.upper().endswith(".TWO")
     last_error = None
@@ -1574,39 +1660,34 @@ def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, ma
             else:
                 last_error = err
 
+        # [FIX] TPEx margin — now uses cached helper
         roc_year = d.year - 1911
         roc_date = f"{roc_year:03d}/{d.month:02d}/{d.day:02d}"
-        url_csv = (
-            "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
-            f"?l=zh-tw&d={roc_date}&o=csv&s=0,asc"
-        )
-        try:
-            r = sess.get(url_csv, headers=headers, timeout=15)
-            df = _parse_tpex_margin_csv(r.text) if r.status_code == 200 and len(r.text) > 200 else None
-            if df is not None and not df.empty:
-                colmap = {_norm_col(c): c for c in df.columns}
-                code_col = colmap.get("代號") or colmap.get("股票代號")
-                if code_col:
-                    sub = df[df[code_col].astype(str).str.strip() == stock_no]
-                    if not sub.empty:
-                        row = sub.iloc[0]
-                        m_bal_c = find_col(colmap, ["資", "餘額"])
-                        m_chg_c = find_col(colmap, ["資", "增減"])
-                        s_bal_c = find_col(colmap, ["券", "餘額"])
-                        s_chg_c = find_col(colmap, ["券", "增減"])
-                        return {
-                            "id": f"{stock_no}.TWO",
-                            "date": d.strftime("%Y-%m-%d"),
-                            "margin_balance": _safe_int(row[m_bal_c]) if m_bal_c else None,
-                            "margin_change": _safe_int(row[m_chg_c]) if m_chg_c else None,
-                            "margin_limit": None,
-                            "margin_usage_rate": None,
-                            "short_balance": _safe_int(row[s_bal_c]) if s_bal_c else None,
-                            "short_change": _safe_int(row[s_chg_c]) if s_chg_c else None,
-                            "error": None,
-                        }
-        except Exception as e:
-            last_error = f"TPEx margin: {e}"
+        df, err = _tpex_margin_csv_cached(roc_date, headers)
+        if df is not None and not df.empty:
+            colmap = {_norm_col(c): c for c in df.columns}
+            code_col = colmap.get("代號") or colmap.get("股票代號")
+            if code_col:
+                sub = df[df[code_col].astype(str).str.strip() == stock_no]
+                if not sub.empty:
+                    row = sub.iloc[0]
+                    m_bal_c = find_col(colmap, ["資", "餘額"])
+                    m_chg_c = find_col(colmap, ["資", "增減"])
+                    s_bal_c = find_col(colmap, ["券", "餘額"])
+                    s_chg_c = find_col(colmap, ["券", "增減"])
+                    return {
+                        "id": f"{stock_no}.TWO",
+                        "date": d.strftime("%Y-%m-%d"),
+                        "margin_balance": _safe_int(row[m_bal_c]) if m_bal_c else None,
+                        "margin_change": _safe_int(row[m_chg_c]) if m_chg_c else None,
+                        "margin_limit": None,
+                        "margin_usage_rate": None,
+                        "short_balance": _safe_int(row[s_bal_c]) if s_bal_c else None,
+                        "short_change": _safe_int(row[s_chg_c]) if s_chg_c else None,
+                        "error": None,
+                    }
+        if err:
+            last_error = err
 
     return {"error": last_error or "unknown"}
 
