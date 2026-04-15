@@ -18,9 +18,12 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 import requests
+import logging
 import yfinance as yf
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+logger = logging.getLogger(__name__)
 
 try:
     import truststore
@@ -57,7 +60,7 @@ VOL_REGIME_CONFIRM_DAYS = 3  # Days a regime must persist before switching
 SUPERTREND_SMOOTHING = "wilder"  # "wilder" (stable) or "ema" (early entry)
 
 # Entry trigger config (Phase 4 Item 1)
-ENTRY_MIN_RR = 1.2            # Minimum R:R for entry trigger (relaxed from 1.5)
+ENTRY_MIN_RR = 1.5            # Minimum R:R for entry trigger
 
 # Position sizing (Phase 4 Item 2)
 PORTFOLIO_RISK_PCT = 1.0      # % of total capital risked per trade
@@ -74,10 +77,6 @@ RR_ANOMALY_THRESHOLD = 5.0
 _bench_cache: Dict[str, Any] = {"df": None, "ts": None}
 _bench_cache_lock = threading.Lock()
 _BENCH_TTL_SECONDS = 300  # 5-minute TTL
-
-# [P6] TWII market cache — download ^TWII once, reuse for all stocks
-_twii_cache: Dict[str, Any] = {"daily": None, "weekly": None, "ts": None}
-_twii_cache_lock = threading.Lock()
 
 # [P1] Institutional full-market CSV cache — one download per (market, date)
 _inst_csv_cache: Dict[tuple, Any] = {}
@@ -102,159 +101,6 @@ def _get_cached_benchmark(ttl_seconds: int = _BENCH_TTL_SECONDS) -> pd.DataFrame
         _bench_cache["df"] = df
         _bench_cache["ts"] = now
     return df
-
-
-def _get_cached_twii(ttl_seconds: int = _BENCH_TTL_SECONDS) -> Dict[str, pd.DataFrame]:
-    """Download ^TWII daily + weekly once, cache for `ttl_seconds`."""
-    now = datetime.now()
-    with _twii_cache_lock:
-        if (_twii_cache["daily"] is not None
-                and _twii_cache["ts"] is not None
-                and (now - _twii_cache["ts"]).total_seconds() < ttl_seconds):
-            return {"daily": _twii_cache["daily"], "weekly": _twii_cache["weekly"]}
-    daily = _download_yf("^TWII", "2y", "1d")
-    weekly = _download_yf("^TWII", "2y", "1wk")
-    with _twii_cache_lock:
-        _twii_cache["daily"] = daily
-        _twii_cache["weekly"] = weekly
-        _twii_cache["ts"] = now
-    return {"daily": daily, "weekly": weekly}
-
-
-def compute_market_features(twii_data: Dict[str, pd.DataFrame],
-                            as_of_ts=None) -> Dict[str, Any]:
-    """
-    [P6] Compute market environment features from TWII (加權指數).
-    Three layers: trend structure, volatility environment, capital sentiment.
-    All field names prefixed with 'market_' to avoid collision with stock fields.
-    """
-    mf: Dict[str, Any] = {}
-    daily = twii_data.get("daily")
-    weekly = twii_data.get("weekly")
-
-    if daily is None or daily.empty or len(daily) < 60:
-        mf["market_data_available"] = False
-        return mf
-
-    mf["market_data_available"] = True
-
-    # Trim to as_of_date if provided
-    if as_of_ts is not None:
-        daily = daily.loc[:as_of_ts].copy()
-        if weekly is not None and not weekly.empty:
-            weekly = weekly.loc[:as_of_ts].copy()
-
-    if len(daily) < 60:
-        mf["market_data_available"] = False
-        return mf
-
-    close = daily["Close"]
-    c_now = float(close.iloc[-1])
-
-    # ---------------------------------------------------------------
-    # LAYER 1: TREND STRUCTURE
-    # ---------------------------------------------------------------
-    ma5 = close.rolling(5).mean()
-    ma20 = close.rolling(20).mean()
-    ma60 = close.rolling(60).mean()
-    ma5_now = float(ma5.iloc[-1])
-    ma20_now = float(ma20.iloc[-1])
-    ma60_now = float(ma60.iloc[-1])
-
-    # ADX for market
-    adx_s, pdi_s, mdi_s = calculate_adx(daily)
-    adx_now = float(adx_s.iloc[-1])
-
-    # Daily trend
-    m_trend, m_strength = classify_trend(c_now, ma5_now, ma20_now, ma60_now, adx_now)
-    mf["market_trend_state"] = m_trend
-    mf["market_trend_strength"] = m_strength
-
-    # Weekly trend
-    if weekly is not None and not weekly.empty and len(weekly) >= 20:
-        w_close = weekly["Close"]
-        wma5 = w_close.rolling(5).mean()
-        wma20 = w_close.rolling(20).mean()
-        wma60 = w_close.rolling(60).mean()
-        wma5_now = float(wma5.iloc[-1]) if len(wma5.dropna()) >= 1 else None
-        wma20_now = float(wma20.iloc[-1])
-        wma60_now = float(wma60.iloc[-1]) if len(wma60.dropna()) >= 1 else None
-        wc_now = float(w_close.iloc[-1])
-        if wma5_now and wma60_now:
-            if wc_now > wma20_now > wma60_now and wma5_now > wma20_now:
-                mf["market_weekly_trend"] = "uptrend"
-            elif wc_now < wma20_now < wma60_now and wma5_now < wma20_now:
-                mf["market_weekly_trend"] = "downtrend"
-            else:
-                mf["market_weekly_trend"] = "consolidation"
-        else:
-            mf["market_weekly_trend"] = "insufficient_data"
-    else:
-        mf["market_weekly_trend"] = None
-
-    # MA20 deviation (overheated / oversold gauge)
-    ma20_dev = (c_now - ma20_now) / ma20_now * 100
-    mf["market_ma20_dev_pct"] = round(ma20_dev, 4)
-
-    # 52-week position
-    high_52 = float(daily.tail(252)["High"].max())
-    low_52 = float(daily.tail(252)["Low"].min())
-    mf["market_pos_52w_pct"] = round(
-        (c_now - low_52) / (high_52 - low_52) * 100, 2
-    ) if high_52 != low_52 else 50.0
-
-    # ---------------------------------------------------------------
-    # LAYER 2: VOLATILITY ENVIRONMENT
-    # ---------------------------------------------------------------
-    atr_s = calculate_atr(daily, 14)
-    atr_now = float(atr_s.iloc[-1])
-    mf["market_atr_pct"] = round(atr_now / c_now * 100, 4)
-    mf["market_atr_percentile"] = percentile_rank(atr_s, 252)
-
-    bbw, bb_upper, bb_lower = calculate_bbands(daily)
-    mf["market_bb_width_percentile"] = percentile_rank(bbw, 252)
-
-    # Reuse the single-day regime classifier
-    bb_p = mf["market_bb_width_percentile"]
-    atr_p = mf["market_atr_percentile"]
-    if bb_p is not None and atr_p is not None and np.isfinite(bb_p) and np.isfinite(atr_p):
-        if bb_p < 0.15 and atr_p < 0.25:
-            mf["market_volatility_regime"] = "compression"
-        elif bb_p < 0.25 and atr_p > 0.50:
-            mf["market_volatility_regime"] = "squeeze_breakout"
-        elif bb_p > 0.75 and atr_p > 0.75:
-            mf["market_volatility_regime"] = "expansion"
-        elif atr_p > 0.65:
-            mf["market_volatility_regime"] = "high_volatility"
-        else:
-            mf["market_volatility_regime"] = "normal"
-    else:
-        mf["market_volatility_regime"] = "unknown"
-
-    # ---------------------------------------------------------------
-    # LAYER 3: CAPITAL SENTIMENT
-    # ---------------------------------------------------------------
-    # RSI
-    rsi_s = calculate_rsi(close, 14)
-    mf["market_rsi14"] = round(float(rsi_s.iloc[-1]), 2)
-
-    # OBV slope (market-wide volume direction)
-    obv_s = calculate_obv(daily)
-    mf["market_obv_slope_20d"] = slope_n(obv_s, 20)
-
-    # SuperTrend direction
-    try:
-        _, st_dir = calculate_supertrend(daily)
-        mf["market_supertrend_bullish"] = bool(int(st_dir.iloc[-1]) == 1)
-    except Exception:
-        mf["market_supertrend_bullish"] = None
-
-    # ---------------------------------------------------------------
-    # DERIVED: Market-vs-stock trend agreement
-    # (computed later in build_ai_features using stock's trend_state)
-    # ---------------------------------------------------------------
-
-    return _sanitize_numpy(mf)
 
 
 def _get_session() -> requests.Session:
@@ -2092,18 +1938,15 @@ def compute_decision_fields(
         feat["support_distance_pct"] = None
 
     # ---------------------------------------------------------------
-    # [P4 Item 1] EVENT-BASED ENTRY TRIGGER (v3)
+    # [P4 Item 1] EVENT-BASED ENTRY TRIGGER (v2)
     # Now includes:
     #   - Veto rules for adverse tape conditions (P1-B)
     #   - Single-event confirmation requirement
     #   - Price-action quality check
-    #   - [P5] Trend-continuation path: in strong uptrends, a green candle
-    #     with volume above average qualifies even without a "today event"
     # ---------------------------------------------------------------
     rr_val = feat.get("risk_reward_ratio")
     rr_ok = bool(rr_val is not None and rr_val >= ENTRY_MIN_RR)
     vol_surge = bool(vol_ratio is not None and vol_ratio > 1.5)
-    vol_above_avg = bool(vol_ratio is not None and vol_ratio > 1.0)
 
     # "Today events" — instantaneous signals that only fire on transition day
     today_events = []
@@ -2120,21 +1963,6 @@ def compute_decision_fields(
 
     has_event = len(today_events) >= 1
     not_bearish = trend_state not in ("downtrend", "strong_downtrend", "weak_downtrend", "top_pullback")
-
-    # [P5] TREND-CONTINUATION PATH — relaxed entry for established strong trends
-    # In a confirmed strong uptrend, we don't always need a "transition event".
-    # A green candle with at least average volume is enough to confirm continuation.
-    _trend_continuation_states = ("strong_uptrend", "uptrend")
-    trend_continuation = bool(
-        not has_event
-        and trend_state in _trend_continuation_states
-        and is_bullish          # SuperTrend already bullish
-        and close_gt_open       # Green candle
-        and vol_above_avg       # At least average volume
-    )
-    if trend_continuation:
-        today_events.append("trend_continuation")
-        has_event = True
 
     # [P1-B] VETO RULES — hard disqualifiers that prevent trigger regardless of events
     veto_reasons = []
@@ -2201,18 +2029,37 @@ def compute_decision_fields(
 # ===================================================================
 
 
-def _download_yf(ticker: str, period: str, interval: str):
-    """Helper for threaded yf.download — serialised via _yf_lock."""
-    with _yf_lock:
-        try:
-            # [FIX] auto_adjust=True and ffill() to avoid missing data/unadjusted price bugs
-            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-            df = clean_yf_columns(_ensure_naive_index(df))
-            if not df.empty:
-                df = df.ffill().dropna(subset=["Close"])
-            return df
-        except Exception:
-            return pd.DataFrame()
+def _download_yf(ticker: str, period: str, interval: str, max_retries: int = 3):
+    """Helper for threaded yf.download — serialised via _yf_lock.
+
+    [FIX] Added retry with exponential backoff to handle Yahoo rate-limiting.
+    Yahoo intermittently returns empty JSON (HTTP 200 but no data) or HTTP 429
+    when too many requests are made in a short window. This causes yfinance to
+    return an empty DataFrame, which downstream code treats as "not found".
+    Retrying with increasing delays (2s → 4s → 8s) resolves most transient
+    failures without changing any downstream logic.
+    """
+    for attempt in range(max_retries):
+        with _yf_lock:
+            try:
+                # [FIX] auto_adjust=True and ffill() to avoid missing data/unadjusted price bugs
+                df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+                df = clean_yf_columns(_ensure_naive_index(df))
+                if not df.empty:
+                    df = df.ffill().dropna(subset=["Close"])
+                    return df
+            except Exception as e:
+                logger.warning("yf.download(%s) attempt %d/%d exception: %s",
+                               ticker, attempt + 1, max_retries, e)
+        # Empty df or exception — wait before retrying (backoff: 2s, 4s, 8s)
+        if attempt < max_retries - 1:
+            wait = 2 ** (attempt + 1)
+            logger.info("yf.download(%s) returned empty, retrying in %ds (%d/%d)",
+                        ticker, wait, attempt + 1, max_retries)
+            time.sleep(wait)
+    logger.warning("yf.download(%s, period=%s, interval=%s) failed after %d retries",
+                   ticker, period, interval, max_retries)
+    return pd.DataFrame()
 
 
 def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
@@ -2229,6 +2076,8 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         df_daily = _download_yf(yf_ticker, "2y", "1d")
 
     if df_daily.empty:
+        logger.warning("%s (%s): all yf.download attempts returned empty — "
+                       "likely Yahoo rate-limit, not a bad ticker", stock_id, yf_ticker)
         return {"error": f"not found: {stock_id}", "symbol": stock_id}
 
     chosen_ts = _nearest_trading_ts(df_daily, as_of_date)
@@ -2243,17 +2092,14 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
     trade_date = chosen_ts.date()
     query_date = as_of_date if as_of_date else datetime.now().date()
 
-    # -- download weekly + benchmark + TWII sequentially (AI only) --
+    # -- download weekly + benchmark sequentially (AI only) --
     df_weekly_upto = None
     bench_df = None
-    twii_data = None
     if mode == "ai":
         df_weekly = _download_yf(yf_ticker, "2y", "1wk")
         df_weekly_upto = df_weekly.loc[:chosen_ts] if df_weekly is not None and not df_weekly.empty else None
         # [P1] Use cached benchmark — downloaded once, reused for all stocks
         bench_df = _get_cached_benchmark()
-        # [P6] Use cached TWII — downloaded once, reused for all stocks
-        twii_data = _get_cached_twii()
 
     # -- basic price --
     close = df["Close"]
@@ -2833,49 +2679,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         feat["divergence_net_signal"] = "none"
 
     # ===================================================================
-    # [P6] MARKET ENVIRONMENT (TWII 加權指數)
-    # Compute once per batch via cache, attach to every stock's JSON.
-    # ===================================================================
-    if mode == "ai" and twii_data is not None:
-        market_feat = compute_market_features(twii_data, as_of_ts=chosen_ts)
-        feat.update(market_feat)
-
-        # Stock-vs-market trend agreement
-        if market_feat.get("market_data_available"):
-            m_trend = market_feat.get("market_trend_state", "")
-            m_bull = m_trend in (
-                "strong_uptrend", "uptrend", "weak_uptrend", "uptrend_pullback",
-            )
-            m_bear = m_trend in (
-                "strong_downtrend", "downtrend", "weak_downtrend",
-                "downtrend_bounce", "top_pullback",
-            )
-            s_bull = trend_state in (
-                "strong_uptrend", "uptrend", "weak_uptrend", "uptrend_pullback",
-                "bottom_bounce", "strong_bottom_bounce", "weak_bottom_bounce",
-            )
-            s_bear = trend_state in (
-                "strong_downtrend", "downtrend", "weak_downtrend",
-                "downtrend_bounce", "top_pullback",
-            )
-
-            if s_bull and m_bull:
-                feat["stock_vs_market"] = "both_bullish"
-            elif s_bear and m_bear:
-                feat["stock_vs_market"] = "both_bearish"
-            elif s_bull and m_bear:
-                feat["stock_vs_market"] = "stock_bullish_market_bearish"
-            elif s_bear and m_bull:
-                feat["stock_vs_market"] = "stock_bearish_market_bullish"
-            else:
-                feat["stock_vs_market"] = "mixed"
-        else:
-            feat["stock_vs_market"] = None
-    else:
-        feat["market_data_available"] = False
-        feat["stock_vs_market"] = None
-
-    # ===================================================================
     # Decision fields (WITH ATR FLOOR, EVENT-BASED TRIGGERS, POSITION SIZING)
     # ===================================================================
     resistance = feat.get("fib_nearest_resistance_1") or feat.get("st_resistance")
@@ -2885,35 +2688,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         if ext_resistance and ext_resistance > c_now:
             resistance = ext_resistance
     support = feat.get("fib_nearest_support_1") or feat.get("st_support")
-
-    # [P5] TREND-AWARE TARGET UPGRADE
-    # When first resistance is too close for adequate R:R in a strong trend,
-    # upgrade to R2 or Fib extension so the system doesn't filter out
-    # valid trend-continuation entries.
-    _strong_trend_states = (
-        "strong_uptrend", "uptrend", "weak_uptrend", "uptrend_pullback",
-    )
-    _strong_mtf = ("aligned_bull", "mixed_bull_bias")
-    if (resistance and resistance > c_now and support and support < c_now
-            and trend_state in _strong_trend_states
-            and feat.get("mtf_alignment") in _strong_mtf):
-        _preliminary_risk = c_now - support  # approximate risk using support
-        _preliminary_reward = resistance - c_now
-        _preliminary_rr = (_preliminary_reward / _preliminary_risk) if _preliminary_risk > 0 else 99
-        if _preliminary_rr < ENTRY_MIN_RR:
-            # Try R2 first, then Fib extension 1.272
-            _r2 = feat.get("fib_nearest_resistance_2")
-            _ext = feat.get("fib_ext_1272")
-            _upgrade = None
-            if _r2 and _r2 > resistance:
-                _upgrade = _r2
-            elif _ext and _ext > resistance:
-                _upgrade = _ext
-            if _upgrade:
-                feat["target_upgrade_from"] = resistance
-                feat["target_upgrade_to"] = _upgrade
-                feat["target_upgrade_reason"] = "strong_trend_rr_too_low"
-                resistance = _upgrade
 
     # [P4] Pass event-based trigger inputs to decision engine
     decision = compute_decision_fields(
@@ -3122,9 +2896,11 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
     if not target_list:
         return f"No stocks in sector {sector_name}."
 
-    # [OPT] Parallel analysis of all stocks in sector
+    # [FIX] Reduced max_workers from 5 to 2 to lower Yahoo rate-limit risk.
+    # yf.download is serialised via _yf_lock anyway, so parallelism only
+    # benefits the external data fetches (institutional, margin, etc.).
     results = []
-    with ThreadPoolExecutor(max_workers=min(len(target_list), 5)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(target_list), 2)) as pool:
         futures = {
             pool.submit(_analyze_one_stock_for_sector, sid, as_of_date, mode,
                         regulatory_data): sid
