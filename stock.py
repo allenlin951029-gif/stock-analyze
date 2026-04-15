@@ -1460,12 +1460,50 @@ def _parse_twse_json_table(obj):
     return None
 
 
+def _parse_twse_margin_csv(text: str):
+    """Parse TWSE MI_MARGN CSV response into a DataFrame.
+    Same pattern as _parse_twse_t86_csv — find header row, parse to DataFrame.
+    """
+    if not text or len(text) < 200:
+        return None
+    text = text.replace("\r", "").replace("=", "")
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    # Find header row — look for column headers containing 股票代號/代號 + 融資/資
+    start = next(
+        (
+            i
+            for i, ln in enumerate(lines)
+            if ("代號" in ln or "代碼" in ln) and ("融資" in ln or "資買" in ln or "餘額" in ln)
+        ),
+        None,
+    )
+    if start is None:
+        return None
+    end = next(
+        (
+            j
+            for j in range(start + 1, len(lines))
+            if lines[j].startswith("說明") or lines[j].startswith("備註")
+               or lines[j].startswith("\"說明") or lines[j].startswith("\"備註")
+        ),
+        len(lines),
+    )
+    try:
+        return pd.read_csv(io.StringIO("\n".join(lines[start:end])))
+    except Exception:
+        return None
+
+
 def _twse_margin_json(date_yyyymmdd: str, headers: dict):
     """Fetch TWSE margin data for ALL stocks on a given date.
 
     [FIX] Added full-market cache (like _inst_csv_cache) so that multiple
     stocks on the same date share a single HTTP request. This eliminates
     the rate-limit problem where 7 TWSE stocks = 7 identical requests.
+
+    [FIX] Changed from JSON to CSV format. The JSON endpoint is rate-limited
+    more aggressively by TWSE, while the CSV endpoint (same as T86 三大法人)
+    works reliably. Added CSV as primary, JSON as fallback.
     """
     sess = _get_session()  # [OPT]
 
@@ -1478,12 +1516,14 @@ def _twse_margin_json(date_yyyymmdd: str, headers: dict):
                 return None, "TWSE margin cached no-data"
             return cached, None
 
+    # [FIX] CSV first (reliable, same as T86), JSON as fallback
     urls = [
-        f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
-        f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL",
+        (f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=csv&date={date_yyyymmdd}&selectType=ALL", "csv"),
+        (f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=csv&date={date_yyyymmdd}&selectType=ALL", "csv"),
+        (f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_yyyymmdd}&selectType=ALL", "json"),
     ]
     h2 = dict(headers)
-    h2["Referer"] = "https://www.twse.com.tw/zh/page/trading/exchange/MI_MARGN.html"
+    h2["Referer"] = "https://www.twse.com.tw/zh/trading/margin/mi-margn.html"
     last_err = None
 
     # [FIX] Serialize via semaphore to avoid hammering TWSE
@@ -1497,28 +1537,36 @@ def _twse_margin_json(date_yyyymmdd: str, headers: dict):
                     return None, "TWSE margin cached no-data"
                 return cached, None
 
-        for url in urls:
+        for url, fmt in urls:
             try:
                 r = sess.get(url, headers=h2, timeout=15)
                 if r.status_code != 200:
                     last_err = f"HTTP {r.status_code}"
                     continue
-                j = r.json()
-                df = pd.DataFrame(j) if isinstance(j, list) else _parse_twse_json_table(j)
+                if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
+                    with _margin_cache_lock:
+                        _margin_csv_cache[cache_key] = None
+                    return None, "TWSE margin no data"
+
+                df = None
+                if fmt == "csv":
+                    df = _parse_twse_margin_csv(r.text)
+                else:
+                    try:
+                        j = r.json()
+                        df = pd.DataFrame(j) if isinstance(j, list) else _parse_twse_json_table(j)
+                    except Exception:
+                        pass
+
                 if df is not None and not df.empty:
                     with _margin_cache_lock:
                         _margin_csv_cache[cache_key] = df
                     return df, None
-                last_err = "empty"
+                last_err = f"{fmt} empty"
             except Exception as e:
                 last_err = str(e)
 
-    # All URLs failed — check if it's a legitimate no-data day vs rate-limit
-    # Only cache as None if we got a 200 but empty (legitimate no-data)
-    if last_err == "empty":
-        with _margin_cache_lock:
-            _margin_csv_cache[cache_key] = None
-    # Don't cache HTTP errors or exceptions — allow retry on next stock
+    # All URLs failed — only cache legitimate no-data, not transient errors
     return None, last_err or "failed"
 
 
@@ -2184,10 +2232,12 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
 
     # -- basic price --
     close = df["Close"]
-    c_now = float(close.iloc[-1])
-    o_now = float(latest["Open"])
-    h_now = float(latest["High"])
-    l_now = float(latest["Low"])
+    # [FIX] round to 2 decimals to fix yfinance float32 precision artifacts
+    # e.g. 69.19999694824219 → 69.2
+    c_now = round(float(latest["Close"]), 2)
+    o_now = round(float(latest["Open"]), 2)
+    h_now = round(float(latest["High"]), 2)
+    l_now = round(float(latest["Low"]), 2)
     vol_now = float(latest["Volume"])
 
     feat: Dict[str, Any] = {"symbol": yf_ticker, "price_date": str(trade_date), "query_date": str(query_date)}
