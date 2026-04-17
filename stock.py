@@ -87,6 +87,11 @@ _inst_cache_lock = threading.Lock()
 _margin_csv_cache: Dict[tuple, Any] = {}
 _margin_cache_lock = threading.Lock()
 
+# [FIX] FinMind per-stock margin cache — keyed by (stock_no, date).
+# FinMind API is rate-limited at 600/hour with token, so cache aggressively.
+_finmind_margin_cache: Dict[tuple, Any] = {}
+_finmind_cache_lock = threading.Lock()
+
 # [FIX] Serialize TWSE/TPEx API requests to avoid rate-limiting
 # Only 1 thread can make an uncached TWSE request at a time
 _twse_request_semaphore = threading.Semaphore(1)
@@ -1460,6 +1465,102 @@ def _parse_twse_json_table(obj):
     return None
 
 
+def _finmind_margin_fetch(stock_no: str, trade_date, max_back: int = 10):
+    """Fetch margin/short sale data from FinMind API.
+
+    [FIX] FinMind is a free Taiwan financial data API that proxies TWSE/TPEx data.
+    Used as primary source because Streamlit Cloud's IP can't reach TWSE MI_MARGN
+    endpoint (both JSON and CSV variants are blocked), but TWSE T86 works.
+
+    Returns normalized dict matching get_margin_short_data's return schema,
+    or None if FinMind doesn't have data (caller should fall back to TWSE/TPEx).
+
+    Requires FINMIND_TOKEN env variable (optional — works without but lower rate limit).
+    """
+    import os
+    token = os.environ.get("FINMIND_TOKEN", "").strip()
+
+    # Cache key — per stock, per requested date
+    date_str = trade_date.strftime("%Y-%m-%d")
+    cache_key = (stock_no, date_str)
+    with _finmind_cache_lock:
+        if cache_key in _finmind_margin_cache:
+            return _finmind_margin_cache[cache_key]
+
+    sess = _get_session()
+    url = "https://api.finmindtrade.com/api/v4/data"
+    # Query window: go back max_back days to handle non-trading days
+    start_date = (trade_date - timedelta(days=max_back)).strftime("%Y-%m-%d")
+    end_date = date_str
+
+    params = {
+        "dataset": "TaiwanStockMarginPurchaseShortSale",
+        "data_id": stock_no,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        r = sess.get(url, params=params, headers=headers, timeout=20)
+        if r.status_code != 200:
+            logger.warning(f"FinMind HTTP {r.status_code} for {stock_no}")
+            with _finmind_cache_lock:
+                _finmind_margin_cache[cache_key] = None
+            return None
+        payload = r.json()
+        if payload.get("status") != 200:
+            # e.g. rate limited, bad token
+            logger.warning(f"FinMind status {payload.get('status')} msg={payload.get('msg')}")
+            with _finmind_cache_lock:
+                _finmind_margin_cache[cache_key] = None
+            return None
+
+        rows = payload.get("data") or []
+        if not rows:
+            with _finmind_cache_lock:
+                _finmind_margin_cache[cache_key] = None
+            return None
+
+        # Rows sorted by date ascending — take the latest one
+        rows_sorted = sorted(rows, key=lambda x: x.get("date", ""))
+        latest = rows_sorted[-1]
+
+        # Map FinMind fields to our schema
+        m_bal = latest.get("MarginPurchaseTodayBalance")
+        m_yes = latest.get("MarginPurchaseYesterdayBalance")
+        m_lim = latest.get("MarginPurchaseLimit")
+        s_bal = latest.get("ShortSaleTodayBalance")
+        s_yes = latest.get("ShortSaleYesterdayBalance")
+
+        # Compute change from today - yesterday
+        m_chg = (m_bal - m_yes) if (m_bal is not None and m_yes is not None) else None
+        s_chg = (s_bal - s_yes) if (s_bal is not None and s_yes is not None) else None
+        usage = round(m_bal / m_lim * 100, 1) if (m_bal and m_lim and m_lim > 0) else None
+
+        result = {
+            "id": f"{stock_no}.TW",
+            "date": latest.get("date"),
+            "margin_balance": _safe_int(m_bal),
+            "margin_change": _safe_int(m_chg),
+            "margin_limit": _safe_int(m_lim),
+            "margin_usage_rate": usage,
+            "short_balance": _safe_int(s_bal),
+            "short_change": _safe_int(s_chg),
+            "error": None,
+        }
+        with _finmind_cache_lock:
+            _finmind_margin_cache[cache_key] = result
+        return result
+    except Exception as e:
+        logger.warning(f"FinMind fetch error for {stock_no}: {e}")
+        with _finmind_cache_lock:
+            _finmind_margin_cache[cache_key] = None
+        return None
+
+
 def _parse_twse_margin_csv(text: str):
     """Parse TWSE MI_MARGN CSV response into a DataFrame.
     Same pattern as _parse_twse_t86_csv — find header row, parse to DataFrame.
@@ -1649,6 +1750,14 @@ def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, ma
     headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-TW,zh;q=0.9"}
     is_two = isinstance(market_hint, str) and market_hint.upper().endswith(".TWO")
     last_error = None
+
+    # [FIX] Try FinMind first — works for both TWSE and TPEx, not blocked by rate limits
+    finmind_result = _finmind_margin_fetch(stock_no, trade_date, max_back)
+    if finmind_result is not None and finmind_result.get("margin_balance") is not None:
+        # Fix the id suffix for TPEx stocks
+        if is_two:
+            finmind_result["id"] = f"{stock_no}.TWO"
+        return finmind_result
 
     def find_col(colmap, contains):
         return next((orig for nk, orig in colmap.items() if all(kw in nk for kw in contains)), None)
