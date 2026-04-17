@@ -1786,8 +1786,17 @@ def _finmind_eps_fetch(stock_no: str, trade_date):
 def _finmind_holders_fetch(stock_no: str, trade_date):
     """Fetch major holder concentration from TaiwanStockHoldingSharesPer.
 
-    Major holders = HoldingSharesLevel > 1000 張 (level 13-15).
-    Retail holders = HoldingSharesLevel <= 10 張 (level 1-3).
+    FinMind schema: HoldingSharesLevel is a numeric level code "1" to "15" (+ "16" for adjustment).
+    Official TDCC definition:
+      Level 1  = 1 – 999 shares (散戶 retail)
+      Level 2  = 1,000 – 5,000
+      ...
+      Level 14 = 800,001 – 1,000,000
+      Level 15 = 1,000,001+ shares (千張大戶 major holder ≥ 1000 lots)
+      Level 16 = 差異數調整 (skip)
+
+    Major holder = Level 15 (≥ 1000 lots / 千張)
+    Retail holder = Level 1 (< 1000 shares)
     """
     date_str = trade_date.strftime("%Y-%m-%d")
     cache_key = (stock_no, date_str)
@@ -1795,7 +1804,7 @@ def _finmind_holders_fetch(stock_no: str, trade_date):
         if cache_key in _finmind_holders_cache:
             return _finmind_holders_cache[cache_key]
 
-    # Weekly updates; fetch past ~6 weeks to have 4w delta
+    # Weekly updates — fetch ~6 weeks for 4-week delta
     start_date = (trade_date - timedelta(days=50)).strftime("%Y-%m-%d")
     rows = _finmind_api_get("TaiwanStockHoldingSharesPer", {
         "data_id": stock_no,
@@ -1818,41 +1827,33 @@ def _finmind_holders_fetch(stock_no: str, trade_date):
                 return None
 
             def _compute_concentration(date_rows):
-                # HoldingSharesLevel comes as strings like "1-999", "1,000-5,000", etc.
-                # Sum percent for major (>1000) vs retail (<=999)
-                major_pct = 0.0
-                retail_pct = 0.0
-                total_pct = 0.0
+                """Extract major (Level 15) and retail (Level 1) percent."""
+                major_pct = 0.0   # Level 15: 1,000,001+ shares = 千張大戶
+                retail_pct = 0.0  # Level 1: 1-999 shares = 散戶
                 for r in date_rows:
-                    lvl = str(r.get("HoldingSharesLevel") or r.get("level") or "")
+                    lvl_raw = r.get("HoldingSharesLevel") or r.get("level") or ""
                     pct = r.get("percent") or r.get("Percent") or 0.0
                     try:
                         pct = float(pct)
                     except (TypeError, ValueError):
                         pct = 0.0
-                    total_pct += pct
-                    # Skip "total" or 合計 rows
-                    if "合計" in lvl or "total" in lvl.lower() or lvl.strip() == "":
-                        continue
-                    # Major: contains "以上" or lower bound >= 1000
-                    if "以上" in lvl:
-                        major_pct += pct
-                    else:
-                        # Parse lower bound from strings like "1,000-5,000"
-                        first_num = ""
-                        for ch in lvl:
-                            if ch.isdigit() or ch == ",":
-                                first_num += ch
-                            elif ch == "-":
-                                break
-                        try:
-                            lower = int(first_num.replace(",", "")) if first_num else 0
-                        except ValueError:
-                            lower = 0
-                        if lower >= 1000:
+                    # Normalize level — FinMind may return numeric (15) or string ("15") or range ("1,000,001以上")
+                    lvl_str = str(lvl_raw).strip()
+                    # Try numeric first
+                    try:
+                        lvl_num = int(lvl_str)
+                        if lvl_num == 15:
                             major_pct += pct
-                        elif lower <= 1:
+                        elif lvl_num == 1:
                             retail_pct += pct
+                        continue
+                    except ValueError:
+                        pass
+                    # Fallback: parse range strings (legacy format)
+                    if "以上" in lvl_str or "1,000,001" in lvl_str:
+                        major_pct += pct
+                    elif lvl_str.startswith("1-") or lvl_str.startswith("1 -") or "1-999" in lvl_str:
+                        retail_pct += pct
                 return round(major_pct, 2), round(retail_pct, 2)
 
             latest_date = dates_sorted[-1]
@@ -1874,13 +1875,14 @@ def _finmind_holders_fetch(stock_no: str, trade_date):
                 else:
                     trend = "stable"
 
+            has_data = major_now > 0 or retail_now > 0
             result = {
                 "holders_date": latest_date,
-                "major_holder_pct": major_now if major_now > 0 else None,
-                "retail_holder_pct": retail_now if retail_now > 0 else None,
-                "major_holder_4w_delta": major_4w_delta,
-                "chip_concentration_trend": trend,
-                "holders_data_available": major_now > 0 or retail_now > 0,
+                "major_holder_pct": major_now if has_data else None,
+                "retail_holder_pct": retail_now if has_data else None,
+                "major_holder_4w_delta": major_4w_delta if has_data else None,
+                "chip_concentration_trend": trend if has_data else "unknown",
+                "holders_data_available": has_data,
             }
         except Exception as e:
             logger.warning(f"FinMind holders parse error for {stock_no}: {e}")
