@@ -96,8 +96,9 @@ _finmind_cache_lock = threading.Lock()
 # Monthly revenue and EPS are full-market (keyed by date), major holders and lending are per-stock
 _finmind_revenue_cache: Dict[tuple, Any] = {}   # (stock_no, date) — per-stock
 _finmind_eps_cache: Dict[tuple, Any] = {}       # (stock_no, date) — per-stock
-_finmind_holders_cache: Dict[tuple, Any] = {}   # (stock_no, date) — per-stock
+_finmind_holders_cache: Dict[tuple, Any] = {}   # (stock_no, date) — per-stock (now used for foreign shareholding)
 _finmind_lending_cache: Dict[tuple, Any] = {}   # (stock_no, date) — per-stock
+_finmind_daytrade_cache: Dict[tuple, Any] = {}  # (stock_no, date) — per-stock (day-trading ratio)
 _finmind_ext_cache_lock = threading.Lock()
 
 # [FIX] Serialize TWSE/TPEx API requests to avoid rate-limiting
@@ -1784,19 +1785,23 @@ def _finmind_eps_fetch(stock_no: str, trade_date):
 
 
 def _finmind_holders_fetch(stock_no: str, trade_date):
-    """Fetch major holder concentration from TaiwanStockHoldingSharesPer.
+    """Fetch foreign shareholding ratio from TaiwanStockShareholding.
 
-    FinMind schema: HoldingSharesLevel is a numeric level code "1" to "15" (+ "16" for adjustment).
-    Official TDCC definition:
-      Level 1  = 1 – 999 shares (散戶 retail)
-      Level 2  = 1,000 – 5,000
-      ...
-      Level 14 = 800,001 – 1,000,000
-      Level 15 = 1,000,001+ shares (千張大戶 major holder ≥ 1000 lots)
-      Level 16 = 差異數調整 (skip)
+    NOTE: Originally designed for major holder (千張大戶) concentration via
+    TaiwanStockHoldingSharesPer, but that dataset requires FinMind backer/sponsor
+    membership. Switched to TaiwanStockShareholding (free) which gives foreign
+    investment ratio — a different but equally useful chip signal for Taiwan stocks.
 
-    Major holder = Level 15 (≥ 1000 lots / 千張)
-    Retail holder = Level 1 (< 1000 shares)
+    Foreign holding ratio trend analysis:
+      - Rising trend = foreign accumulation (strong chip signal)
+      - Falling trend = foreign distribution
+      - >50% ratio = foreign-dominated stock (e.g. 2330)
+
+    Schema fields (Chinese → English):
+      外資及陸資共用法令投資上限比率 → ChineseInvestmentUpperLimitRatio (overall foreign cap %)
+      外資尚可投資股數 → ForeignInvestmentRemainingShares
+      全體外資持有股數 → ForeignInvestmentShares (what we want)
+      發行股數 → NumberOfSharesIssued (for computing ratio if needed)
     """
     date_str = trade_date.strftime("%Y-%m-%d")
     cache_key = (stock_no, date_str)
@@ -1804,9 +1809,9 @@ def _finmind_holders_fetch(stock_no: str, trade_date):
         if cache_key in _finmind_holders_cache:
             return _finmind_holders_cache[cache_key]
 
-    # Weekly updates — fetch ~6 weeks for 4-week delta
-    start_date = (trade_date - timedelta(days=50)).strftime("%Y-%m-%d")
-    rows = _finmind_api_get("TaiwanStockHoldingSharesPer", {
+    # Daily-ish updates — fetch ~35 days for 4-week delta
+    start_date = (trade_date - timedelta(days=45)).strftime("%Y-%m-%d")
+    rows = _finmind_api_get("TaiwanStockShareholding", {
         "data_id": stock_no,
         "start_date": start_date,
     })
@@ -1814,78 +1819,87 @@ def _finmind_holders_fetch(stock_no: str, trade_date):
     result = None
     if rows:
         try:
-            # Group by date
-            by_date: Dict[str, list] = {}
-            for r in rows:
-                d = r.get("date", "")
-                by_date.setdefault(d, []).append(r)
-
-            dates_sorted = sorted(by_date.keys())
-            if not dates_sorted:
+            rows_sorted = sorted(rows, key=lambda r: r.get("date", ""))
+            if not rows_sorted:
                 with _finmind_ext_cache_lock:
                     _finmind_holders_cache[cache_key] = None
                 return None
 
-            def _compute_concentration(date_rows):
-                """Extract major (Level 15) and retail (Level 1) percent."""
-                major_pct = 0.0   # Level 15: 1,000,001+ shares = 千張大戶
-                retail_pct = 0.0  # Level 1: 1-999 shares = 散戶
-                for r in date_rows:
-                    lvl_raw = r.get("HoldingSharesLevel") or r.get("level") or ""
-                    pct = r.get("percent") or r.get("Percent") or 0.0
-                    try:
-                        pct = float(pct)
-                    except (TypeError, ValueError):
-                        pct = 0.0
-                    # Normalize level — FinMind may return numeric (15) or string ("15") or range ("1,000,001以上")
-                    lvl_str = str(lvl_raw).strip()
-                    # Try numeric first
-                    try:
-                        lvl_num = int(lvl_str)
-                        if lvl_num == 15:
-                            major_pct += pct
-                        elif lvl_num == 1:
-                            retail_pct += pct
-                        continue
-                    except ValueError:
-                        pass
-                    # Fallback: parse range strings (legacy format)
-                    if "以上" in lvl_str or "1,000,001" in lvl_str:
-                        major_pct += pct
-                    elif lvl_str.startswith("1-") or lvl_str.startswith("1 -") or "1-999" in lvl_str:
-                        retail_pct += pct
-                return round(major_pct, 2), round(retail_pct, 2)
+            def _compute_ratio(row):
+                """Compute foreign holding ratio (%) from a single row.
+                Tries multiple field name variants that FinMind uses.
+                """
+                # Try pre-computed ratio first
+                for key in ("ForeignInvestmentSharesRatio", "foreign_investment_shares_ratio",
+                            "PercentageOfShareholding"):
+                    v = row.get(key)
+                    if v is not None:
+                        try:
+                            return float(v)
+                        except (TypeError, ValueError):
+                            pass
+                # Else compute from shares / issued
+                held = None
+                issued = None
+                for key in ("ForeignInvestmentShares", "foreign_investment_shares"):
+                    if key in row:
+                        try:
+                            held = float(row[key])
+                            break
+                        except (TypeError, ValueError):
+                            pass
+                for key in ("NumberOfSharesIssued", "number_of_shares_issued"):
+                    if key in row:
+                        try:
+                            issued = float(row[key])
+                            break
+                        except (TypeError, ValueError):
+                            pass
+                if held is not None and issued and issued > 0:
+                    return round(held / issued * 100, 4)
+                return None
 
-            latest_date = dates_sorted[-1]
-            major_now, retail_now = _compute_concentration(by_date[latest_date])
+            # Extract latest and prior-period ratios
+            latest_row = rows_sorted[-1]
+            latest_ratio = _compute_ratio(latest_row)
+            latest_date = latest_row.get("date")
 
-            # 4-week-ago comparison
-            major_4w_delta = None
-            if len(dates_sorted) >= 4:
-                old_date = dates_sorted[max(0, len(dates_sorted) - 4)]
-                major_old, _ = _compute_concentration(by_date[old_date])
-                major_4w_delta = round(major_now - major_old, 2)
+            if latest_ratio is None:
+                with _finmind_ext_cache_lock:
+                    _finmind_holders_cache[cache_key] = None
+                return None
 
+            # 4-week (~20 trading day) delta
+            delta_4w = None
+            if len(rows_sorted) >= 20:
+                old_ratio = _compute_ratio(rows_sorted[-20])
+                if old_ratio is not None:
+                    delta_4w = round(latest_ratio - old_ratio, 3)
+            elif len(rows_sorted) >= 2:
+                # Fallback to oldest available if we don't have 20 days
+                old_ratio = _compute_ratio(rows_sorted[0])
+                if old_ratio is not None:
+                    delta_4w = round(latest_ratio - old_ratio, 3)
+
+            # Trend classification — threshold 0.2% over 4 weeks is meaningful
             trend = "unknown"
-            if major_4w_delta is not None:
-                if major_4w_delta > 0.3:
-                    trend = "concentrating"
-                elif major_4w_delta < -0.3:
-                    trend = "dispersing"
+            if delta_4w is not None:
+                if delta_4w > 0.2:
+                    trend = "accumulating"
+                elif delta_4w < -0.2:
+                    trend = "reducing"
                 else:
                     trend = "stable"
 
-            has_data = major_now > 0 or retail_now > 0
             result = {
-                "holders_date": latest_date,
-                "major_holder_pct": major_now if has_data else None,
-                "retail_holder_pct": retail_now if has_data else None,
-                "major_holder_4w_delta": major_4w_delta if has_data else None,
-                "chip_concentration_trend": trend if has_data else "unknown",
-                "holders_data_available": has_data,
+                "foreign_holding_date": latest_date,
+                "foreign_holding_pct": round(latest_ratio, 2),
+                "foreign_holding_4w_delta": delta_4w,
+                "foreign_accumulation_trend": trend,
+                "foreign_holding_data_available": True,
             }
         except Exception as e:
-            logger.warning(f"FinMind holders parse error for {stock_no}: {e}")
+            logger.warning(f"FinMind foreign shareholding parse error for {stock_no}: {e}")
             result = None
 
     with _finmind_ext_cache_lock:
@@ -1959,6 +1973,114 @@ def _finmind_lending_fetch(stock_no: str, trade_date):
 
     with _finmind_ext_cache_lock:
         _finmind_lending_cache[cache_key] = result
+    return result
+
+
+def _finmind_daytrade_fetch(stock_no: str, trade_date, total_volume_map: dict = None):
+    """Fetch day-trading (當沖) data from TaiwanStockDayTrading.
+
+    FinMind TaiwanStockDayTrading schema returns ONLY day-trade stats:
+      {stock_id, date, BuyAfterSale, Volume, BuyAmount, SellAmount}
+    where `Volume` is the day-trade volume (shares turned over intraday).
+
+    To compute the day-trade RATIO we need to divide by total Volume from
+    price data. Caller should pass `total_volume_map` = {date_str: total_volume}
+    so we can compute ratio without another API call.
+
+    Returns dict with:
+      day_trade_ratio_latest          — latest day's DT ratio (%)
+      day_trade_ratio_5d_avg          — 5-day moving average
+      day_trade_ratio_20d_avg         — 20-day moving average
+      day_trade_ratio_percentile_252d — percentile in last 252 days
+      flag_day_trade_overheat         — latest > 45% AND 20d avg > 35% (sustained retail frenzy)
+      flag_day_trade_divergence       — ratio rising but volume flat/down (散戶在炒、聰明錢離場)
+    """
+    date_str = trade_date.strftime("%Y-%m-%d")
+    cache_key = (stock_no, date_str)
+    with _finmind_ext_cache_lock:
+        if cache_key in _finmind_daytrade_cache:
+            return _finmind_daytrade_cache[cache_key]
+
+    # Need ~300 days for 252-day percentile
+    start_date = (trade_date - timedelta(days=380)).strftime("%Y-%m-%d")
+    rows = _finmind_api_get("TaiwanStockDayTrading", {
+        "data_id": stock_no,
+        "start_date": start_date,
+    })
+
+    result = None
+    if rows and total_volume_map:
+        try:
+            # Compute ratio per day where we have both DT volume and total volume
+            ratios_by_date: Dict[str, float] = {}
+            for r in rows:
+                d = r.get("date", "")
+                dt_vol_raw = r.get("Volume")
+                try:
+                    dt_vol = float(dt_vol_raw) if dt_vol_raw is not None else 0
+                except (TypeError, ValueError):
+                    continue
+                total_vol = total_volume_map.get(d)
+                if total_vol and total_vol > 0 and dt_vol > 0:
+                    ratios_by_date[d] = round(dt_vol / total_vol * 100, 2)
+
+            if not ratios_by_date:
+                with _finmind_ext_cache_lock:
+                    _finmind_daytrade_cache[cache_key] = None
+                return None
+
+            dates_sorted = sorted(ratios_by_date.keys())
+            ratios_sorted = [ratios_by_date[d] for d in dates_sorted]
+
+            latest = ratios_sorted[-1]
+            latest_date = dates_sorted[-1]
+
+            # 5-day MA
+            avg_5d = round(sum(ratios_sorted[-5:]) / min(5, len(ratios_sorted)), 2)
+            # 20-day MA
+            avg_20d = round(sum(ratios_sorted[-20:]) / min(20, len(ratios_sorted)), 2) if len(ratios_sorted) >= 2 else latest
+
+            # 252-day percentile
+            window = ratios_sorted[-252:] if len(ratios_sorted) >= 30 else ratios_sorted
+            rank = sum(1 for x in window if x <= latest) / len(window) if window else None
+            percentile = round(rank, 4) if rank is not None else None
+
+            # Overheat flag: sustained high day-trade activity
+            flag_overheat = bool(latest > 45 and avg_20d > 35)
+
+            # Divergence flag: DT ratio rising (last 5d avg vs prior 5d avg) while
+            # total volume NOT rising — means the extra turnover is pure retail churn.
+            flag_divergence = False
+            if len(ratios_sorted) >= 10 and len(dates_sorted) >= 10:
+                recent_5_ratio = sum(ratios_sorted[-5:]) / 5
+                prior_5_ratio = sum(ratios_sorted[-10:-5]) / 5
+                ratio_rising = recent_5_ratio > prior_5_ratio + 3  # ratio climbed at least 3 pp
+
+                # Get corresponding total volumes
+                recent_vols = [total_volume_map.get(d, 0) for d in dates_sorted[-5:]]
+                prior_vols = [total_volume_map.get(d, 0) for d in dates_sorted[-10:-5]]
+                recent_vol_avg = sum(recent_vols) / 5 if recent_vols else 0
+                prior_vol_avg = sum(prior_vols) / 5 if prior_vols else 0
+                vol_not_rising = recent_vol_avg <= prior_vol_avg * 1.1  # allow 10% noise
+
+                flag_divergence = bool(ratio_rising and vol_not_rising)
+
+            result = {
+                "day_trade_date": latest_date,
+                "day_trade_ratio_latest": latest,
+                "day_trade_ratio_5d_avg": avg_5d,
+                "day_trade_ratio_20d_avg": avg_20d,
+                "day_trade_ratio_percentile_252d": percentile,
+                "flag_day_trade_overheat": flag_overheat,
+                "flag_day_trade_divergence": flag_divergence,
+                "day_trade_data_available": True,
+            }
+        except Exception as e:
+            logger.warning(f"FinMind daytrade parse error for {stock_no}: {e}")
+            result = None
+
+    with _finmind_ext_cache_lock:
+        _finmind_daytrade_cache[cache_key] = result
     return result
 
 
@@ -3279,9 +3401,9 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         def _fetch_holders():
             try:
                 r = _finmind_holders_fetch(stock_no, latest_overall_ts.date())
-                return r if r else {"holders_data_available": False}
+                return r if r else {"foreign_holding_data_available": False}
             except Exception:
-                return {"holders_data_available": False}
+                return {"foreign_holding_data_available": False}
 
         def _fetch_lending():
             try:
@@ -3290,8 +3412,26 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
             except Exception:
                 return {"lending_data_available": False}
 
+        def _fetch_daytrade():
+            try:
+                # Build {date_str: total_volume} map from df for ratio computation.
+                # df is in scope from build_ai_features' enclosing frame.
+                vol_map = {}
+                try:
+                    for ts, v in df["Volume"].items():
+                        ds = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
+                        vol_map[ds] = float(v) if v is not None else 0
+                except Exception:
+                    vol_map = {}
+                if not vol_map:
+                    return {"day_trade_data_available": False}
+                r = _finmind_daytrade_fetch(stock_no, latest_overall_ts.date(), total_volume_map=vol_map)
+                return r if r else {"day_trade_data_available": False}
+            except Exception:
+                return {"day_trade_data_available": False}
+
         # [OPT] Run all external data fetches in parallel threads
-        with ThreadPoolExecutor(max_workers=7) as pool:
+        with ThreadPoolExecutor(max_workers=8) as pool:
             fut_inst = pool.submit(_fetch_institutional)
             fut_margin = pool.submit(_fetch_margin)
             fut_tdcc = pool.submit(_fetch_tdcc)
@@ -3299,6 +3439,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
             fut_eps = pool.submit(_fetch_eps)
             fut_holders = pool.submit(_fetch_holders)
             fut_lending = pool.submit(_fetch_lending)
+            fut_daytrade = pool.submit(_fetch_daytrade)
 
         feat.update(fut_inst.result())
         feat.update(fut_margin.result())
@@ -3307,6 +3448,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         feat.update(fut_eps.result())
         feat.update(fut_holders.result())
         feat.update(fut_lending.result())
+        feat.update(fut_daytrade.result())
 
     else:
         feat["inst_data_available"] = False
@@ -3314,8 +3456,9 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         feat["tdcc_available"] = False
         feat["revenue_data_available"] = False
         feat["eps_data_available"] = False
-        feat["holders_data_available"] = False
+        feat["foreign_holding_data_available"] = False
         feat["lending_data_available"] = False
+        feat["day_trade_data_available"] = False
 
     # ===================================================================
     # [P0] GHOST FIELD IMPLEMENTATIONS — Beta, Liquidity, Divergence Net
@@ -3419,10 +3562,13 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
                 "available": feat.get("eps_data_available", False),
             },
             "holders": {
-                "available": feat.get("holders_data_available", False),
+                "available": feat.get("foreign_holding_data_available", False),
             },
             "lending": {
                 "available": feat.get("lending_data_available", False),
+            },
+            "day_trade": {
+                "available": feat.get("day_trade_data_available", False),
             },
         }
 
