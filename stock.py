@@ -92,6 +92,14 @@ _margin_cache_lock = threading.Lock()
 _finmind_margin_cache: Dict[tuple, Any] = {}
 _finmind_cache_lock = threading.Lock()
 
+# [NEW] FinMind extended data caches — monthly revenue, EPS, major holders, securities lending
+# Monthly revenue and EPS are full-market (keyed by date), major holders and lending are per-stock
+_finmind_revenue_cache: Dict[tuple, Any] = {}   # (stock_no, date) — per-stock
+_finmind_eps_cache: Dict[tuple, Any] = {}       # (stock_no, date) — per-stock
+_finmind_holders_cache: Dict[tuple, Any] = {}   # (stock_no, date) — per-stock
+_finmind_lending_cache: Dict[tuple, Any] = {}   # (stock_no, date) — per-stock
+_finmind_ext_cache_lock = threading.Lock()
+
 # [FIX] Serialize TWSE/TPEx API requests to avoid rate-limiting
 # Only 1 thread can make an uncached TWSE request at a time
 _twse_request_semaphore = threading.Semaphore(1)
@@ -1561,6 +1569,397 @@ def _finmind_margin_fetch(stock_no: str, trade_date, max_back: int = 10):
         return None
 
 
+def _finmind_api_get(dataset: str, params: dict, timeout: int = 20):
+    """Unified FinMind API caller. Returns list of row dicts or None.
+
+    Handles: token auth, HTTP errors, status checks, rate limit detection.
+    """
+    import os
+    token = os.environ.get("FINMIND_TOKEN", "").strip()
+    sess = _get_session()
+    url = "https://api.finmindtrade.com/api/v4/data"
+    q = dict(params)
+    q["dataset"] = dataset
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        r = sess.get(url, params=q, headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            logger.warning(f"FinMind {dataset} HTTP {r.status_code}")
+            return None
+        payload = r.json()
+        if payload.get("status") != 200:
+            logger.warning(f"FinMind {dataset} status {payload.get('status')}: {payload.get('msg')}")
+            return None
+        return payload.get("data") or []
+    except Exception as e:
+        logger.warning(f"FinMind {dataset} error: {e}")
+        return None
+
+
+def _finmind_revenue_fetch(stock_no: str, trade_date):
+    """Fetch monthly revenue data for a stock.
+
+    Returns dict with revenue YoY/MoM trend analysis, or None.
+    """
+    date_str = trade_date.strftime("%Y-%m-%d")
+    cache_key = (stock_no, date_str)
+    with _finmind_ext_cache_lock:
+        if cache_key in _finmind_revenue_cache:
+            return _finmind_revenue_cache[cache_key]
+
+    # Fetch past 14 months to have enough for 3m rolling YoY + prior year comparison
+    start_date = (trade_date - timedelta(days=450)).strftime("%Y-%m-%d")
+    rows = _finmind_api_get("TaiwanStockMonthRevenue", {
+        "data_id": stock_no,
+        "start_date": start_date,
+    })
+
+    result = None
+    if rows:
+        try:
+            # Sort by revenue_year + revenue_month ascending
+            def _rev_key(r):
+                return (int(r.get("revenue_year", 0)), int(r.get("revenue_month", 0)))
+            rows_sorted = sorted(rows, key=_rev_key)
+
+            if len(rows_sorted) >= 1:
+                latest = rows_sorted[-1]
+                latest_rev = latest.get("revenue")
+                latest_yoy = latest.get("revenue_year_ago_yoy") or latest.get("YoY")
+                # FinMind field name varies; compute manually if missing
+                if latest_yoy is None and len(rows_sorted) >= 13:
+                    prev_year = rows_sorted[-13]  # same month last year
+                    pv = prev_year.get("revenue")
+                    if pv and pv > 0 and latest_rev:
+                        latest_yoy = round((latest_rev - pv) / pv * 100, 2)
+
+                # MoM — current vs last month
+                latest_mom = None
+                if len(rows_sorted) >= 2:
+                    prev_month = rows_sorted[-2]
+                    pm = prev_month.get("revenue")
+                    if pm and pm > 0 and latest_rev:
+                        latest_mom = round((latest_rev - pm) / pm * 100, 2)
+
+                # 3-month rolling YoY average (last 3 months YoY averaged)
+                yoy_3m_avg = None
+                yoys = []
+                for i in range(1, min(4, len(rows_sorted) + 1)):
+                    idx = -i
+                    r = rows_sorted[idx]
+                    y = r.get("revenue_year_ago_yoy") or r.get("YoY")
+                    if y is None:
+                        # try manual compute
+                        try:
+                            yr = int(r.get("revenue_year"))
+                            mo = int(r.get("revenue_month"))
+                            # find same month previous year
+                            for pr in rows_sorted:
+                                if int(pr.get("revenue_year", 0)) == yr - 1 and int(pr.get("revenue_month", 0)) == mo:
+                                    pv = pr.get("revenue")
+                                    cv = r.get("revenue")
+                                    if pv and pv > 0 and cv is not None:
+                                        y = (cv - pv) / pv * 100
+                                    break
+                        except Exception:
+                            pass
+                    if y is not None:
+                        yoys.append(float(y))
+                if yoys:
+                    yoy_3m_avg = round(sum(yoys) / len(yoys), 2)
+
+                # Momentum classification
+                momentum = "unknown"
+                if latest_yoy is not None and yoy_3m_avg is not None:
+                    if latest_yoy > yoy_3m_avg + 5:
+                        momentum = "accelerating"
+                    elif latest_yoy < yoy_3m_avg - 5:
+                        momentum = "decelerating"
+                    else:
+                        momentum = "stable"
+                elif latest_yoy is not None:
+                    momentum = "stable" if abs(latest_yoy) < 10 else ("accelerating" if latest_yoy > 0 else "decelerating")
+
+                result = {
+                    "revenue_month_label": f"{latest.get('revenue_year')}/{latest.get('revenue_month'):02d}" if latest.get('revenue_month') else None,
+                    "revenue_latest": _safe_int(latest_rev),
+                    "revenue_yoy_latest": round(float(latest_yoy), 2) if latest_yoy is not None else None,
+                    "revenue_mom_latest": latest_mom,
+                    "revenue_yoy_3m_avg": yoy_3m_avg,
+                    "revenue_momentum": momentum,
+                    "revenue_data_available": True,
+                }
+        except Exception as e:
+            logger.warning(f"FinMind revenue parse error for {stock_no}: {e}")
+            result = None
+
+    with _finmind_ext_cache_lock:
+        _finmind_revenue_cache[cache_key] = result
+    return result
+
+
+def _finmind_eps_fetch(stock_no: str, trade_date):
+    """Fetch EPS data from financial statements.
+
+    Returns dict with latest quarter EPS + trend, or None.
+    """
+    date_str = trade_date.strftime("%Y-%m-%d")
+    cache_key = (stock_no, date_str)
+    with _finmind_ext_cache_lock:
+        if cache_key in _finmind_eps_cache:
+            return _finmind_eps_cache[cache_key]
+
+    # Fetch past ~2 years of financial statements to get trend
+    start_date = (trade_date - timedelta(days=800)).strftime("%Y-%m-%d")
+    rows = _finmind_api_get("TaiwanStockFinancialStatements", {
+        "data_id": stock_no,
+        "start_date": start_date,
+    })
+
+    result = None
+    if rows:
+        try:
+            # Filter to EPS rows only
+            eps_rows = [r for r in rows if r.get("type") == "EPS"]
+            if eps_rows:
+                eps_sorted = sorted(eps_rows, key=lambda r: r.get("date", ""))
+                latest = eps_sorted[-1]
+                latest_eps = latest.get("value")
+                latest_date = latest.get("date")
+
+                # EPS YoY — same quarter last year
+                eps_yoy = None
+                if len(eps_sorted) >= 5:
+                    prev_year = eps_sorted[-5]  # 4 quarters ago
+                    pv = prev_year.get("value")
+                    if pv is not None and pv != 0 and latest_eps is not None:
+                        eps_yoy = round((latest_eps - pv) / abs(pv) * 100, 2)
+
+                # EPS QoQ — last quarter
+                eps_qoq = None
+                if len(eps_sorted) >= 2:
+                    prev_q = eps_sorted[-2]
+                    pv = prev_q.get("value")
+                    if pv is not None and pv != 0 and latest_eps is not None:
+                        eps_qoq = round((latest_eps - pv) / abs(pv) * 100, 2)
+
+                # Trailing 4Q sum (TTM EPS)
+                eps_ttm = None
+                if len(eps_sorted) >= 4:
+                    last4 = eps_sorted[-4:]
+                    vals = [r.get("value") for r in last4 if r.get("value") is not None]
+                    if len(vals) == 4:
+                        eps_ttm = round(sum(vals), 2)
+
+                # Trend: last 4 quarters direction
+                trend = "unknown"
+                if len(eps_sorted) >= 4:
+                    last4 = [r.get("value") for r in eps_sorted[-4:] if r.get("value") is not None]
+                    if len(last4) == 4:
+                        if last4[-1] > last4[0] and last4[-1] > last4[-2]:
+                            trend = "improving"
+                        elif last4[-1] < last4[0] and last4[-1] < last4[-2]:
+                            trend = "deteriorating"
+                        else:
+                            trend = "mixed"
+
+                result = {
+                    "eps_quarter_label": latest_date,
+                    "eps_latest": round(float(latest_eps), 2) if latest_eps is not None else None,
+                    "eps_yoy_pct": eps_yoy,
+                    "eps_qoq_pct": eps_qoq,
+                    "eps_ttm": eps_ttm,
+                    "eps_trend_4q": trend,
+                    "eps_data_available": True,
+                }
+        except Exception as e:
+            logger.warning(f"FinMind EPS parse error for {stock_no}: {e}")
+            result = None
+
+    with _finmind_ext_cache_lock:
+        _finmind_eps_cache[cache_key] = result
+    return result
+
+
+def _finmind_holders_fetch(stock_no: str, trade_date):
+    """Fetch major holder concentration from TaiwanStockHoldingSharesPer.
+
+    Major holders = HoldingSharesLevel > 1000 張 (level 13-15).
+    Retail holders = HoldingSharesLevel <= 10 張 (level 1-3).
+    """
+    date_str = trade_date.strftime("%Y-%m-%d")
+    cache_key = (stock_no, date_str)
+    with _finmind_ext_cache_lock:
+        if cache_key in _finmind_holders_cache:
+            return _finmind_holders_cache[cache_key]
+
+    # Weekly updates; fetch past ~6 weeks to have 4w delta
+    start_date = (trade_date - timedelta(days=50)).strftime("%Y-%m-%d")
+    rows = _finmind_api_get("TaiwanStockHoldingSharesPer", {
+        "data_id": stock_no,
+        "start_date": start_date,
+    })
+
+    result = None
+    if rows:
+        try:
+            # Group by date
+            by_date: Dict[str, list] = {}
+            for r in rows:
+                d = r.get("date", "")
+                by_date.setdefault(d, []).append(r)
+
+            dates_sorted = sorted(by_date.keys())
+            if not dates_sorted:
+                with _finmind_ext_cache_lock:
+                    _finmind_holders_cache[cache_key] = None
+                return None
+
+            def _compute_concentration(date_rows):
+                # HoldingSharesLevel comes as strings like "1-999", "1,000-5,000", etc.
+                # Sum percent for major (>1000) vs retail (<=999)
+                major_pct = 0.0
+                retail_pct = 0.0
+                total_pct = 0.0
+                for r in date_rows:
+                    lvl = str(r.get("HoldingSharesLevel") or r.get("level") or "")
+                    pct = r.get("percent") or r.get("Percent") or 0.0
+                    try:
+                        pct = float(pct)
+                    except (TypeError, ValueError):
+                        pct = 0.0
+                    total_pct += pct
+                    # Skip "total" or 合計 rows
+                    if "合計" in lvl or "total" in lvl.lower() or lvl.strip() == "":
+                        continue
+                    # Major: contains "以上" or lower bound >= 1000
+                    if "以上" in lvl:
+                        major_pct += pct
+                    else:
+                        # Parse lower bound from strings like "1,000-5,000"
+                        first_num = ""
+                        for ch in lvl:
+                            if ch.isdigit() or ch == ",":
+                                first_num += ch
+                            elif ch == "-":
+                                break
+                        try:
+                            lower = int(first_num.replace(",", "")) if first_num else 0
+                        except ValueError:
+                            lower = 0
+                        if lower >= 1000:
+                            major_pct += pct
+                        elif lower <= 1:
+                            retail_pct += pct
+                return round(major_pct, 2), round(retail_pct, 2)
+
+            latest_date = dates_sorted[-1]
+            major_now, retail_now = _compute_concentration(by_date[latest_date])
+
+            # 4-week-ago comparison
+            major_4w_delta = None
+            if len(dates_sorted) >= 4:
+                old_date = dates_sorted[max(0, len(dates_sorted) - 4)]
+                major_old, _ = _compute_concentration(by_date[old_date])
+                major_4w_delta = round(major_now - major_old, 2)
+
+            trend = "unknown"
+            if major_4w_delta is not None:
+                if major_4w_delta > 0.3:
+                    trend = "concentrating"
+                elif major_4w_delta < -0.3:
+                    trend = "dispersing"
+                else:
+                    trend = "stable"
+
+            result = {
+                "holders_date": latest_date,
+                "major_holder_pct": major_now if major_now > 0 else None,
+                "retail_holder_pct": retail_now if retail_now > 0 else None,
+                "major_holder_4w_delta": major_4w_delta,
+                "chip_concentration_trend": trend,
+                "holders_data_available": major_now > 0 or retail_now > 0,
+            }
+        except Exception as e:
+            logger.warning(f"FinMind holders parse error for {stock_no}: {e}")
+            result = None
+
+    with _finmind_ext_cache_lock:
+        _finmind_holders_cache[cache_key] = result
+    return result
+
+
+def _finmind_lending_fetch(stock_no: str, trade_date):
+    """Fetch securities lending (借券) data.
+
+    Returns dict with lending balance and change.
+    """
+    date_str = trade_date.strftime("%Y-%m-%d")
+    cache_key = (stock_no, date_str)
+    with _finmind_ext_cache_lock:
+        if cache_key in _finmind_lending_cache:
+            return _finmind_lending_cache[cache_key]
+
+    start_date = (trade_date - timedelta(days=30)).strftime("%Y-%m-%d")
+    rows = _finmind_api_get("TaiwanStockSecuritiesLending", {
+        "data_id": stock_no,
+        "start_date": start_date,
+    })
+
+    result = None
+    if rows:
+        try:
+            rows_sorted = sorted(rows, key=lambda r: r.get("date", ""))
+            # Aggregate by date — lending can have multiple rows per day
+            by_date: Dict[str, dict] = {}
+            for r in rows_sorted:
+                d = r.get("date", "")
+                if d not in by_date:
+                    by_date[d] = {"volume": 0, "value": 0}
+                vol = r.get("volume") or r.get("Volume") or 0
+                try:
+                    by_date[d]["volume"] += int(vol)
+                except (TypeError, ValueError):
+                    pass
+
+            dates_sorted = sorted(by_date.keys())
+            if not dates_sorted:
+                with _finmind_ext_cache_lock:
+                    _finmind_lending_cache[cache_key] = None
+                return None
+
+            latest_date = dates_sorted[-1]
+            latest_vol = by_date[latest_date]["volume"]
+
+            # 5-day cumulative change — sum last 5 days vs 5 days before
+            vol_5d = sum(by_date[d]["volume"] for d in dates_sorted[-5:])
+            vol_5d_prior = sum(by_date[d]["volume"] for d in dates_sorted[-10:-5]) if len(dates_sorted) >= 10 else 0
+            vol_5d_change = vol_5d - vol_5d_prior if vol_5d_prior else None
+
+            # Smart short signal: 5d volume >= 2x prior 5d volume and > 100 lots
+            smart_short = False
+            if vol_5d >= 100 and vol_5d_prior and vol_5d >= vol_5d_prior * 2:
+                smart_short = True
+
+            result = {
+                "lending_date": latest_date,
+                "lending_volume_latest": _safe_int(latest_vol),
+                "lending_volume_5d": _safe_int(vol_5d),
+                "lending_volume_5d_change": _safe_int(vol_5d_change),
+                "flag_smart_short_signal": smart_short,
+                "lending_data_available": True,
+            }
+        except Exception as e:
+            logger.warning(f"FinMind lending parse error for {stock_no}: {e}")
+            result = None
+
+    with _finmind_ext_cache_lock:
+        _finmind_lending_cache[cache_key] = result
+    return result
+
+
 def _parse_twse_margin_csv(text: str):
     """Parse TWSE MI_MARGN CSV response into a DataFrame.
     Same pattern as _parse_twse_t86_csv — find header row, parse to DataFrame.
@@ -2860,20 +3259,61 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
             except Exception:
                 return {"tdcc_available": False}
 
-        # [OPT] Run all 4 external data fetches in parallel threads
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        # [NEW] FinMind extended fetches — revenue, EPS, major holders, lending
+        def _fetch_revenue():
+            try:
+                r = _finmind_revenue_fetch(stock_no, latest_overall_ts.date())
+                return r if r else {"revenue_data_available": False}
+            except Exception:
+                return {"revenue_data_available": False}
+
+        def _fetch_eps():
+            try:
+                r = _finmind_eps_fetch(stock_no, latest_overall_ts.date())
+                return r if r else {"eps_data_available": False}
+            except Exception:
+                return {"eps_data_available": False}
+
+        def _fetch_holders():
+            try:
+                r = _finmind_holders_fetch(stock_no, latest_overall_ts.date())
+                return r if r else {"holders_data_available": False}
+            except Exception:
+                return {"holders_data_available": False}
+
+        def _fetch_lending():
+            try:
+                r = _finmind_lending_fetch(stock_no, latest_overall_ts.date())
+                return r if r else {"lending_data_available": False}
+            except Exception:
+                return {"lending_data_available": False}
+
+        # [OPT] Run all external data fetches in parallel threads
+        with ThreadPoolExecutor(max_workers=7) as pool:
             fut_inst = pool.submit(_fetch_institutional)
             fut_margin = pool.submit(_fetch_margin)
             fut_tdcc = pool.submit(_fetch_tdcc)
+            fut_revenue = pool.submit(_fetch_revenue)
+            fut_eps = pool.submit(_fetch_eps)
+            fut_holders = pool.submit(_fetch_holders)
+            fut_lending = pool.submit(_fetch_lending)
 
         feat.update(fut_inst.result())
         feat.update(fut_margin.result())
         feat.update(fut_tdcc.result())
+        feat.update(fut_revenue.result())
+        feat.update(fut_eps.result())
+        feat.update(fut_holders.result())
+        feat.update(fut_lending.result())
 
     else:
         feat["inst_data_available"] = False
         feat["margin_data_available"] = False
         feat["tdcc_available"] = False
+        feat["revenue_data_available"] = False
+        feat["eps_data_available"] = False
+        feat["holders_data_available"] = False
+        feat["lending_data_available"] = False
 
     # ===================================================================
     # [P0] GHOST FIELD IMPLEMENTATIONS — Beta, Liquidity, Divergence Net
@@ -2969,6 +3409,18 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
             },
             "institutional": {
                 "available": feat.get("inst_data_available", False),
+            },
+            "revenue": {
+                "available": feat.get("revenue_data_available", False),
+            },
+            "eps": {
+                "available": feat.get("eps_data_available", False),
+            },
+            "holders": {
+                "available": feat.get("holders_data_available", False),
+            },
+            "lending": {
+                "available": feat.get("lending_data_available", False),
             },
         }
 
