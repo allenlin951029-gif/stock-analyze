@@ -23,6 +23,13 @@ from stock import (
 st.set_page_config(page_title="Stock Analyze", layout="wide")
 st.title("Stock Analyze")
 
+# [FIX] FinMind token — 融資融券資料來源（TWSE MI_MARGN 在雲端被擋，改用 FinMind API）
+try:
+    if "FINMIND_TOKEN" in st.secrets:
+        os.environ["FINMIND_TOKEN"] = st.secrets["FINMIND_TOKEN"]
+except Exception:
+    pass
+
 # -------------------------
 # Firestore Configuration
 # -------------------------
@@ -113,7 +120,7 @@ def load_regulatory_from_db():
         "twse_disposition": None,
         "tpex_disposition": None,
     }
-    
+
     if db:
         try:
             doc_ref = db.collection(FS_COLLECTION).document(FS_DOCUMENT)
@@ -124,7 +131,7 @@ def load_regulatory_from_db():
                 disp = d.get("regulatory_disposition", {})
                 res_data["attention_stocks"] = set(attn) if isinstance(attn, list) else set()
                 res_data["disposition_stocks"] = disp if isinstance(disp, dict) else {}
-                
+
                 # 載入上傳資訊，並將裡面的 codes list 轉回 set
                 db_info = d.get("regulatory_upload_info", {})
                 if db_info:
@@ -136,7 +143,7 @@ def load_regulatory_from_db():
                             res_info[k] = item
         except Exception:
             pass
-            
+
     return res_data, res_info
 
 
@@ -149,7 +156,7 @@ def save_regulatory_to_db():
         return
     reg = st.session_state.get("regulatory_data", {})
     info = st.session_state.get("regulatory_upload_info", {})
-    
+
     # 準備可 JSON 序列化的 info (將 set 轉為 list)
     safe_info = {}
     for k, v in info.items():
@@ -645,7 +652,7 @@ with st.sidebar:
         st.divider()
         st.caption("No regulatory lists loaded")
 
-# ==========================================
+    # ==========================================
     # AI 操盤手提示詞複製區（可折疊）
     # ==========================================
     st.divider()
@@ -654,38 +661,13 @@ with st.sidebar:
 
     with st.expander("📋 提示詞 A：潛力股篩選", expanded=False):
         prompt_a = r"""你是一位台股技術分析專家，擅長多時間框架趨勢分析與量價結構判讀。
-我將上傳好幾份 JSON 格式的候選股技術面資料，請依照以下框架嚴格篩選出具潛力的標的。
+我將上傳一份 JSON 格式的候選股技術面資料，請依照以下框架嚴格篩選出具潛力的標的。
 
 ═══ 分析框架（按優先級排序）═══
 「趨勢第一、賠率第二、法人籌碼做加減分」
-
-【第零層：大盤環境 — 決定整體基調】
-先讀取任一檔 JSON 中的 market_* 欄位，判斷本輪篩選基調：
-- market_trend_state + market_weekly_trend
-  → 日線 uptrend + 週線 uptrend = 正常篩選
-  → 日線 downtrend 或 週線 downtrend = 提高標準，只留最強
-  → 日線 uptrend_pullback + 週線 uptrend = 正常但留意拉回深度
-- market_volatility_regime
-  → high_volatility / expansion = 收緊進場條件
-  → compression = 留意即將突破
-  → normal = 正常操作
-- market_supertrend_bullish = false → 全面警戒
-- market_rsi14 > 75 → 大盤過熱；< 30 → 超賣留意錯殺
-- market_obv_slope_20d < 0 → 量能衰退，追高風險大
-- stock_vs_market
-  → both_bullish = 順風盤
-  → stock_bullish_market_bearish = 逆風做多，需更強條件
-  → both_bearish = 直接排除
-
 【第一層：趨勢結構 — 決定能不能看】
-分級制：
-✅ 合格：strong_uptrend / uptrend / uptrend_pullback
-⚠️ 需額外確認：weak_uptrend（需至少動能+量價其中一層也通過）
-👀 觀察區：strong_bottom_bounce + mtf mixed_bull_bias（不主動進場，列入追蹤）
-❌ 不合格：downtrend / strong_downtrend / top_pullback
-
-其他條件：
-- mtf_alignment（aligned_bull 最佳，mixed_bull_bias 次之）
+- trend_state（uptrend / uptrend_pullback 才合格）
+- mtf_alignment（aligned_bull 最佳，partial_bull 次之）
 - daily_weekly_trend_agree = true
 - weekly_trend_state = "uptrend"，weekly_above_ma20 = true
 - ma5 > ma20 > ma60（均線多頭排列）
@@ -708,22 +690,13 @@ with st.sidebar:
 - foreign_20d_net > 0 或 trust_20d_net > 0
 - flag_inst_consensus_buy = true 最佳
 - flag_foreign_divergence = true → 標註背離
-⚠️ 若 inst_data_available = false 或 margin_data_available = false → 標註「籌碼資料不完整，判斷降級」
 
 【第五層：風險評估】
-- risk_reward_ratio ≥ 1.2 合格，≥ 2.0 優秀（與系統 ENTRY_MIN_RR 一致）
+- risk_reward_ratio ≥ 1.5 合格，≥ 2.0 優秀
 - flag_poor_risk_reward = true 直接排除
 - beta_60d > 2.0 標註「高 Beta」
-- target_upgrade_reason 不為空 → 標註「目標價已升級：原 {target_upgrade_from} → {target_upgrade_to}」
-- data_quality.stale_warning = true → 標註「資料可能過時」
 
 ═══ 輸出 ═══
-先輸出【大盤環境摘要】：
-📊 大盤趨勢：{market_trend_state}（日線）/ {market_weekly_trend}（週線）
-📊 波動環境：{market_volatility_regime} / RSI：{market_rsi14}
-📊 量能方向：OBV slope {market_obv_slope_20d} / SuperTrend：{market_supertrend_bullish}
-📊 本輪基調：（根據以上→積極/正常/保守/高度警戒）
-
 每檔：5星評級、趨勢/動能/量價/籌碼/風險摘要、綜合判斷、風險提醒。最後排序總表。
 
 ═══ 規則 ═══
@@ -731,24 +704,20 @@ with st.sidebar:
 2. 每個看多附反面檢查
 3. supertrend_bullish=false 必須標註
 4. entry_trigger_veto 不為空逐條列出
-5. stock_vs_market = "stock_bullish_market_bearish" 標註「逆風盤」
-6. 資料缺失（inst/margin/tdcc _available=false）必須標註，不可忽略
 
 ═══ 資料 ═══
 【貼上 sector_候選名單 JSON】"""
         st.code(prompt_a, language="text")
 
     with st.expander("🔥 提示詞 B：進攻名單與買點（需開網頁搜尋）", expanded=False):
-        prompt_b = r"""你是一位台股短中線動能交易策略師，風格「灌溉鮮花、砍掉雜草」。
+        prompt_b = r"""你是一位台股短中線交易策略師，風格「灌溉鮮花、砍掉雜草」。
 ⚠️ 請先開啟「網頁搜尋」功能。
 
 ═══ 第零步：網頁搜尋 ═══
 「趨勢第一、賠率第二、法人籌碼做加減分」
-
 【搜尋 1：市場與恐慌指標】
 "VIX index today"、"S&P 500 this week"、"台股 大盤 本週"
 → VIX>25 警戒，VIX>40「CTA大逃殺買點」
-→ 與 JSON 中 market_* 欄位交叉驗證
 
 【搜尋 2：地緣政治】
 "geopolitical risk 2026"、"台海 最新"、"oil price today"
@@ -762,7 +731,6 @@ with st.sidebar:
 
 【搜尋 4：個股消息（Bottom-up）】
 每檔搜："[代號] 最新消息"、"[公司] 供應鏈 拉貨"、"[產業] 趨勢 2026"
-→ 根據候選股的產業分布，自行追加 2-3 個產業關鍵字（如半導體→"semiconductor cycle 2026"、航運→"freight rate"、重電→"電網 投資"）
 
 【搜尋 5：逆風觀點】
 "[公司] 利空 風險"、"[產業] 泡沫 過熱"
@@ -770,11 +738,6 @@ with st.sidebar:
 
 ═══ 搜尋結果彙整（先輸出）═══
 📡 市場環境（VIX/美股/台股/地緣/油價）
-📊 大盤技術面（引用 JSON）：
-  - 趨勢：{market_trend_state} / 週線：{market_weekly_trend}
-  - 波動：{market_volatility_regime} / ATR pctl：{market_atr_percentile}
-  - 情緒：RSI {market_rsi14} / OBV slope {market_obv_slope_20d}
-  → 搜尋消息面與 JSON 技術面是否一致？不一致要標註
 🇺🇸 川普動態（發文摘要/議題/反應程度/性質/對候選影響）
 📰 每檔消息面（驅動力🟢🟡🔴/重大消息/供應鏈/利多出盡/逆風觀點）
 
@@ -787,25 +750,16 @@ with st.sidebar:
 6. 川普風險折價：正式政策衝擊→部位打5折或暫緩
 7. 禁止在downtrend攤平
 
-【大盤環境修正】
-- market_volatility_regime = "high_volatility" / "expansion" → 進場條件收緊，部位打 7 折
-- market_supertrend_bullish = false → 只做最強 Tier1，暫停 Tier2
-- market_obv_slope_20d < 0 → 大盤量能衰退，追高風險加註
-- stock_vs_market = "stock_bullish_market_bearish" → 需更強基本面催化劑才可進場
-
 【買點】AVWAP→POC→Fib→均線→缺口
-【部位】VIX>30打7折；川普衝擊再折；market_volatility_regime="high_volatility"再折
+【部位】VIX>30打7折；川普衝擊再折
 
 ═══ 輸出 ═══
-Tier1/Tier2/排除，每檔含：進場區間、停損、目標、RR、驅動力、川普風險、最大隱憂、stock_vs_market
+Tier1/Tier2/排除，每檔含：進場區間、停損、目標、RR、驅動力、川普風險、最大隱憂
 資金配置（現金15-20%，高風險25%+）
-⚠️ market_volatility_regime 為 high_volatility / expansion 時，現金建議 25-30%
-⚠️ 資料缺失（inst/margin _available=false）的標的，標註「籌碼資料不完整」
 
 ═══ 規則 ═══
-1. RR<1.2禁入 2. 全不合格就「建議觀望」
+1. RR<1.5禁入 2. 全不合格就「建議觀望」
 3. 川普推文恐慌≠基本面崩壞 4. 消息標來源不編造
-5. 大盤環境與個股訊號矛盾時，以大盤為主降低部位
 
 ═══ 前一輪結果 ═══
 【貼上提示詞A輸出】
@@ -814,16 +768,14 @@ Tier1/Tier2/排除，每檔含：進場區間、停損、目標、RR、驅動力
         st.code(prompt_b, language="text")
 
     with st.expander("🌸 提示詞 C：持股賣/抱決策（需開網頁搜尋）", expanded=False):
-        prompt_c = r"""你是一位台股投資組合動能交易風控專家，核心原則「灌溉鮮花、砍掉雜草」。
+        prompt_c = r"""你是一位台股投資組合風控專家，核心原則「灌溉鮮花、砍掉雜草」。
 ⚠️ 請先開啟「網頁搜尋」功能。
 
 ═══ 第零步：網頁搜尋 ═══
 「趨勢第一、賠率第二、法人籌碼做加減分」
-
 【搜尋 1：系統性風險】
 "VIX index today"、"台股 本週"、"Fed 利率"、"美中關係"、"oil price"
 → 🟢低/🟡中/🔴高
-→ 與 JSON 中 market_trend_state / market_volatility_regime 交叉驗證
 
 【搜尋 2：川普發文 🇺🇸】
 "Trump Truth Social latest"、"Trump tariff 2026"、"川普 關稅 最新"
@@ -833,7 +785,6 @@ Tier1/Tier2/排除，每檔含：進場區間、停損、目標、RR、驅動力
 
 【搜尋 3：每檔持股消息】
 "[代號] 最新消息"、"[公司] 法說會 財報"、"[公司] 供應鏈"
-→ 根據持股產業分布，自行追加產業關鍵字搜尋
 
 【搜尋 4：逆風觀點】
 "[公司] 風險 利空"、"[產業] 衰退 泡沫"
@@ -841,48 +792,12 @@ Tier1/Tier2/排除，每檔含：進場區間、停損、目標、RR、驅動力
 
 ═══ 搜尋結果（先輸出）═══
 📡 系統性風險（VIX/等級/美股/台股/地緣）
-📊 大盤技術面環境：
-  - 趨勢：{market_trend_state}（日線）/ {market_weekly_trend}（週線）
-  - 波動：{market_volatility_regime} / ATR pctl：{market_atr_percentile}
-  - 情緒：RSI {market_rsi14} / OBV slope {market_obv_slope_20d} / ST {market_supertrend_bullish}
-  - 位置：52w {market_pos_52w_pct}% / MA20乖離 {market_ma20_dev_pct}%
-  → 大盤環境總評：🟢順風 / 🟡中性 / 🔴逆風
 🇺🇸 川普動態（發文/性質/影響持股/歷史模式/應對建議）
 📰 每檔消息面
 
 ═══ 分析框架 ═══
-
-【鮮花/雜草計分】每檔逐項打勾，計算分數：
-鮮花條件（每項 +1）：
-  □ uptrend 或 strong_uptrend
-  □ aligned_bull 或 mixed_bull_bias
-  □ supertrend_bullish = true
-  □ rs_vs_bench_20d > 0（跑贏大盤）
-  □ flag_price_up_vol_up = true 或 vol_ratio_5d > 1.0
-  □ risk_reward_ratio ≥ 1.2
-  □ flag_inst_consensus_buy = true 或 foreign_20d_net > 0
-  □ stock_vs_market = "both_bullish"
-
-雜草條件（每項 -1）：
-  □ downtrend 或 strong_downtrend
-  □ aligned_bear
-  □ supertrend_bullish = false
-  □ flag_bearish_divergence_rsi 或 flag_bearish_divergence_macd = true
-  □ rs_vs_bench_20d < 0（弱於大盤）
-  □ risk_reward_ratio < 1.0
-  □ flag_inst_consensus_sell = true
-  □ flag_price_down_vol_up = true（放量殺盤）
-
-判定：≥ 5 分 = 🌸鮮花 / 2-4 分 = ⚠️邊緣 / ≤ 1 分 = 🪓雜草
-
-【大盤環境加權】
-- stock_vs_market = "both_bullish" → 鮮花加分
-- stock_vs_market = "stock_bullish_market_bearish" → 逆風盤，鮮花降一級，停損收緊
-- market_volatility_regime = "high_volatility" / "expansion" → 停損加寬 0.5×ATR，部位打折
-- market_supertrend_bullish = false + market_weekly_trend = "downtrend" → 系統性🔴，非核心減碼
-- market_obv_slope_20d < 0 → 量能持續流出，提高警覺
-- market_rsi14 > 75 → 大盤過熱，高 beta 持股優先減碼
-- market_rsi14 < 30 + market_weekly_trend 仍 uptrend → 錯殺機會（阿呆谷）
+【鮮花】uptrend+aligned_bull+supertrend_bullish+跑贏大盤+價量齊揚+RR≥1.5+法人買超
+【雜草】downtrend+aligned_bear+supertrend翻空+頂背離+弱於大盤+RR<1.0+法人賣超+放量殺盤
 
 ═══ 消息面交叉驗證 ═══
 - 利多不漲⚠️：利多+ret≤0+量縮 → overhyped
@@ -892,17 +807,12 @@ Tier1/Tier2/排除，每檔含：進場區間、停損、目標、RR、驅動力
 - 戰略彈性：供應鏈實際拉貨支撐→可短轉長；weekly也轉空→出場
 
 ═══ 輸出 ═══
-每檔：🌸鮮花/⚠️邊緣/🪓雜草（附計分明細）
-含趨勢、分數、風險、籌碼、消息面、川普影響、stock_vs_market
+每檔：🌸鮮花/⚠️邊緣/🪓雜草
+含趨勢、鮮花vs雜草計分、風險、籌碼、消息面、川普影響
 決策表：基本/轉強/惡化/系統性風險/川普升級 各情境
 反向審計：續抱最大風險？賣出可能錯過？
-持股總表（含消息面+川普風險+大盤環境+stock_vs_market 欄位）
-
-整體組合建議：
-- 鮮花雜草比/川普曝險度/現金部位/集中度
-- 大盤環境總評（🟢/🟡/🔴）與整體部位建議
-- market_volatility_regime ≠ normal 時，明確建議現金比例調整
-⚠️ 資料缺失（inst/margin/tdcc _available=false）的持股，籌碼分數不計，標註「資料不完整」
+持股總表（含消息面+川普風險欄位）
+整體組合建議（鮮花雜草比/川普曝險度/現金部位/集中度）
 
 ═══ 規則 ═══
 1. 全面轉空不續抱 2. 續抱必附停損
@@ -910,7 +820,6 @@ Tier1/Tier2/排除，每檔含：進場區間、停損、目標、RR、驅動力
 4. VIX>40+CTA殺盤→不恐慌賣基本面好的（阿呆谷）
 5. 但擁擠高槓桿股仍先砍部分（風控成本）
 6. 川普口頭威脅≠實質政策 7. 農場文不算依據
-8. 大盤環境🔴時，即使鮮花也減碼至少 30%
 
 ═══ 持股資料 ═══
 【貼上 sector_持股 JSON】"""
@@ -919,7 +828,8 @@ Tier1/Tier2/排除，每檔含：進場區間、停損、目標、RR、驅動力
 # -------------------------
 # Main Content
 # -------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Stock Analysis", "Sector Analysis", "Custom Sectors", "Regulatory Lists", "Holdings"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Stock Analysis", "Sector Analysis", "Custom Sectors", "Regulatory Lists", "Holdings"])
 
 # --- Tab 1: Stock Analysis ---
 with tab1:
@@ -1094,6 +1004,7 @@ with tab4:
 
     st.markdown("---")
 
+
     def _is_new_file(uploaded_file, info_key):
         """Return True only if this file hasn't been processed yet."""
         if uploaded_file is None:
@@ -1103,6 +1014,7 @@ with tab4:
             return True
         return (uploaded_file.name != existing.get("filename")
                 or uploaded_file.size != existing.get("filesize"))
+
 
     # --- Attention uploads ---
     st.subheader("Attention List (注意股)")
