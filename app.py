@@ -677,6 +677,16 @@ with st.sidebar:
 - **L5 基本面**：`revenue_yoy_latest` + `revenue_momentum` / `eps_yoy_pct` + `eps_trend_4q`
 - **L6 散戶情緒**：`flag_day_trade_overheat` / `flag_day_trade_divergence` / `flag_smart_short_signal`
 
+## 資料時效檢查（分析前先看）
+
+比對 `analysis_date` 與 `data_quality.external_sources.{source}.date`：
+
+- **月/季資料**（revenue/eps）落後 10–90 天屬正常，不扣分
+- **日級資料**（margin/institutional/foreign_holding/lending/day_trade）落後 >2 天 = 降權重
+- **當沖資料**落後 >5 天 → `flag_day_trade_overheat`、`flag_day_trade_divergence` 視為過期，**不觸發 L6 警訊**
+- **外資持股/借券**落後 >5 天 → L4 相關趨勢判斷降權重
+- 若單一來源資料過舊，在該檔的綜合判斷欄位末尾標註「`L{n}資料過舊`」
+
 ## 大盤基調（先輸出 1 行）
 
 `📊 大盤：{market_trend_state}/{market_weekly_trend}週/{market_volatility_regime}/RSI{market_rsi14}/ST{market_supertrend_bullish} → 基調{積極/正常/保守/警戒}`
@@ -716,12 +726,17 @@ L6 當沖{n}%{🔥/normal}/{⚠️分歧/正常}/借券{⚠️/正常} [✓/✗]
 - 警示 + 強基本面（EPS improving + 營收 accelerating + 外資 accumulating）→ 可能錯殺，**不降級**，標註「逢低機會」
 - `above_bb_upper_in_high_vol` 單獨 + 強勢突破股 → 動能延續 > 回檔機率，僅註記「追高收緊停損」
 
-## 硬排除（結構性問題，非風險判斷）
+## 硬排除（真正結構崩壞，只保留這三條）
 
-- `trend_state` ∈ (downtrend/strong_downtrend)
-- `flag_entry_trigger=false` 且 `entry_trigger_reason` 顯示 `blocked:` 或 `no_trigger`
-- `supertrend_bullish=false` + `weekly_trend_state`≠uptrend
+- `trend_state = strong_downtrend`（純弱勢股不碰）
+- `supertrend_bullish=false` + `weekly_trend_state`≠uptrend（雙時間框架失守）
 - `flag_day_trade_divergence=true` + `foreign_accumulation_trend=reducing`（主力出貨鐵證）
+
+## 軟性警訊（不排除，AI 依情境判斷）
+
+- `trend_state=downtrend` → AI 判斷是系統性風險（大盤拖累）還是個股弱勢，前者可能錯殺
+- `flag_entry_trigger=false` → 標註「今日非最佳進場日」，建議等回測 MA5/MA20 或量能突破再進場（不排除整檔）
+- `entry_trigger_reason` 中的 `no_trigger` 或 `blocked:` → 只是時機問題，非結構問題
 
 ## 最終排序總表
 
@@ -775,6 +790,15 @@ L6 當沖{n}%{🔥/normal}/{⚠️分歧/正常}/借券{⚠️/正常} [✓/✗]
 3. 🟢需求驅動 > 🟡成本改善 > 🔴成本轉嫁
 4. 有 EPS 支撐的突破最安心
 
+## 資料時效檢查（用前先看）
+
+比對 `analysis_date` 與 `data_quality.external_sources.{source}.date`：
+
+- **月/季**（revenue/eps）落後 10–90 天屬正常
+- **日級**（margin/inst/foreign_holding/lending/day_trade）落後 >2 天 = 降權重
+- **當沖落後 >5 天** → L6 警訊視為過期，**不扣部位**
+- **外資持股落後 >5 天** → 不將 accumulating/reducing 當決策依據
+
 **警示綜合判斷（非禁入）**：
 - `entry_warnings` 為空 → 進場品質佳
 - 單一警示 + 基本面強 + 籌碼 accumulating → 可能錯殺，Tier2 觀察逢低
@@ -823,15 +847,18 @@ L6 當沖{n}%{🔥/normal}/{⚠️分歧/正常}/借券{⚠️/正常} [✓/✗]
 
 `現金{n}% / Tier1{n}% / Tier2{n}% / 修正：VIX{>30?}、川普{衝擊?}、過熱{n}檔`
 
-## 硬規則（結構性，非風險判斷）
+## 硬規則（只保留真正的結構性問題）
 
-1. **`flag_entry_trigger=false`** 且 reason 為 `blocked:` / `no_trigger` → 禁入（結構不合格）
-2. 全不合格 → 「建議觀望」，不湊人頭
-3. 川普口頭威脅 ≠ 基本面崩壞
-4. 消息必標來源/時間，禁止編造
-5. 大盤與個股訊號矛盾 → 以大盤為準降部位
-6. 每檔 ≤ 5 行；不寫總結段
-7. **RR 僅參考，不是禁入依據**
+1. **`trend_state=strong_downtrend`** → 禁入
+2. **`supertrend_bullish=false` + `weekly_trend_state`≠uptrend** → 禁入（雙時間框架失守）
+3. **`flag_day_trade_divergence=true` + `foreign_accumulation_trend=reducing`** → 禁入（主力出貨）
+4. `flag_entry_trigger=false` **不是禁入**，標註「今日非最佳進場日」+ 建議等待條件（拉回均線/量能突破）
+5. 全不合格 → 「建議觀望」，不湊人頭
+6. 川普口頭威脅 ≠ 基本面崩壞
+7. 消息必標來源/時間，禁止編造
+8. 大盤與個股訊號矛盾 → 以大盤為準降部位
+9. 每檔 ≤ 5 行；不寫總結段
+10. **RR 僅參考，不是禁入依據**
 
 ## 前一輪結果
 
@@ -865,6 +892,16 @@ L6 當沖{n}%{🔥/normal}/{⚠️分歧/正常}/借券{⚠️/正常} [✓/✗]
 📰 持股消息：
   {代號}：{🟢🟡🔴}{要點}
 ```
+
+## 資料時效檢查（計分前先看）
+
+比對 `analysis_date` 與 `data_quality.external_sources.{source}.date`：
+
+- **月/季**（revenue/eps）落後 10–90 天屬正常
+- **日級**（margin/inst/foreign_holding/lending/day_trade）落後 >2 天 = 降權重
+- **當沖落後 >5 天** → `flag_day_trade_overheat`/`divergence` 不扣雜草分
+- **外資持股落後 >5 天** → `foreign_accumulation_trend` 不加減分
+- 資料過舊的持股，在決策欄位末尾標註「`資料落後 {n} 天`」
 
 ## 鮮花/雜草計分（含軟性權重）
 
@@ -961,17 +998,19 @@ L6 當沖{n}%{🔥/normal}/{⚠️分歧/正常}/借券{⚠️/正常} [✓/✗]
 - 建議現金比：{n}%（{VIX/川普/過熱/正常}）
 - 集中度：{若單股>30% 警示}
 
-## 硬規則（結構性，非風險判斷）
+## 硬規則（只保留真正結構崩壞的情境）
 
-1. 全面轉空不續抱；續抱必附停損
-2. 雜草 >50% → **「組合需大幅調整」**
-3. VIX>40 + CTA 殺盤 → 核心股不恐慌賣（阿呆谷）
-4. 擁擠高槓桿股仍先砍部分（風控成本）
-5. 川普口頭威脅 ≠ 實質政策
-6. 農場文不算依據，必標來源
-7. `市場=🔴逆風` → 鮮花也減碼 ≥30%
-8. 每檔 ≤ 5 行
-9. **警示不是禁入/禁抱依據**，需綜合其他訊號判斷
+1. `trend_state=strong_downtrend` 或 `supertrend_bullish=false`+`weekly_trend=downtrend` → **不續抱**（雙時間框架失守）
+2. `flag_day_trade_divergence=true` + `foreign_accumulation_trend=reducing` → **不續抱**（主力出貨鐵證）
+3. 續抱必附停損；停損觸及必執行
+4. 雜草 >50% → **「組合需大幅調整」**
+5. VIX>40 + CTA 殺盤 → 核心股不恐慌賣（阿呆谷）
+6. 擁擠高槓桿股仍先砍部分（風控成本）
+7. 川普口頭威脅 ≠ 實質政策
+8. 農場文不算依據，必標來源
+9. `市場=🔴逆風` → 鮮花也減碼 ≥30%
+10. 每檔 ≤ 5 行
+11. **警示/`flag_entry_trigger=false` 不是禁抱依據**，需綜合其他訊號判斷
 
 ## 持股資料
 
