@@ -1431,6 +1431,12 @@ def compute_institutional_features(chips_multi: List[Dict], price_now: float, pr
     feat["flag_inst_consensus_buy"] = bool(feat["foreign_20d_net"] > 0 and feat["trust_20d_net"] > 0)
     feat["flag_inst_consensus_sell"] = bool(feat["foreign_20d_net"] < 0 and feat["trust_20d_net"] < 0)
 
+    # [V2] Surface the latest T86 data date for staleness checks downstream
+    try:
+        feat["inst_date"] = chips_multi[-1].get("date") if chips_multi else None
+    except Exception:
+        feat["inst_date"] = None
+
     return feat
 
 
@@ -3378,6 +3384,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
                     m_chg = margin.get("margin_change")
                     s_chg = margin.get("short_change")
                     m_usage = margin.get("margin_usage_rate")
+                    as_of = margin.get("as_of_date")
                     # [P0-A FIX] Only mark available if at least one core field is non-null
                     has_real_data = any(v is not None for v in [m_bal, s_bal, m_chg, s_chg, m_usage])
                     return {
@@ -3387,11 +3394,12 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
                         "short_balance": s_bal,
                         "short_change": s_chg,
                         "short_margin_ratio": round(s_bal / m_bal * 100, 2) if m_bal and s_bal and m_bal > 0 else None,
+                        "margin_date": as_of,  # [V2] surface data date for staleness checks
                         "margin_data_available": has_real_data,
                     }
-                return {"margin_data_available": False}
+                return {"margin_data_available": False, "margin_date": None}
             except Exception:
-                return {"margin_data_available": False}
+                return {"margin_data_available": False, "margin_date": None}
 
         def _fetch_tdcc():
             try:
@@ -3556,36 +3564,58 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
 
     # Data quality metadata (Item #19)
     # [P0-A] Data quality metadata — now includes external source reliability
+    # [V2] Each source now carries its actual data date (no lag_days/stale flags —
+    # those are inferred by AI from comparing to analysis_date, since each source
+    # has different "normal" lag (revenue ~monthly, EPS ~quarterly, chip daily).
+    analysis_date_str = trade_date.isoformat() if trade_date else None
+    feat["analysis_date"] = analysis_date_str
+
     feat["data_quality"] = {
         "price_data_days": len(df),
         "volume_zero_pct": round(float((df["Volume"] == 0).sum()) / len(df) * 100, 1) if len(df) > 0 else None,
         "stale_warning": bool((datetime.now().date() - trade_date).days > 3),
+        "analysis_date": analysis_date_str,
     }
     if mode == "ai":
         feat["data_quality"]["inst_data_coverage"] = None
-        # [P0-A] External source reliability gates
+        # [P0-A V2] External source metadata — only date, available, source.
+        # AI reads analysis_date and compares with each source's date to determine
+        # staleness based on per-source context (monthly vs quarterly vs daily).
         feat["data_quality"]["external_sources"] = {
             "margin": {
                 "available": feat.get("margin_data_available", False),
-                "has_real_data": feat.get("margin_data_available", False),
+                "date": feat.get("margin_date"),
+                "source": "FinMind.TaiwanStockMarginPurchaseShortSale",
             },
             "institutional": {
                 "available": feat.get("inst_data_available", False),
+                "date": feat.get("inst_date"),
+                "source": "TWSE/TPEx.T86",
             },
             "revenue": {
                 "available": feat.get("revenue_data_available", False),
+                "date": feat.get("revenue_month_label"),
+                "source": "FinMind.TaiwanStockMonthRevenue",
             },
             "eps": {
                 "available": feat.get("eps_data_available", False),
+                "date": feat.get("eps_quarter_label"),
+                "source": "FinMind.TaiwanStockFinancialStatements",
             },
-            "holders": {
+            "foreign_holding": {
                 "available": feat.get("foreign_holding_data_available", False),
+                "date": feat.get("foreign_holding_date"),
+                "source": "FinMind.TaiwanStockShareholding",
             },
             "lending": {
                 "available": feat.get("lending_data_available", False),
+                "date": feat.get("lending_date"),
+                "source": "FinMind.TaiwanStockSecuritiesLending",
             },
             "day_trade": {
                 "available": feat.get("day_trade_data_available", False),
+                "date": feat.get("day_trade_date"),
+                "source": "FinMind.TaiwanStockDayTrading",
             },
         }
 
