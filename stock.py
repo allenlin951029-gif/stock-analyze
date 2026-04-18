@@ -2706,7 +2706,7 @@ def compute_decision_fields(
     #   - Price-action quality check
     # ---------------------------------------------------------------
     rr_val = feat.get("risk_reward_ratio")
-    rr_ok = bool(rr_val is not None and rr_val >= ENTRY_MIN_RR)
+    rr_ok = bool(rr_val is not None and rr_val >= ENTRY_MIN_RR)  # kept for display, not gating
     vol_surge = bool(vol_ratio is not None and vol_ratio > 1.5)
 
     # "Today events" — instantaneous signals that only fire on transition day
@@ -2725,47 +2725,64 @@ def compute_decision_fields(
     has_event = len(today_events) >= 1
     not_bearish = trend_state not in ("downtrend", "strong_downtrend", "weak_downtrend", "top_pullback")
 
-    # [P1-B] VETO RULES — hard disqualifiers that prevent trigger regardless of events
-    veto_reasons = []
+    # [SOFT WARNINGS] These conditions used to be hard vetoes that blocked the trigger.
+    # They're now surfaced as warnings for AI to weigh against other context.
+    # Rationale: any single rule viewed in isolation can misfire (e.g. strong stock
+    # pulling back to MA20 on volume looks like distribution; a breakout running
+    # above BB upper for days looks overextended but may continue). Let AI integrate
+    # these warnings with fundamentals, chip signals, retail sentiment, and news.
+    entry_warnings = []
     if price_down_vol_up and not supertrend_flip_bull:
-        # Distribution bar (down + volume) — only override if a strong reversal signal is present
-        veto_reasons.append("price_down_vol_up_distribution")
+        # Distribution bar candidate — down close + volume surge, no reversal signal
+        entry_warnings.append("price_down_vol_up_distribution")
     if above_bb_upper and volatility_regime in ("high_volatility", "expansion"):
-        # Overextended + high vol — pullback risk too high
-        veto_reasons.append("above_bb_upper_in_high_vol")
+        # Overextension candidate — closed above BB upper in high-vol regime
+        entry_warnings.append("above_bb_upper_in_high_vol")
     if not close_gt_open and not supertrend_flip_bull and not kd_golden_cross:
-        # Red candle without strong reversal confirmation
-        veto_reasons.append("red_candle_no_reversal_confirm")
+        # Unconfirmed red candle — no reversal signal to rescue it
+        entry_warnings.append("red_candle_no_reversal_confirm")
 
-    vetoed = len(veto_reasons) > 0
+    has_warnings = len(entry_warnings) > 0
 
     # [P1-B] CONFIRMATION REQUIREMENT — single-event triggers need extra support
+    # This one REMAINS a hard gate because it's about signal quality, not risk judgement.
     # bb_squeeze_fire alone is a "candidate", not a trigger. It needs at least one of:
     #   - volume confirmation (vol_surge)
-    #   - another event (ST flip, KD cross, MACD cross)
-    #   - green candle in favorable regime
+    #   - green candle
     needs_confirmation = (len(today_events) == 1 and today_events[0] == "bb_squeeze_fire")
     has_confirmation = vol_surge or close_gt_open
     single_event_blocked = needs_confirmation and not has_confirmation
 
     # Final trigger decision
+    # [CHANGED] Neither RR nor soft warnings gate the trigger anymore. Only signal
+    # quality (has_event + bullish context + confirmation) determines pass/fail.
+    # Warnings are shown in a separate field for AI to consider holistically.
     trigger_pass = bool(
-        has_event and rr_ok and not_bearish and is_bullish
-        and not vetoed and not single_event_blocked
+        has_event and not_bearish and is_bullish
+        and not single_event_blocked
     )
 
     feat["flag_entry_trigger"] = trigger_pass
     feat["entry_trigger_events"] = today_events if trigger_pass else []
-    feat["entry_trigger_veto"] = veto_reasons if veto_reasons else []
+
+    # [NEW FIELD NAME] entry_warnings replaces entry_trigger_veto
+    feat["entry_warnings"] = entry_warnings if entry_warnings else []
+    feat["entry_warning_count"] = len(entry_warnings)
+
+    # Backward-compat alias — keep entry_trigger_veto populated so any prompt that
+    # still references it won't break. Will be removed in a future cleanup.
+    feat["entry_trigger_veto"] = entry_warnings if entry_warnings else []
 
     if trigger_pass:
-        feat["entry_trigger_reason"] = f"Events: {', '.join(today_events)} | R:R={rr_val}"
-    elif vetoed:
-        feat["entry_trigger_reason"] = f"vetoed: {', '.join(veto_reasons)}"
+        rr_display = f"R:R={rr_val}" if rr_val is not None else "R:R=n/a"
+        warn_suffix = f" | warnings: {', '.join(entry_warnings)}" if entry_warnings else ""
+        feat["entry_trigger_reason"] = f"Events: {', '.join(today_events)} | {rr_display}{warn_suffix}"
     elif single_event_blocked:
         feat["entry_trigger_reason"] = f"needs_confirmation: {today_events[0]} alone insufficient"
-    elif has_event and not rr_ok:
-        feat["entry_trigger_reason"] = f"rr_insufficient: R:R={rr_val} < {ENTRY_MIN_RR}"
+    elif has_event and not not_bearish:
+        feat["entry_trigger_reason"] = f"blocked: trend_state={trend_state}"
+    elif has_event and not is_bullish:
+        feat["entry_trigger_reason"] = "blocked: structure_not_bullish"
     else:
         feat["entry_trigger_reason"] = "no_trigger"
 
