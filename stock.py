@@ -3384,7 +3384,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
                     m_chg = margin.get("margin_change")
                     s_chg = margin.get("short_change")
                     m_usage = margin.get("margin_usage_rate")
-                    as_of = margin.get("as_of_date")
+                    as_of = margin.get("as_of_date") or margin.get("date")  # FinMind returns 'date', TWSE returns 'as_of_date'
                     # [P0-A FIX] Only mark available if at least one core field is non-null
                     has_real_data = any(v is not None for v in [m_bal, s_bal, m_chg, s_chg, m_usage])
                     return {
