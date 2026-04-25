@@ -18,6 +18,7 @@ from stock import (
     SECTOR_DICT,
     build_ai_features,
     format_text_report,
+    compute_market_features,
 )
 
 st.set_page_config(page_title="Stock Analyze", layout="wide")
@@ -754,7 +755,8 @@ L6 當沖{n}%{🔥/normal}/{⚠️分歧/正常}/借券{⚠️/正常} [✓/✗]
 
 ## 資料
 
-【貼上 sector_候選名單 JSON】"""
+【貼上 sector_候選名單 JSON】
+【貼上 market_features JSON（從 Market Snapshot tab 下載）】"""
         st.code(prompt_a, language="text")
 
     with st.expander("🔥 提示詞 B：進攻名單與買點（需開網頁搜尋）", expanded=False):
@@ -851,7 +853,7 @@ L6 當沖{n}%{🔥/normal}/{⚠️分歧/正常}/借券{⚠️/正常} [✓/✗]
 
 1. **`trend_state=strong_downtrend`** → 禁入
 2. **`supertrend_bullish=false` + `weekly_trend_state`≠uptrend** → 禁入（雙時間框架失守）
-3. **`flag_day_trade_divergence=true` + `foreign_accumulation_trend=reducing`** → 禁入（主力出貨）
+3. **`flag_day_trade_divergence=true` + `foreign_accumulation_trend=reducing`** → 禁入(主力出貨)
 4. `flag_entry_trigger=false` **不是禁入**，標註「今日非最佳進場日」+ 建議等待條件（拉回均線/量能突破）
 5. 全不合格 → 「建議觀望」，不湊人頭
 6. 川普口頭威脅 ≠ 基本面崩壞
@@ -866,7 +868,8 @@ L6 當沖{n}%{🔥/normal}/{⚠️分歧/正常}/借券{⚠️/正常} [✓/✗]
 
 ## 技術面資料
 
-【貼上 sector_候選名單 JSON】"""
+【貼上 sector_候選名單 JSON】
+【貼上 market_features JSON】"""
         st.code(prompt_b, language="text")
 
     with st.expander("🌸 提示詞 C：持股賣/抱決策（需開網頁搜尋）", expanded=False):
@@ -1014,14 +1017,15 @@ L6 當沖{n}%{🔥/normal}/{⚠️分歧/正常}/借券{⚠️/正常} [✓/✗]
 
 ## 持股資料
 
-【貼上 sector_持股 JSON】"""
+【貼上 sector_持股 JSON】
+【貼上 market_features JSON】"""
         st.code(prompt_c, language="text")
 
 # -------------------------
 # Main Content
 # -------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Stock Analysis", "Sector Analysis", "Custom Sectors", "Regulatory Lists", "Holdings"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["Stock Analysis", "Sector Analysis", "Custom Sectors", "Regulatory Lists", "Holdings", "📊 Market Snapshot"])
 
 # --- Tab 1: Stock Analysis ---
 with tab1:
@@ -1428,6 +1432,209 @@ with tab5:
             st.rerun()
     else:
         st.info("尚無持股資料，請在上方新增。")
+
+# --- Tab 6: Market Snapshot (大盤狀態快照) ---
+with tab6:
+    st.header("📊 Market Snapshot - 大盤狀態快照")
+    st.caption("抓取 ^TWII 加權指數 + ^VIX，產出 AI 判讀「現在是什麼盤」所需的客觀數據")
+
+    col_m1, col_m2, col_m3 = st.columns([1, 1, 1])
+
+    with col_m1:
+        market_date = st.date_input(
+            "分析日期",
+            value=st.session_state.as_of_date,
+            key="market_snapshot_date"
+        )
+
+    with col_m2:
+        st.write("")
+        st.write("")
+        fetch_market_btn = st.button(
+            "🌐 抓取大盤狀態",
+            type="primary",
+            use_container_width=True,
+            key="fetch_market_btn"
+        )
+
+    with col_m3:
+        st.write("")
+        st.write("")
+        if st.button("🔄 清除快取", use_container_width=True, key="clear_market_cache"):
+            if "market_features_cache" in st.session_state:
+                del st.session_state.market_features_cache
+            st.rerun()
+
+    # 執行抓取
+    if fetch_market_btn:
+        with st.spinner("正在下載 ^TWII / ^VIX 並計算大盤指標..."):
+            try:
+                features = compute_market_features(
+                    as_of_date=market_date.strftime("%Y-%m-%d")
+                )
+                st.session_state.market_features_cache = features
+            except Exception as e:
+                st.error(f"執行錯誤：{e}")
+                st.exception(e)
+
+    # 顯示結果
+    if "market_features_cache" in st.session_state:
+        features = st.session_state.market_features_cache
+
+        if features.get("data_quality", {}).get("twii_available"):
+            snapshot_date = features.get("snapshot_date", "?")
+            st.success(f"✓ 大盤資料抓取成功（{snapshot_date}）")
+
+            # 第一排：價格與波動指標
+            st.markdown("### 📈 大盤關鍵指標")
+            c1, c2, c3, c4 = st.columns(4)
+
+            twii_close = features.get("twii_close", 0)
+            twii_change = features.get("twii_change_pct", 0)
+            c1.metric(
+                "TWII 收盤",
+                f"{twii_close:,.2f}",
+                f"{twii_change:+.2f}%"
+            )
+
+            rsi_d = features.get("market_rsi14", 0)
+            rsi_w = features.get("market_weekly_rsi14") or 0
+            c2.metric(
+                "RSI 14 / 週RSI",
+                f"{rsi_d:.1f}",
+                f"週 {rsi_w:.1f}"
+            )
+
+            vix_val = features.get("vix_latest")
+            vix_lvl = features.get("vix_level", "?")
+            if vix_val is not None:
+                c3.metric(
+                    "VIX",
+                    f"{vix_val:.2f}",
+                    vix_lvl
+                )
+            else:
+                c3.metric("VIX", "N/A", "data unavailable")
+
+            adx_val = features.get("market_adx", 0)
+            c4.metric(
+                "ADX (趨勢強度)",
+                f"{adx_val:.1f}",
+                "強勢" if adx_val > 25 else ("中等" if adx_val > 20 else "弱勢")
+            )
+
+            # 第二排：趨勢與波動 regime
+            st.markdown("### 🎯 趨勢狀態")
+            tc1, tc2, tc3, tc4 = st.columns(4)
+
+            trend_state = features.get("market_trend_state", "?")
+            trend_color = "🟢" if "uptrend" in trend_state else (
+                "🔴" if "downtrend" in trend_state else "🟡"
+            )
+            tc1.metric("日線趨勢", f"{trend_color} {trend_state}")
+
+            weekly_trend = features.get("market_weekly_trend_state", "?")
+            tc2.metric("週線趨勢", weekly_trend or "N/A")
+
+            vol_regime = features.get("market_volatility_regime", "?")
+            vol_color = "🔴" if vol_regime == "expansion" else (
+                "🟢" if vol_regime == "contraction" else "🟡"
+            )
+            tc3.metric("波動 Regime", f"{vol_color} {vol_regime}")
+
+            suggested = features.get("suggested_regime", "?")
+            regime_emoji = {
+                "trend": "📈 趨勢盤",
+                "range": "↔️ 震盪盤",
+                "late_trend": "🔥 末段過熱",
+                "late_trend_or_blowoff": "🚀 末段過熱/權值噴發",
+                "crisis": "⚠️ 黑天鵝",
+                "transition": "❓ 轉折期",
+            }.get(suggested, suggested)
+            tc4.metric("建議市況", regime_emoji)
+
+            # 第三排：補充資訊
+            st.markdown("### 📊 量價與位置")
+            qc1, qc2, qc3, qc4 = st.columns(4)
+
+            ma20 = features.get("twii_ma20", 0)
+            qc1.metric("MA20", f"{ma20:,.0f}")
+
+            bb_pos = features.get("market_bb_position_pct", 50)
+            qc2.metric("布林位置 %", f"{bb_pos:.1f}",
+                       "偏上軌" if bb_pos > 80 else ("偏下軌" if bb_pos < 20 else "區間內"))
+
+            atr_pct = features.get("market_atr14_pct", 0)
+            qc3.metric("ATR 14 %", f"{atr_pct:.2f}%")
+
+            vol_ratio = features.get("market_vol_ratio_5d", 1.0)
+            qc4.metric("量比 5D", f"{vol_ratio:.2f}",
+                       "爆量" if vol_ratio > 1.3 else ("量縮" if vol_ratio < 0.7 else "正常"))
+
+            # 警示區
+            warnings = features.get("data_quality", {}).get("warnings", [])
+            if warnings:
+                st.markdown("### ⚠️ 資料警示")
+                for w in warnings:
+                    st.warning(w)
+
+            # 下載按鈕
+            st.divider()
+            json_str = json.dumps(features, ensure_ascii=False, indent=2, default=str)
+            st.download_button(
+                label="📥 下載 market_features JSON（給 AI 用）",
+                data=json_str,
+                file_name=f"market_features_{snapshot_date}.json",
+                mime="application/json",
+                key="download_market_json",
+                use_container_width=True
+            )
+
+            # 完整 JSON 檢視
+            with st.expander("查看完整 JSON 內容（可直接複製貼給 AI）", expanded=False):
+                st.code(json_str, language="json")
+
+        else:
+            st.error("⚠️ 大盤資料抓取失敗")
+            warnings = features.get("data_quality", {}).get("warnings", [])
+            for w in warnings:
+                st.warning(w)
+    else:
+        st.info("👆 點上方「抓取大盤狀態」開始")
+
+        # 使用說明
+        with st.expander("📖 使用說明", expanded=True):
+            st.markdown("""
+### 這個功能在做什麼？
+
+抓取**台股大盤**（^TWII 加權指數）+ **VIX 恐慌指數**的客觀數據，產出 AI 判讀
+「**現在是什麼盤**」所需的所有指標。
+
+### 為什麼需要？
+
+之前 AI 判市況時要靠網頁搜尋估算大盤狀態，**容易誤判**。
+有了這份 JSON，AI 就能客觀判斷：
+
+- 趨勢盤、震盪盤、末段過熱、權值噴發、黑天鵝、轉折期
+- 自動推算策略權重（S1 趨勢延續 / S2 反轉捕捉 / S4 避險防禦 等）
+
+### 使用流程
+
+1. 點「🌐 抓取大盤狀態」
+2. 下載 `market_features_YYYY-MM-DD.json`
+3. 把它跟 sector JSON **一起**貼到 Prompt A
+4. AI 同時做：客觀市況判讀 + 個股海選評分
+
+### 包含哪些欄位？
+
+- **價格**：TWII 收盤、漲跌幅、週漲跌幅
+- **趨勢**：market_trend_state、weekly_trend_state、SuperTrend、MA20/60
+- **動能**：RSI、週 RSI、ADX、+DI/-DI
+- **波動**：ATR、Volatility Regime（expansion/contraction/normal）
+- **位置**：Bollinger 位置、量比
+- **VIX**：恐慌指數及等級（low/normal/elevated/panic）
+- **建議**：suggested_regime（自動推算當前市況）
+""")
 
 # -------------------------
 # Auto Refresh Logic
