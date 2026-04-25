@@ -3863,13 +3863,263 @@ def analyze_stock_technical(stock_id: str, as_of_date=None, mode: str = "human",
         return {"human_report": text}
 
 
+# ===================================================================
+# 18. MARKET FEATURES (大盤狀態指標)
+# 提供 AI 判讀「現在是什麼盤」所需的客觀數據
+# ===================================================================
+
+
+def compute_market_features(as_of_date=None) -> Dict[str, Any]:
+    """
+    抓 ^TWII（加權指數）+ ^VIX 計算大盤狀態指標。
+
+    產出可直接給 AI 判市況的客觀數據，包括：
+    - 趨勢、動能、波動、量能
+    - VIX 等級
+    - 大盤 RSI、ADX、MA、SuperTrend、Bollinger
+
+    Returns: dict（可直接 json.dumps 成獨立檔案）
+    """
+    result = {
+        "snapshot_date": str(as_of_date) if as_of_date else datetime.now().strftime("%Y-%m-%d"),
+        "fetched_at": datetime.now().isoformat(),
+        "data_quality": {"twii_available": False, "vix_available": False, "warnings": []},
+    }
+
+    # --------- 1. 下載 TWII 日線 + 週線 ----------
+    twii = _download_yf("^TWII", "2y", "1d")
+    if twii.empty or len(twii) < 60:
+        result["data_quality"]["warnings"].append("TWII 日線資料不足")
+        return result
+
+    twii_w = _download_yf("^TWII", "2y", "1wk")
+
+    result["data_quality"]["twii_available"] = True
+
+    # --------- 2. 過濾到 as_of_date 並對齊 ----------
+    if as_of_date is not None:
+        target_ts = _nearest_trading_ts(twii, as_of_date)
+        if target_ts is not None:
+            twii = twii.loc[:target_ts]
+        if not twii_w.empty:
+            target_ts_w = _nearest_trading_ts(twii_w, as_of_date)
+            if target_ts_w is not None:
+                twii_w = twii_w.loc[:target_ts_w]
+
+    if len(twii) < 60:
+        result["data_quality"]["warnings"].append("TWII 過濾後資料不足")
+        return result
+
+    close = twii["Close"]
+    high = twii["High"]
+    low = twii["Low"]
+    volume = twii["Volume"]
+
+    # --------- 3. 價格與漲跌幅 ----------
+    c_now = float(close.iloc[-1])
+    c_prev = float(close.iloc[-2]) if len(close) > 1 else c_now
+    daily_change = (c_now / c_prev - 1) * 100 if c_prev > 0 else 0.0
+
+    weekly_change = None
+    if len(close) > 6:
+        c_5d = float(close.iloc[-6])
+        if c_5d > 0:
+            weekly_change = (c_now / c_5d - 1) * 100
+
+    result.update({
+        "twii_close": round(c_now, 2),
+        "twii_open": float(twii["Open"].iloc[-1]),
+        "twii_high": float(high.iloc[-1]),
+        "twii_low": float(low.iloc[-1]),
+        "twii_change_pct": round(daily_change, 2),
+        "twii_weekly_change_pct": round(weekly_change, 2) if weekly_change is not None else None,
+        "twii_volume": int(volume.iloc[-1]),
+    })
+
+    # --------- 4. 移動平均 + 趨勢狀態 ----------
+    ma5 = float(close.rolling(5).mean().iloc[-1])
+    ma20 = float(close.rolling(20).mean().iloc[-1])
+    ma60 = float(close.rolling(60).mean().iloc[-1])
+
+    # ADX
+    adx_dict = calculate_adx(twii, 14)
+    adx_val = float(adx_dict["adx"].iloc[-1]) if not adx_dict["adx"].empty else 0.0
+    plus_di = float(adx_dict["plus_di"].iloc[-1]) if not adx_dict["plus_di"].empty else 0.0
+    minus_di = float(adx_dict["minus_di"].iloc[-1]) if not adx_dict["minus_di"].empty else 0.0
+
+    # 用 stock.py 的 classify_trend 一致邏輯
+    trend_state, trend_strength = classify_trend(c_now, ma5, ma20, ma60, adx_val)
+
+    result.update({
+        "twii_ma5": round(ma5, 2),
+        "twii_ma20": round(ma20, 2),
+        "twii_ma60": round(ma60, 2),
+        "market_trend_state": trend_state,
+        "market_trend_strength": trend_strength,
+        "market_above_ma20": bool(c_now > ma20),
+        "market_above_ma60": bool(c_now > ma60),
+        "market_adx": round(adx_val, 2),
+        "market_plus_di": round(plus_di, 2),
+        "market_minus_di": round(minus_di, 2),
+        "market_di_bullish": bool(plus_di > minus_di),
+    })
+
+    # --------- 5. 週線趨勢 ----------
+    if not twii_w.empty and len(twii_w) >= 20:
+        c_w_now = float(twii_w["Close"].iloc[-1])
+        wma20 = float(twii_w["Close"].rolling(20).mean().iloc[-1])
+        weekly_rsi = float(calculate_rsi(twii_w["Close"], 14).iloc[-1])
+
+        result.update({
+            "market_weekly_above_ma20": bool(c_w_now > wma20),
+            "market_weekly_trend_state": "uptrend" if c_w_now > wma20 else "downtrend",
+            "market_weekly_rsi14": round(weekly_rsi, 2),
+        })
+    else:
+        result["data_quality"]["warnings"].append("TWII 週線資料不足，無 weekly RSI/trend")
+        result.update({
+            "market_weekly_above_ma20": None,
+            "market_weekly_trend_state": None,
+            "market_weekly_rsi14": None,
+        })
+
+    # --------- 6. RSI / SuperTrend / Bollinger ----------
+    rsi_val = float(calculate_rsi(close, 14).iloc[-1])
+
+    st_dict = calculate_supertrend(twii, period=10, multiplier=3.0)
+    st_bullish = bool(st_dict["supertrend_bullish"].iloc[-1]) if "supertrend_bullish" in st_dict else False
+
+    bb_dict = calculate_bbands(twii, 20, 2)
+    bb_upper = float(bb_dict["bb_upper"].iloc[-1])
+    bb_lower = float(bb_dict["bb_lower"].iloc[-1])
+    bb_pos = ((c_now - bb_lower) / (bb_upper - bb_lower)) * 100 if bb_upper > bb_lower else 50.0
+
+    result.update({
+        "market_rsi14": round(rsi_val, 2),
+        "market_supertrend_bullish": st_bullish,
+        "market_bb_upper": round(bb_upper, 2),
+        "market_bb_lower": round(bb_lower, 2),
+        "market_bb_position_pct": round(bb_pos, 2),
+    })
+
+    # --------- 7. ATR / 波動 Regime ----------
+    atr_series = calculate_atr(twii, 14)
+    atr_now = float(atr_series.iloc[-1])
+    atr_pct = (atr_now / c_now) * 100 if c_now > 0 else 0.0
+    atr_20d_avg = float(atr_series.rolling(20).mean().iloc[-1])
+
+    if atr_now > atr_20d_avg * 1.3:
+        vol_regime = "expansion"
+    elif atr_now < atr_20d_avg * 0.7:
+        vol_regime = "contraction"
+    else:
+        vol_regime = "normal"
+
+    result.update({
+        "market_atr14": round(atr_now, 2),
+        "market_atr14_pct": round(atr_pct, 2),
+        "market_volatility_regime": vol_regime,
+    })
+
+    # --------- 8. 量能 ----------
+    vol_5d_avg = float(volume.rolling(5).mean().iloc[-1])
+    vol_ratio_5d = float(volume.iloc[-1]) / vol_5d_avg if vol_5d_avg > 0 else 1.0
+
+    result.update({
+        "market_vol_ratio_5d": round(vol_ratio_5d, 2),
+    })
+
+    # --------- 9. VIX ----------
+    try:
+        vix = _download_yf("^VIX", "3mo", "1d")
+        if not vix.empty and len(vix) >= 2:
+            vix_now = float(vix["Close"].iloc[-1])
+            vix_prev = float(vix["Close"].iloc[-2])
+            vix_change = vix_now - vix_prev
+
+            if vix_now < 18:
+                vix_level = "low"          # 低恐慌
+            elif vix_now < 25:
+                vix_level = "normal"       # 正常
+            elif vix_now < 30:
+                vix_level = "elevated"     # 偏高警戒
+            else:
+                vix_level = "panic"        # 恐慌
+
+            result.update({
+                "vix_latest": round(vix_now, 2),
+                "vix_change": round(vix_change, 2),
+                "vix_level": vix_level,
+            })
+            result["data_quality"]["vix_available"] = True
+        else:
+            result["data_quality"]["warnings"].append("VIX 資料不足")
+            result.update({"vix_latest": None, "vix_change": None, "vix_level": None})
+    except Exception as e:
+        result["data_quality"]["warnings"].append(f"VIX 下載失敗: {str(e)[:50]}")
+        result.update({"vix_latest": None, "vix_change": None, "vix_level": None})
+
+    # --------- 10. 推算市場狀態（給 AI 參考，非必需） ----------
+    rsi_d = result.get("market_rsi14", 50)
+    rsi_w = result.get("market_weekly_rsi14") or 50
+    vix_lvl = result.get("vix_level", "normal")
+    daily_chg = result["twii_change_pct"]
+
+    # 簡單分類（AI 仍可基於更多訊號自行判斷）
+    suggested_regime = None
+    if vix_lvl == "panic" or daily_chg < -2.0:
+        suggested_regime = "crisis"           # 黑天鵝
+    elif rsi_d > 75 and daily_chg > 1.0:
+        suggested_regime = "late_trend_or_blowoff"   # 末段過熱或權值噴發
+    elif rsi_d > 75:
+        suggested_regime = "late_trend"       # 末段過熱
+    elif 50 <= rsi_d <= 75 and adx_val > 25:
+        suggested_regime = "trend"            # 趨勢盤
+    elif 40 <= rsi_d <= 60 and adx_val < 20:
+        suggested_regime = "range"            # 震盪盤
+    else:
+        suggested_regime = "transition"       # 轉折期
+
+    result["suggested_regime"] = suggested_regime
+
+    # --------- 11. 移除 NaN 與不可序列化值 ----------
+    result = _sanitize_numpy(result)
+
+    return result
+
+
+def save_market_features(features: Dict[str, Any], output_path: str = None) -> str:
+    """把大盤 features 存成 JSON 檔案，預設檔名 market_features_YYYY-MM-DD.json"""
+    if output_path is None:
+        date = features.get("snapshot_date", datetime.now().strftime("%Y-%m-%d"))
+        output_path = f"market_features_{date}.json"
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(features, f, ensure_ascii=False, indent=2, default=str)
+
+    print(f"✓ Market features saved: {output_path}")
+    return output_path
+
+
+# ===================================================================
+# 19. ENTRY POINT
+# ===================================================================
+
 if __name__ == "__main__":
     import sys
 
     sid = sys.argv[1] if len(sys.argv) > 1 else "2330"
     m = sys.argv[2] if len(sys.argv) > 2 else "human"
-    result = analyze_stock_technical(sid, mode=m)
-    if "human_report" in result:
-        print(result["human_report"])
-    if "ai_report" in result:
-        print(json.dumps(result["ai_report"], ensure_ascii=False, default=str))
+
+    # market 模式 - 只產出大盤 features
+    if sid == "market":
+        as_of = sys.argv[2] if len(sys.argv) > 2 else None
+        features = compute_market_features(as_of_date=as_of)
+        save_market_features(features)
+        print(json.dumps(features, ensure_ascii=False, indent=2, default=str))
+    else:
+        result = analyze_stock_technical(sid, mode=m)
+        if "human_report" in result:
+            print(result["human_report"])
+        if "ai_report" in result:
+            print(json.dumps(result["ai_report"], ensure_ascii=False, default=str))
