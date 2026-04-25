@@ -3941,11 +3941,11 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
     ma20 = float(close.rolling(20).mean().iloc[-1])
     ma60 = float(close.rolling(60).mean().iloc[-1])
 
-    # ADX
-    adx_dict = calculate_adx(twii, 14)
-    adx_val = float(adx_dict["adx"].iloc[-1]) if not adx_dict["adx"].empty else 0.0
-    plus_di = float(adx_dict["plus_di"].iloc[-1]) if not adx_dict["plus_di"].empty else 0.0
-    minus_di = float(adx_dict["minus_di"].iloc[-1]) if not adx_dict["minus_di"].empty else 0.0
+    # ADX (回傳 tuple: ADX, +DI, -DI)
+    adx_series, plus_di_series, minus_di_series = calculate_adx(twii, 14)
+    adx_val = float(adx_series.iloc[-1]) if not adx_series.empty and pd.notna(adx_series.iloc[-1]) else 0.0
+    plus_di = float(plus_di_series.iloc[-1]) if not plus_di_series.empty and pd.notna(plus_di_series.iloc[-1]) else 0.0
+    minus_di = float(minus_di_series.iloc[-1]) if not minus_di_series.empty and pd.notna(minus_di_series.iloc[-1]) else 0.0
 
     # 用 stock.py 的 classify_trend 一致邏輯
     trend_state, trend_strength = classify_trend(c_now, ma5, ma20, ma60, adx_val)
@@ -3986,12 +3986,14 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
     # --------- 6. RSI / SuperTrend / Bollinger ----------
     rsi_val = float(calculate_rsi(close, 14).iloc[-1])
 
-    st_dict = calculate_supertrend(twii, period=10, multiplier=3.0)
-    st_bullish = bool(st_dict["supertrend_bullish"].iloc[-1]) if "supertrend_bullish" in st_dict else False
+    # SuperTrend (回傳 tuple: supertrend_series, direction_series; direction +1=多頭, -1=空頭)
+    st_series, st_direction = calculate_supertrend(twii, period=10, multiplier=3.0)
+    st_bullish = bool(st_direction.iloc[-1] == 1) if not st_direction.empty else False
 
-    bb_dict = calculate_bbands(twii, 20, 2)
-    bb_upper = float(bb_dict["bb_upper"].iloc[-1])
-    bb_lower = float(bb_dict["bb_lower"].iloc[-1])
+    # Bollinger Bands (回傳 tuple: bbw, upper, lower)
+    bbw_series, bb_upper_series, bb_lower_series = calculate_bbands(twii, 20, 2)
+    bb_upper = float(bb_upper_series.iloc[-1]) if not bb_upper_series.empty and pd.notna(bb_upper_series.iloc[-1]) else c_now * 1.05
+    bb_lower = float(bb_lower_series.iloc[-1]) if not bb_lower_series.empty and pd.notna(bb_lower_series.iloc[-1]) else c_now * 0.95
     bb_pos = ((c_now - bb_lower) / (bb_upper - bb_lower)) * 100 if bb_upper > bb_lower else 50.0
 
     result.update({
