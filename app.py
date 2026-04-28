@@ -270,6 +270,8 @@ if "sector_as_of_date" not in st.session_state:
     st.session_state.sector_as_of_date = datetime.now().date()
 if "report_mode" not in st.session_state:
     st.session_state.report_mode = "human"
+if "prompt_m_ai_result" not in st.session_state:
+    st.session_state.prompt_m_ai_result = ""
 
 
 # -------------------------
@@ -866,6 +868,7 @@ with st.sidebar:
 【貼上 sector 池子 2 JSON】
 ...（可多池）"""
         st.code(prompt_m, language="text")
+        st.caption("💡 跑完 M 後，把「🤖 AI 區段」貼到 Tab 6 最下方的「Prompt M 結果」框，A/B/C 會自動帶入。")
 
     with st.expander("📋 提示詞 A：候選股海選評分", expanded=False):
         prompt_a = r"""# 📋 提示詞 A：候選股海選評分
@@ -1058,258 +1061,324 @@ L6 當沖/分歧/smart_short = {n}
 【貼上 sector 池子 2 JSON】
 ...
 """
-        st.code(prompt_a, language="text")
+        # 動態組合：若有 M 結果，自動插入到 prompt 開頭
+        m_result = st.session_state.get("prompt_m_ai_result", "").strip()
+        if m_result:
+            st.success("✅ 已自動帶入 Prompt M 結果")
+            final_prompt_a = (
+                "## 🌐 今日市況（來自 Prompt M）\n\n"
+                f"{m_result}\n\n"
+                "---\n\n"
+                f"{prompt_a}"
+            )
+        else:
+            st.warning("⚠️ 尚未在 Tab 6 貼上 Prompt M 結果，建議先跑 M 再回來複製")
+            final_prompt_a = prompt_a
+        st.code(final_prompt_a, language="text")
 
-    with st.expander("🔥 提示詞 B：進攻名單與買點（需開網頁搜尋）", expanded=False):
-        prompt_b = r"""# 🔥 提示詞 B：進攻名單與買點
+    with st.expander("🔥 提示詞 B：進攻名單 AI 判讀（需開網頁搜尋）", expanded=False):
+        prompt_b = r"""# 🔥 提示詞 B：進攻名單 AI 判讀
 
-你是台股動能交易策略師，風格「灌溉鮮花、砍掉雜草」。
+你是台股交易策略師，**不重新計分**，只做兩件事：
+1. **讀 Prompt A 的個股分數**，依市況脈絡判斷該進攻、觀察、還是排除
+2. **依新聞/川普/逆風觀點調整**，給出可下單的 Tier1/Tier2 清單
+
 ⚠️ **先開啟網頁搜尋**。每檔 ≤ 5 行。
 
 ---
 
-## 第零步：填入市況（從 Prompt M 結果複製整段 AI 區段）
+## 第零步:填入市況(從 Prompt M 結果複製整段 AI 區段)
 
 ```
-═══════ 市況快照 {YYYY-MM-DD}（給 AI 用）═══════
+═══════ 市況快照 {YYYY-MM-DD}(給 AI 用)═══════
 [整段貼上]
 ═══════ 以上請複製貼到 Prompt A/B/C 開頭 ═══════
 ```
 
-## 第一步：網頁搜尋（≤6 行）
+## 第一步:必填「市況套用聲明」(缺則拒絕分析)
 
-**S1 市場補充**：`VIX`、`美股 本週`、`台股 本週`
-**S2 川普動態**：`Trump latest`、`Trump tariff Taiwan`
-**S3 個股**：每檔搜 `[代號] 最新消息`
-**S4 逆風觀點**：`[股] 利空`、`[產業] 泡沫`
+```
+【市況套用聲明】
+今日激進度:{n}/100 → {🟢全力/🟢積極/🟡中性/🟠防禦/🔴強防/🚨危機}
+建議現金比:{n}%(套用 M 建議)
+
+我在這次分析中會做的調整:
+├─ Tier1 門檻:排序分 ≥ {依激進度自填}
+├─ 部位修正係數:×{依激進度自填}
+├─ 偏好 edge:{依激進度自填 S1/S2/S4/S5}
+└─ 大盤約束:{1-2 句具體}
+   例:「大盤週 RSI 80 過熱、ATR%2.1 → 對 RSI>75 個股部位再×0.7」
+   例:「大盤強勢但廣度差 → 我會避免推 RS<0 的個股」
+
+備註:今日所有判斷皆以此激進度為基準。
+```
+
+## 第二步:網頁搜尋(≤6 行)
+
+**S1 市場補充**:`VIX`、`美股 本週`、`台股 本週`
+**S2 川普動態**:`Trump latest`、`Trump tariff Taiwan`
+**S3 個股**:每檔搜 `[代號] 最新消息`
+**S4 逆風觀點**:`[股] 利空`、`[產業] 泡沫`
 
 ### 搜尋彙整輸出
 
 ```
-📡 補充：VIX動向/川普{Y/N}/油{n}/地緣{🟢🟡🔴}
-🇺🇸 川普：48hr內{Y/N}/{議題}/影響{標的}
-📰 個股：
-  {代號}：{🟢需求/🟡成本/🔴轉嫁}/{要點}/逆風{有無}
+📡 補充:VIX動向/川普{Y/N}/油{n}/地緣{🟢🟡🔴}
+🇺🇸 川普:48hr內{Y/N}/{議題}/影響{標的}
+📰 個股:
+  {代號}:{🟢需求/🟡成本/🔴轉嫁}/{要點}/逆風{有無}
 ```
 
-## Tier1 標準（依激進度動態）
+## 第三步:對 Prompt A 結果做 AI 判讀(核心工作)
 
-| 激進度 | Tier1 門檻 | 偏好 edge |
-|---|---|---|
-| ≥ 80 | 排序分≥65 | 寬鬆，S1/S5 |
-| 65-79 | 排序分≥70 | 標準，S1/S5 |
-| 50-64 | 排序分≥75 | 收緊，挑強 |
-| 35-49 | 排序分≥80 + 主導 S2/S4 | 提高門檻 |
-| 20-34 | 暫停新進場 | 僅 S2 阿呆谷 |
-| < 20 | 全停 | 守 ETF |
+**你的任務不是重算分數**,而是對 A 的每檔個股做「**脈絡詮釋**」。
 
-## 警示綜合判斷
+### 判讀矩陣
 
-- 警示 ≥2 + 外資 reducing → 排除
-- above_bb_upper 單獨 + 強勢突破 → 部位 ×0.7 但不排除
-- flag_day_trade_divergence + foreign reducing → 排除
+| A 的評級 | 你的判讀方向 |
+|---|---|
+| ★★★★★(≥80)| 確認是真鮮花還是過熱頂部 |
+| ★★★★☆(65-79)| 看 A 的「層間判讀」+ 新聞 → 升 Tier1 還是降 Tier2 |
+| ★★★☆☆(50-64)| 默認 Tier2,除非有強催化劑 |
+| ★★☆☆☆ 以下 | 默認排除,除非反轉訊號明確 |
 
-## 部位計算
+### 判讀關鍵問題(每檔必答)
 
-```
-基礎部位 × 激進度修正 × 個股修正
+對每檔 ★★★★ 以上的個股,AI 必須回答:
 
-基礎部位：Tier1=5-7%、Tier2=2-4%、核心ETF=15-25%
+1. **A 的分數是真的還是虛的?**
+   - 有沒有「分數高但 RS 轉負」(虛高)
+   - 有沒有「過熱警示但 A 給高分」(過熱頂部)
+   - 有沒有「基本面強但籌碼弱」(題材退潮)
 
-激進度修正：
-- ≥80：×1.0
-- 65-79：×0.85
-- 50-64：×0.7
-- 35-49：×0.55
-- <35：×0.4
+2. **新聞/川普會不會改變判斷?**
+   - 利多 + A 給高分 → 確認進攻
+   - 利多但 A 給低分 → 利多有限,觀察
+   - 利空 + A 給高分 → 警戒,等回測再進
+   - 利空 + A 給低分 → 排除
 
-個股修正：
-- 過熱（RSI>75）：×0.7
-- 處置股：×0.5
-- 借券放空升高：×0.85
-```
+3. **市況約束怎麼套用?**
+   - 激進度 ≥ 65 → 寬鬆,A 的 Tier1 全採用
+   - 激進度 50-64 → 收緊,只取 A 的 ★★★★★
+   - 激進度 < 50 → 嚴格,必須有反轉訊號才進
 
-## 買點優先序
+## 第四步:輸出 Tier1/Tier2/排除
 
-AVWAP → POC → Fib 支撐 → 均線 → 缺口
-
-## 輸出格式
-
-### Tier 1 進攻（每檔 ≤ 5 行）
+### Tier 1 進攻(每檔 ≤ 5 行)
 
 ```
-【{代號}】🟢需求驅動 | 主導 {S1/S2/S4/S5}
-進場 {low}-{high} | 停損 {stop} | ATR {n}% | 警示{n}
-催化：{要點}+反轉訊號{有無}
-風險：{最大隱憂 ≤15字}
-部位：{n}%（激進度×個股修正後）
+【{代號}】★★★★☆ ({A 的分數}) | 主導 {edge}
+進場 {low}-{high} | 停損 {stop} | ATR {n}%
+🤖 AI 判讀:{≤25字 解釋為什麼採用 A 的分數,含市況脈絡}
+   例:「A 給 78 分 + 多頭背離 + 外資+5K → 反轉確認,激進度48仍可少量進」
+   例:「A 給 80 分但 RS 轉負 + 過熱警示 → 降為 Tier2 觀察」
+🌐 新聞催化:{要點+方向}(標來源/時間)
+部位:{n}%(基礎{n}% × 激進度修正{n} × 個股修正{n})
 ```
 
-### Tier 2 觀察（每檔 ≤ 3 行）
+### Tier 2 觀察(每檔 ≤ 3 行)
 
 ```
-【{代號}】{觸發條件} → 升 Tier1
-關鍵位：{支撐} / 警示：{若有則列出}
+【{代號}】★★★☆☆ ({A 的分數})
+觸發條件:{站回 X 或 跌至 Y 不破} → 升 Tier1
+🤖 AI 判讀:{≤20字 為何降級或暫不進}
 ```
 
-### 排除區（一行帶過）
-
-`{代號}：{主因} / ...`
-
-## 資金配置（直接套用 Prompt M 的「建議現金比」）
+### 排除區(一行帶過)
 
 ```
-現金 {n}%（套用 M 建議）/ Tier1 {n}% / Tier2 {n}%
+{代號}:A 給 {n} 分,但 {主因排除:例如 RS 轉負/雙背離/題材退潮/激進度過低}
 ```
 
-## 硬規則
+## 第五步:資金配置
 
-1. trend_state=strong_downtrend → 禁入
-2. supertrend_bullish=false 且 weekly≠uptrend → 禁入
-3. flag_day_trade_divergence + foreign reducing → 禁入
+```
+現金 {套用 M 建議}%
+Tier1 {n}%(依激進度修正)
+Tier2 {n}%
+─ 修正:激進度 {n} × VIX {等級} × 過熱{n}檔
+```
+
+## 硬規則(A 已篩過,這裡再防最後一道)
+
+1. trend_state=strong_downtrend → 強制排除(即使 A 沒篩到)
+2. 利空消息 + A 分數低 → 強制排除
+3. 川普行政命令直接衝擊 → 受影響股全排除
 4. 全不合格 → 「建議觀望」
 5. 川普口頭威脅 ≠ 基本面崩壞
 6. 消息必標來源/時間
-7. 每檔 ≤ 5 行；不寫總結段
+7. 每檔 ≤ 5 行;不寫總結段
+8. **禁止重新計算 A 的個股分數**,只能詮釋
 
 ## 資料
 
 【貼上 Prompt M 的 🤖 AI 區段】
-【貼上 Prompt A 輸出】
-【貼上 sector_候選名單 JSON】
+【貼上 Prompt A 完整輸出】
 """
-        st.code(prompt_b, language="text")
+        # 動態組合：若有 M 結果，自動插入到 prompt 開頭
+        m_result = st.session_state.get("prompt_m_ai_result", "").strip()
+        if m_result:
+            st.success("✅ 已自動帶入 Prompt M 結果")
+            final_prompt_b = (
+                "## 🌐 今日市況（來自 Prompt M）\n\n"
+                f"{m_result}\n\n"
+                "---\n\n"
+                f"{prompt_b}"
+            )
+        else:
+            st.warning("⚠️ 尚未在 Tab 6 貼上 Prompt M 結果，建議先跑 M 再回來複製")
+            final_prompt_b = prompt_b
+        st.code(final_prompt_b, language="text")
 
-    with st.expander("🌸 提示詞 C：持股風控決策（需開網頁搜尋）", expanded=False):
-        prompt_c = r"""# 🌸 提示詞 C：持股風控決策
+    with st.expander("🌸 提示詞 C：持股風控 AI 判讀(需開網頁搜尋)", expanded=False):
+        prompt_c = r"""# 🌸 提示詞 C：持股風控 AI 判讀
 
-你是台股組合風控專家，原則「灌溉鮮花、砍掉雜草」。
+你是台股組合風控專家,**不重新計分**,只做兩件事:
+1. **對每檔持股給「鮮花/警戒/雜草」標籤**(簡單分類,非詳細計分)
+2. **依市況激進度決定減碼幅度**
+
 ⚠️ **先開啟網頁搜尋**。每檔 ≤ 5 行。
 
 ---
 
-## 第零步：填入市況（從 Prompt M 結果複製整段 AI 區段）
+## 第零步:填入市況(從 Prompt M 結果複製整段 AI 區段)
 
 ```
-═══════ 市況快照 {YYYY-MM-DD}（給 AI 用）═══════
+═══════ 市況快照 {YYYY-MM-DD}(給 AI 用)═══════
 [整段貼上]
 ═══════ 以上請複製貼到 Prompt A/B/C 開頭 ═══════
 ```
 
-## 第一步：網頁搜尋（≤6 行）
+## 第一步:必填「市況套用聲明」(缺則拒絕分析)
 
-**S1 系統性風險**：`VIX`、`Fed 利率`、`美中關係`
-**S2 川普動態**：`Trump latest`、`Trump China Taiwan`
-**S3 每檔持股**：`[代號] 最新消息`、`[公司] 法說會`
+```
+【市況套用聲明】
+今日激進度:{n}/100 → {🟢全力/🟢積極/🟡中性/🟠防禦/🔴強防/🚨危機}
+建議現金比:{n}%(套用 M 建議)
+
+我在這次風控中會做的調整:
+├─ 鮮花處理:{加碼/續抱/減 X%}
+├─ 警戒處理:{續抱/減 15%/減 30%}
+├─ 雜草處理:{減 30%/減 50%/全出}
+└─ 大盤約束:{1-2 句具體}
+   例:「激進度 48 偏防禦 → 鮮花改設追漲停損鎖獲利」
+   例:「大盤週 RSI 80 過熱 → 高 beta 持股優先減碼」
+```
+
+## 第二步:網頁搜尋(≤6 行)
+
+**S1 系統性風險**:`VIX`、`Fed 利率`、`美中關係`
+**S2 川普動態**:`Trump latest`、`Trump China Taiwan`
+**S3 每檔持股**:`[代號] 最新消息`、`[公司] 法說會`
 
 ### 搜尋彙整輸出
 
 ```
-📡 系統補充：VIX動向/Fed{方向}/地緣{摘要}
-🇺🇸 川普：{48hr Y/N}/{性質}/{影響持股}
-📰 持股消息：
-  {代號}：{🟢🟡🔴}{要點}
+📡 系統補充:VIX動向/Fed{方向}/地緣{摘要}
+🇺🇸 川普:{48hr Y/N}/{性質}/{影響持股}
+📰 持股消息:
+  {代號}:{🟢🟡🔴}{要點}
 ```
 
-## 鮮花/雜草計分
+## 第三步:簡化分類(不重複 A 的細分計分)
 
-**鮮花 +1 each**：
+對每檔持股,依「**結構訊號**」+「**消息面**」做三類分類:
+
+### 🌸 鮮花(多項結構訊號全綠燈)
+
+至少滿足 4 項:
 - trend_state ∈ (uptrend/strong_uptrend/strong_bottom_bounce)
-- mtf_alignment ∈ (aligned_bull/mixed_bull_bias)
 - supertrend_bullish=true
-- rs_vs_bench_20d > 0
-- flag_price_up_vol_up=true 或 vol_ratio_5d>1.0
-- foreign_20d_net>0 或 flag_inst_consensus_buy
+- weekly_trend_state=uptrend
 - foreign_accumulation_trend=accumulating
-- revenue_momentum ∈ (stable/accelerating)
-- eps_trend_4q=improving
-- entry_warnings 為空
-- flag_bullish_divergence_macd 或 _rsi（反轉訊號）
+- rs_vs_bench_20d > 0
+- 報酬率 > 0
+- 消息面 🟢 需求驅動
 
-**雜草 −1 each**：
-- trend_state ∈ (downtrend/strong_downtrend)
-- supertrend_bullish=false
-- flag_bearish_divergence_rsi 或 _macd
-- rs_vs_bench_20d < 0
-- flag_inst_consensus_sell=true
-- flag_price_down_vol_up=true
-- flag_day_trade_overheat / divergence / smart_short_signal
-- foreign_accumulation_trend=reducing
-- revenue_momentum=decelerating
+### 🪓 雜草(結構崩壞)
 
-**警示 −0.5 each**（軟性，可依情境歸零）：
-- price_down_vol_up_distribution（強勢股測均線→0）
-- above_bb_upper_in_high_vol（強勢突破→0）
-- red_candle_no_reversal_confirm
+任一觸發:
+- trend_state=strong_downtrend
+- supertrend_bullish=false 且 weekly=downtrend
+- flag_inst_consensus_sell=true 連 3 日
+- foreign_accumulation_trend=reducing 且 rs_vs_bench_20d<-5
+- 消息面 🔴 利空且未反映完
+- A 評為 ★★ 以下(如 A 報告中有提到)
 
-**判定**：淨分 ≥5 🌸 / 2-4 ⚠️ / ≤1 🪓
+### ⚠️ 警戒(介於兩者之間)
 
-## 警示判斷脈絡
+不符合鮮花、也未崩壞 → 警戒
 
-- 警示 + 基本面強 + 外資 accumulating → 警示扣分歸零
-- 警示 + 基本面轉弱 → 警示扣滿分
-- 警示 ≥2 + 外資 reducing → 升級為 -1 扣分
-- above_bb_upper 單獨 + 強勢多頭 → 扣 0 分
+## 第四步:依激進度決定操作(核心)
 
-## 持股決策（依激進度動態）
+| 持股分類 | 激進度≥65 | 激進度50-64 | 激進度35-49 | 激進度<35 |
+|---|---|---|---|---|
+| 🌸 鮮花 | 加碼 10-20% | **續抱** | 續抱 + 追漲停損 | 減 20% 鎖獲利 |
+| ⚠️ 警戒 | 續抱不加 | 減 15% | 減 30% | 減 50% |
+| 🪓 雜草 | 減 30% | 減 50% | **全出** | 全出 |
 
-| 持股淨分 | 激進度 ≥ 65 | 激進度 50-64 | 激進度 < 35 |
-|---|---|---|---|
-| 🌸 鮮花（≥5）| 加碼 10-20% | 續抱 | **減 20%（鎖獲利）**|
-| ⚠️ 警戒（2-4）| 續抱不加 | 減 15% | **減 30-50%** |
-| 🪓 雜草（≤1）| 減 30% | 減 50% | **全出** |
-
-## 大盤加權（依 market_features）
-
-- market_rsi14>75 + 高 beta → 優先減碼
-- market_volatility_regime=expansion → 停損加寬 0.5×ATR
-- market_supertrend_bullish=false + market_weekly_trend=downtrend → 非核心減碼
-- market_rsi14<30 + weekly 仍 uptrend → 阿呆谷買點
-
-## 每檔輸出（5 行）
+## 第五步:每檔輸出(5 行)
 
 ```
-【{代號} {symbol}】🌸/⚠️/🪓 (淨{±n})
-計分：+{鮮花項} / -{雜草項} / ⚠️警示
+【{代號} {symbol}】🌸/⚠️/🪓
 持倉 {shares}@{avg} 現{close} 報酬 {ret}%
-基本面：營{yoy}%{momentum}/EPS{yoy}%{trend}/外資{pct}%{trend}
-💭 決策：{續抱/減X%/全出} 停{stop} 風險：{≤15字}
+🤖 AI 判讀:{≤30字 為什麼這樣分類,含市況脈絡}
+   例:「結構全綠+外資累積 = 鮮花;激進度 48 → 續抱但設追漲停損」
+   例:「RS轉負+雙背離+題材退潮 = 警戒;激進度 48 → 減 30%」
+🌐 消息:{要點+影響}(標來源/時間)
+💭 決策:{續抱/減X%/全出} 停損{stop} 風險:{≤15字}
 ```
 
-## 持股總表
+## 第六步:持股總表
 
-| 代號 | 🌸⚠️🪓 | 淨分 | 趨勢 | 報酬% | 基本面 | 警示 | 川普 | 大盤 | 決策 |
-|---|---|---|---|---|---|---|---|---|---|
+| 代號 | 🌸⚠️🪓 | 報酬% | 結構 | 消息 | 大盤約束 | 決策 |
+|---|---|---|---|---|---|---|
 
-## 反向審計（2 行）
+## 反向審計(2 行)
 
-- 續抱最大風險：{≤15字}
-- 賣出可能錯過：{≤15字}
+- 續抱最大風險:{≤15字}
+- 賣出可能錯過:{≤15字}
 
-## 組合總結（4 行）
+## 組合總結(4 行)
 
-- 🌸/⚠️/🪓 比例：X / Y / Z
-- 川普曝險：{高/中/低}
-- 建議現金比：**{直接套用 Prompt M 建議}**
-- 集中度：{若單股市值>30% 警示 — 用 股數×現價計算實際市值佔比，不可用 position_size_pct}
+- 🌸/⚠️/🪓 比例:X / Y / Z
+- 川普曝險:{高/中/低}
+- 建議現金比:**{直接套用 Prompt M 建議}**
+- 集中度:{若單股市值>30% 警示 — 用 股數×現價計算實際市值佔比,禁用 position_size_pct}
 
 ## 硬規則
 
 1. trend_state=strong_downtrend 或 supertrend_bullish=false+weekly=downtrend → 不續抱
-2. flag_day_trade_divergence + foreign reducing → 不續抱
-3. 續抱必附停損；停損觸及必執行
+2. 川普行政命令直接衝擊 + 技術已破 → 即減 50%
+3. 續抱必附停損;停損觸及必執行
 4. 雜草 >50% → 「組合需大幅調整」
 5. 激進度 < 20 → 鮮花也減 ≥30%
 6. 川普口頭威脅 ≠ 實質政策
 7. 每檔 ≤ 5 行
-8. **集中度計算用實際股數×現價，禁用 position_size_pct**
+8. **集中度計算用實際股數×現價,禁用 position_size_pct**
+9. **禁止重新計算 A 的個股分數**
 
 ## 持股資料
 
 【貼上 Prompt M 的 🤖 AI 區段】
 【貼上 sector_持股 JSON】
+(可選)【貼上 Prompt A 對持股的評分結果】
 """
-        st.code(prompt_c, language="text")
+        # 動態組合：若有 M 結果，自動插入到 prompt 開頭
+        m_result = st.session_state.get("prompt_m_ai_result", "").strip()
+        if m_result:
+            st.success("✅ 已自動帶入 Prompt M 結果")
+            final_prompt_c = (
+                "## 🌐 今日市況（來自 Prompt M）\n\n"
+                f"{m_result}\n\n"
+                "---\n\n"
+                f"{prompt_c}"
+            )
+        else:
+            st.warning("⚠️ 尚未在 Tab 6 貼上 Prompt M 結果，建議先跑 M 再回來複製")
+            final_prompt_c = prompt_c
+        st.code(final_prompt_c, language="text")
+
 
 
 # -------------------------
@@ -1926,6 +1995,87 @@ with tab6:
 - **VIX**：恐慌指數及等級（low/normal/elevated/panic）
 - **建議**：suggested_regime（自動推算當前市況）
 """)
+
+    # ============================================
+    # Prompt M 結果輸入框（給 A/B/C 自動帶入用）
+    # ============================================
+    st.divider()
+    st.subheader("🤖 Prompt M 結果輸入區")
+    st.caption(
+        "跑完 Prompt M 後，把「🤖 AI 區段」整段貼進來。"
+        "之後在 Sidebar 點開 Prompt A/B/C 時會自動把 M 結果帶到最前面，一鍵複製就能用。"
+    )
+
+    m_result_input = st.text_area(
+        "貼上 Prompt M 的 🤖 AI 區段（從『═══════ 市況快照』開始到『═══════ 以上請複製...』結束）：",
+        value=st.session_state.get("prompt_m_ai_result", ""),
+        height=400,
+        key="m_result_textarea",
+        placeholder="""═══════ 市況快照 2026-04-25（給 AI 用）═══════
+
+🌐 市場狀態：...
+
+📊 大盤客觀：
+   TWII 38,932 (+3.23%) / 日RSI 76 / 週RSI 80 / VIX 19 normal
+   ...
+
+🌡️ 激進度量表：48/100 → 🟠 偏向防禦
+   ...
+
+═══════ 以上請複製貼到 Prompt A/B/C 開頭 ═══════"""
+    )
+
+    # 三個按鈕：儲存 / 清除 / 預覽
+    btn_save_col, btn_clear_col, btn_preview_col = st.columns(3)
+
+    with btn_save_col:
+        if st.button("💾 儲存 M 結果", type="primary", use_container_width=True, key="save_m_result"):
+            st.session_state.prompt_m_ai_result = m_result_input.strip()
+            if m_result_input.strip():
+                st.success("✓ 已儲存！A/B/C 會自動帶入此結果")
+            else:
+                st.warning("輸入框是空的，未儲存")
+            st.rerun()
+
+    with btn_clear_col:
+        if st.button("🗑️ 清除 M 結果", use_container_width=True, key="clear_m_result"):
+            st.session_state.prompt_m_ai_result = ""
+            st.success("✓ 已清除")
+            st.rerun()
+
+    with btn_preview_col:
+        if st.button("👁️ 預覽組合 Prompt", use_container_width=True, key="preview_combined"):
+            st.session_state["_show_combined_preview"] = True
+
+    # 顯示目前狀態
+    saved_m = st.session_state.get("prompt_m_ai_result", "").strip()
+    if saved_m:
+        st.success(f"✅ 目前已儲存 M 結果（{len(saved_m)} 字元）— A/B/C 會自動帶入")
+        with st.expander("查看已儲存的 M 結果", expanded=False):
+            st.code(saved_m, language="text")
+    else:
+        st.info("⚠️ 尚未儲存 M 結果。A/B/C 會顯示原始模板（缺市況前綴）")
+
+    # 預覽組合 Prompt（A/B/C 三個各看一眼）
+    if st.session_state.get("_show_combined_preview") and saved_m:
+        st.markdown("---")
+        st.markdown("### 👁️ 組合 Prompt 預覽")
+        preview_tab1, preview_tab2, preview_tab3 = st.tabs(["📋 Prompt A 預覽", "🔥 Prompt B 預覽", "🌸 Prompt C 預覽"])
+
+        m_block = f"## 🌐 今日市況（來自 Prompt M）\n\n{saved_m}\n\n---\n\n"
+        with preview_tab1:
+            st.caption("（這是你按 Sidebar 的 Prompt A 會看到的完整內容，已帶 M 結果）")
+            st.code(m_block + "[此處會接 Prompt A 的完整模板]", language="text")
+        with preview_tab2:
+            st.caption("（這是你按 Sidebar 的 Prompt B 會看到的完整內容，已帶 M 結果）")
+            st.code(m_block + "[此處會接 Prompt B 的完整模板]", language="text")
+        with preview_tab3:
+            st.caption("（這是你按 Sidebar 的 Prompt C 會看到的完整內容，已帶 M 結果）")
+            st.code(m_block + "[此處會接 Prompt C 的完整模板]", language="text")
+
+        if st.button("關閉預覽", key="close_preview"):
+            st.session_state["_show_combined_preview"] = False
+            st.rerun()
 
 # -------------------------
 # Auto Refresh Logic
