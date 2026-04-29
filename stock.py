@@ -3886,7 +3886,23 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
         "data_quality": {"twii_available": False, "vix_available": False, "warnings": []},
     }
 
-    # --------- 1. 下載 TWII 日線 + 週線 ----------
+    # --------- 0. 強制清除 yfinance 快取（避免 Streamlit Cloud 進程內快取陳舊資料）----------
+    try:
+        import yfinance as yf
+        # yfinance 0.2+ 內部快取 reset
+        if hasattr(yf, "_BasePriceHistory") and hasattr(yf._BasePriceHistory, "_metadata"):
+            yf._BasePriceHistory._metadata.clear()
+        # 清除 utils 快取（如果存在）
+        try:
+            from yfinance import cache as _yf_cache
+            if hasattr(_yf_cache, "_cache"):
+                _yf_cache._cache.clear()
+        except (ImportError, AttributeError):
+            pass
+    except Exception:
+        pass
+
+    # --------- 1. 下載 TWII 日線 + 週線（使用較大 period 確保最新資料）----------
     twii = _download_yf("^TWII", "2y", "1d")
     if twii.empty or len(twii) < 60:
         result["data_quality"]["warnings"].append("TWII 日線資料不足")
@@ -3895,6 +3911,27 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
     twii_w = _download_yf("^TWII", "2y", "1wk")
 
     result["data_quality"]["twii_available"] = True
+
+    # --------- 1.5 資料新鮮度檢查 ----------
+    latest_data_date = twii.index[-1].date()  # 抓到的最新資料日
+    target_check = as_of_date if as_of_date else datetime.now().date()
+    if isinstance(target_check, str):
+        try:
+            target_check = pd.Timestamp(target_check).date()
+        except Exception:
+            target_check = datetime.now().date()
+    
+    # 計算資料延遲天數（不算週末）
+    days_lag = (pd.Timestamp(target_check) - pd.Timestamp(latest_data_date)).days
+    if days_lag > 2:
+        result["data_quality"]["warnings"].append(
+            f"⚠️ TWII 資料延遲 {days_lag} 天！抓到的最新日為 {latest_data_date}，"
+            f"目標日為 {target_check}。Yahoo Finance 對 ^TWII 偶發更新延遲，"
+            f"建議稍後重試或選擇較早日期。"
+        )
+        # 將實際資料日寫入 result 讓使用者看到
+        result["actual_data_date"] = str(latest_data_date)
+        result["data_lag_days"] = days_lag
 
     # --------- 2. 過濾到 as_of_date 並對齊 ----------
     if as_of_date is not None:
