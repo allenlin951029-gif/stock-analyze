@@ -870,128 +870,165 @@ with st.sidebar:
         st.code(prompt_m, language="text")
         st.caption("💡 跑完 M 後，把「🤖 AI 區段」貼到 Tab 6 最下方的「Prompt M 結果」框，A/B/C 會自動帶入。")
 
-    with st.expander("📋 提示詞 A：候選股海選評分", expanded=False):
-        prompt_a = r"""# 📋 提示詞 A：候選股海選評分
+    with st.expander("📋 提示詞 A：候選股海選評分（動能右側專用）", expanded=False):
+        prompt_a = r"""# 📋 提示詞 A：候選股海選評分（動能右側專用）
 
-你是台股技術+籌碼分析師。
-**單一任務**：對每個池子的候選股逐檔評分，依市況加權排序。
+你是台股**動能右側交易**分析師。
+**單一任務**：對每個池子的候選股逐檔評分,依市況加權排序。
+
+**核心信條**：
+- ✅ 順勢延續、突破追進、量價齊揚
+- ❌ 反向摸底、跌深反彈、左側逢低
 
 **規則**：
-- **層內計分**：嚴格依規則執行，AI 不能改分數
+- **層內計分**：嚴格依規則執行,AI 不能改分數
 - **層間判讀**：AI 在「💭」欄位解讀脈絡
-- 每檔 ≤ 11 行
+- 每檔 ≤ 12 行
 
 ---
 
-## 第零步：填入市況（從 Prompt M 結果複製整段 AI 區段）
+## 第零步：填入市況(從 Prompt M 結果複製整段 AI 區段)
 
 ```
-═══════ 市況快照 {YYYY-MM-DD}（給 AI 用）═══════
-[整段貼上 Prompt M 的 🤖 AI 區段]
+═══════ 市況快照 {YYYY-MM-DD}(給 AI 用)═══════
+[整段貼上]
 ═══════ 以上請複製貼到 Prompt A/B/C 開頭 ═══════
 ```
 
-依市況的「激進度」決定主導 edge 加成方向。
-
 ---
 
-## 計分規則（AI 嚴格執行，不可主觀）
+## 計分規則(動能右側專用,AI 嚴格執行)
 
-### L1 趨勢（30 分）
+### L1 趨勢(30 分)
 
-trend_state 基礎分（15 分）：
-| 狀態 | 分數 |
-|---|---|
-| strong_uptrend | 15 |
-| uptrend / uptrend_pullback / strong_bottom_bounce | 12 |
-| top_pullback | 6 |
-| consolidation | 5 |
-| downtrend / downtrend_bounce | 2 |
-| strong_downtrend | 0 |
+trend_state 基礎分(15 分)：
+| 狀態 | 分數 | 動能交易者觀點 |
+|---|---|---|
+| strong_uptrend | 15 | 完美追進 |
+| uptrend | 13 | 趨勢延續 |
+| uptrend_pullback | 10 | 強勢拉回(模式 B 機會)|
+| **strong_bottom_bounce** | **8** | 反轉初期,需確認(降權重)|
+| top_pullback | 5 | 觀察 |
+| consolidation | 6 | 待突破(模式 C 機會)|
+| downtrend / downtrend_bounce | 0 | **動能交易者禁區** |
+| strong_downtrend | 0 | 排除 |
 
-搭配加分（15 分）：
-- mtf_alignment=aligned_bull → +5；mixed_bull_bias → +3
+搭配加分(15 分)：
+- mtf_alignment=aligned_bull → +5;mixed_bull_bias → +2
 - weekly_trend_state=uptrend → +5
-- supertrend_bullish=true → +5
+- supertrend_bullish=true → +3
+- **flag_supertrend_flip_bull=true → +2(剛剛轉多,最理想)**
 
-### L2 動能（20 分）
+### L2 動能(20 分,動能交易者調整 RSI 曲線)
 
-- RSI（8 分）：50-70=8；40-50 或 70-75=6；30-40 或 75-80=4；80+=2；<30=0
-- MACD（6 分）：osc>0 且 slope_5d>0=6；osc>0 且 slope≤0=3；osc<0=0
-- ADX（6 分）：>25 + di_bullish=6；20-25 + di_bullish=3；其他=0
+**RSI(8 分)動能右側調整**：
+| RSI | 分數 | 動能交易者觀點 |
+|---|---|---|
+| **65-80** | **8** | 強勢延續區(最愛)|
+| 50-65 | 6 | 多頭中段 |
+| 80-85 | 5 | 過熱但仍多頭 |
+| 40-50 | 3 | 動能不足 |
+| 85+ | 3 | 過熱警戒 |
+| < 40 | 0 | 動能交易者不碰 |
 
-### L3 量價（20 分）
+**MACD(6 分)**：
+- osc>0 且 slope_5d>0 → 6(動能強化)
+- osc>0 且 slope_5d≤0 → 3(動能轉弱)
+- osc<0 → 0
 
-- flag_price_up_vol_up=true → +6
-- vol_ratio_5d>1.2 → +4；>1.0 → +2
-- OBV slope_5d 和 slope_20d 雙正 → +6；任一正 → +3
-- pos_52w_pct>90 → +6；>70 → +4
+**ADX(6 分)**：
+- ADX>30 + di_bullish → 6(強趨勢)
+- 25-30 + di_bullish → 4
+- 20-25 + di_bullish → 2
+- 其他 → 0
 
-### L4 籌碼（15 分）
+### L3 量價(25 分,動能交易者最重要) ⭐ 提權重
 
-- foreign_accumulation_trend=accumulating → +6；stable → +3
-- flag_inst_consensus_buy → +4；flag_inst_consensus_sell → -4
-- foreign_holding_4w_delta>0 → +3
+- **flag_price_up_vol_up=true → +8**(量價齊揚是動能核心)
+- vol_ratio_5d>1.5 → +5;>1.2 → +3;>1.0 → +1
+- OBV slope_5d 和 slope_20d 雙正 → +6;任一正 → +3
+- pos_52w_pct>90 → +6;>70 → +4
+
+### L4 籌碼(15 分)
+
+- foreign_accumulation_trend=accumulating → +6;stable → +2
+- flag_inst_consensus_buy → +5;flag_inst_consensus_sell → -5
+- foreign_holding_4w_delta>0 → +2
 - foreign_20d_net>0 → +2
 
-### L5 基本面（10 分，OR 邏輯）
+### L5 基本面(10 分,OR 邏輯,動能交易者不主導)
 
-- revenue_momentum=accelerating → +3；stable → +2；decelerating → 0
-- eps_trend_4q=improving → +3；mixed → +1；deteriorating → 0
+- revenue_momentum=accelerating → +3;stable → +1;decelerating → 0
+- eps_trend_4q=improving → +3;mixed → +1;deteriorating → 0
 - revenue_mom_latest>30 → +2
 - revenue_yoy_latest>10 → +2
 
-### 反轉訊號加分（最多 +5）
+### 動能右側加分(最多 +10) ⭐ 取代「反轉加分」
 
-- flag_bullish_divergence_macd=true → +3
-- flag_bullish_divergence_rsi=true → +2
-- chart_pattern_1='falling_wedge' + confirmed=true + bias='bullish' → +2
+- **flag_supertrend_flip_bull=true → +3**(剛轉多,最理想進場點)
+- **rs_vs_bench_20d > 5 → +2**(顯著強過大盤)
+- **ma20_dev_pct 介於 0~5% → +2**(高於 MA20 但不過熱)
+- **flag_bb_squeeze_fire=true → +3**(壓縮後爆發訊號)
+- 加分上限 +10
 
-### L6 情緒扣分（最低 -10）
+### L6 散戶情緒扣分(最低 -8,調降)
 
-- flag_day_trade_overheat = -3
-- flag_day_trade_divergence = -4
-- flag_smart_short_signal = -3
+動能股噴出時散戶湧入正常,不應重扣：
 
-### 警示扣分（最低 -10）
+- flag_day_trade_overheat = -2(從 -3 調降)
+- **flag_day_trade_divergence = -4**(散戶買主力倒貨,仍重扣)
+- flag_smart_short_signal = -2(從 -3 調降)
 
-- price_down_vol_up_distribution = -4
+### 警示扣分(最低 -10)
+
+- price_down_vol_up_distribution = -5(疑似主力出貨,重扣)
 - red_candle_no_reversal_confirm = -2
-- above_bb_upper_in_high_vol：強勢突破（pos_52w>90+pu_vu）=0；其他=-3
+- above_bb_upper_in_high_vol：
+  - 強勢突破(pos_52w>90 + flag_price_up_vol_up=true) = **+1**(動能突破,反而加分)
+  - 否則 = -2
 
-### 總分與評級
+### 動能右側硬排除(強制 ★☆☆☆☆)
+
+1. trend_state ∈ (strong_downtrend, downtrend) → **禁區**
+2. supertrend_bullish=false → **直接排除**(動能交易者不買破線)
+3. weekly_trend_state=downtrend → **直接排除**(週線多頭是底線)
+4. flag_day_trade_divergence=true 且 foreign_accumulation_trend=reducing → 排除
+5. **rs_vs_bench_20d < -3 → 排除**(跑輸大盤太多,動能已失)
+6. **ma20_dev_pct < -3 → 排除**(已破短期趨勢)
+
+### 總分計算
 
 ```
-總分 = L1 + L2 + L3 + L4 + L5 + 反轉 + L6 + 警示
+總分 = L1 + L2 + L3 + L4 + L5 + 動能加分 + L6 + 警示
+範圍：-18 至 110
 ```
 
-- ★★★★★ ≥ 80
-- ★★★★☆ 65-79
-- ★★★☆☆ 50-64
-- ★★☆☆☆ 35-49
-- ★☆☆☆☆ < 35
+### 評級對照
 
-### 硬排除（強制 ★☆☆☆☆）
+- **★★★★★** ≥ 85(動能完美風暴)
+- **★★★★☆** 70-84
+- **★★★☆☆** 55-69
+- **★★☆☆☆** 40-54
+- **★☆☆☆☆** < 40
 
-1. trend_state = strong_downtrend
-2. supertrend_bullish=false 且 weekly_trend ≠ uptrend
-3. flag_day_trade_divergence=true 且 foreign_accumulation_trend=reducing
+### 主導 edge 判定(動能右側調整)
 
-### 主導 edge 判定
-
-- L1+L2+L3 三層平均≥18 → S1 趨勢延續
-- 反轉加分≥3 + L4≥10 → S2 反轉捕捉
-- L1≤15 + bb_position 30-50 + ADX<20 → S3 震盪高低
+- **L1+L2+L3 三層平均≥20 → S1 趨勢延續(動能核心)**
+- 動能加分≥6 + L1≥18 → **S1+ 強動能延續**(特別標記)
+- L1≥10 + bb_squeeze_fire → S3 突破式震盪
 - ETF 或 beta<1 + L4≥10 → S4 避險防禦
 - L4≥12 主導其他層偏弱 → S5 籌碼跟隨
+- ⚠️ **動能右側交易者基本不做 S2 反轉捕捉**(左側買法)
 
-### 排序分（依激進度動態加權）
+### 排序分(動能右側專用加權)
 
 | 激進度 | 偏好 edge | 加成 |
 |---|---|---|
-| ≥ 65 | S1 / S5 為主 | S1/S5 ×1.15、其他 ×1.0 |
-| 50-64 | S1/S2/S5 平衡 | 全部 ×1.0 |
-| < 50 | S2 / S4 為主 | S2/S4 ×1.15、S1 ×0.9 |
+| ≥ 80 全力 | S1+ / S1 為絕對主力 | S1+ ×1.30、S1 ×1.20、其他 ×1.0 |
+| 65-79 積極 | S1+ / S1 為主 | S1+ ×1.20、S1 ×1.15、其他 ×1.0 |
+| 50-64 中性 | S1 + S5 平衡 | S1 ×1.10、S5 ×1.05、其他 ×1.0 |
+| 35-49 防禦 | S5 / S4 為主 | S5/S4 ×1.15、S1 ×0.9 |
+| <35 強防 | S4 為主 | S4 ×1.20、其他 ×0.85 |
 
 ```
 排序分 = 個股總分 × 主導 edge 加成
@@ -1004,55 +1041,58 @@ trend_state 基礎分（15 分）：
 - 當沖落後 >5 天 → L6 三 flag 視為 false
 - 外資/借券落後 >5 天 → L4 ×0.7
 
-### 個股輸出格式（每檔 11 行）
+### 個股輸出格式(每檔 12 行)
 
 ```
 【{代號} {symbol}】★★★★☆ {n}分 (排序{n})
-L1 {trend_state}/週{weekly}/ST{狀態} = {n}/30
+L1 {trend_state}/週{weekly}/ST{狀態}/flip{Y/N} = {n}/30
 L2 RSI{n}/MACD{狀態}/ADX{n} = {n}/20
-L3 vol{n}/OBV{狀態}/pos{n}% = {n}/20
+L3 vol{n}/OBV{狀態}/pos{n}%/PUVU{Y/N} = {n}/25
 L4 外{foreign_20d}/投{trust_20d}/外資比{n}%{trend} = {n}/15
 L5 營{yoy}%{momentum}/EPS{yoy}%{trend}/MoM{n}% = {n}/10
-反轉訊號：{多頭背離/底部型態 列出} = {n}/5
+動能加分:ST_flip/RS+/MA20dev/BB_fire = {n}/10
 L6 當沖/分歧/smart_short = {n}
 警示: {entry_warnings} = {n}
-🔍層間判讀：{≤30字}
-💡建議：{Tier1/Tier2/觀察/排除} | 主導 edge：{S1/S2/S3/S4/S5}
+🔍層間判讀:{≤30字}
+💡建議:{Tier1/Tier2/觀察/排除} | 主導 edge:{S1+/S1/S3/S4/S5}
+🔥動能特徵:{順勢/拉回/突破/盤整待噴/反轉初期 — 標一個}
 ```
 
-### 層間判讀模式（必擇一）
+### 層間判讀模式(必擇一,動能右側視角)
 
-1. 強弱不對稱：L1+L4 強、L5 弱 → 「反轉型機會」
-2. 層間共振：L1+L2+L3 全強、L6 多扣 → 「強勢過熱」
-3. 層間矛盾：總分高但 RS 轉負 → 「分數虛高」
-4. 催化劑：反轉+L1 升級 → 「反轉確認」
+1. **強勢延續**:L1+L2+L3 全強、量價齊揚 → 「動能完美、可追」
+2. **拉回機會**:trend_state=uptrend_pullback + ST 仍多 → 「強勢拉回,等回 MA5 接」
+3. **突破在即**:bb_squeeze + 量增 → 「壓縮待噴、量出即追」
+4. **強勢過熱**:L1+L2+L3 全強、RSI>80 → 「順勢但部位收緊」
+5. **層間矛盾**:總分高但 RS 轉負 → 「分數虛高、跑輸大盤」
+6. **反轉初期**(謹慎):strong_bottom_bounce + ST_flip → 「左側風險,待確認 5 日」
 
-**AI 不能反駁分數**，只能解釋脈絡。
+**AI 不能反駁分數**,只能解釋脈絡。
 
 ---
 
 ## 輸出總表
 
-### 跨池子總表（合併池排序前 10 名）
+### 跨池子總表(合併池排序前 10 名)
 
-| 代號 | 池子 | 評級 | 總分 | 排序分 | 主導edge | 層間判讀 | 建議 |
-|---|---|---|---|---|---|---|---|
+| 代號 | 池子 | 評級 | 總分 | 排序分 | 主導edge | 動能特徵 | 層間判讀 | 建議 |
+|---|---|---|---|---|---|---|---|---|
 
-### 各池子內部排序（每個池子獨立一張）
+### 各池子內部排序(每個池子獨立一張)
 
-#### 池子 X：{名稱}（{n}檔）
+#### 池子 X：{名稱}({n}檔)
 
-| 代號 | 評級 | 總分 | 排序分 | 主導edge | L1 | L2 | L3 | L4 | L5 | 反轉 | 扣分 | 層間判讀 | 建議 |
+| 代號 | 評級 | 總分 | 排序分 | 主導edge | L1 | L2 | L3 | L4 | L5 | 動能加分 | 扣分 | 動能特徵 | 建議 |
 
 ---
 
 ## 輸出規則
 
-1. 不重複輸出市況（已在 Prompt M 完成）
-2. 個股每檔 ≤ 11 行
+1. 不重複輸出市況(已在 Prompt M 完成)
+2. 個股每檔 ≤ 12 行
 3. 排序依**排序分降序**
 4. 不寫總結段
-5. 樣本>30 檔時，跨池子總表前 10、各池子內前 5
+5. 樣本>30 檔時,跨池子總表前 10、各池子內前 5
 
 ## 資料
 
@@ -1076,14 +1116,26 @@ L6 當沖/分歧/smart_short = {n}
             final_prompt_a = prompt_a
         st.code(final_prompt_a, language="text")
 
-    with st.expander("🔥 提示詞 B：進攻名單 AI 判讀（需開網頁搜尋）", expanded=False):
-        prompt_b = r"""# 🔥 提示詞 B：進攻名單 AI 判讀
+    with st.expander("🔥 提示詞 B：動能右側進攻名單（需開網頁搜尋）", expanded=False):
+        prompt_b = r"""# 🔥 提示詞 B：動能右側進攻名單（獨立判斷）
 
-你是台股交易策略師，**不重新計分**，只做兩件事：
-1. **讀 Prompt A 的個股分數**，依市況脈絡判斷該進攻、觀察、還是排除
-2. **依新聞/川普/逆風觀點調整**，給出可下單的 Tier1/Tier2 清單
+你是台股**動能右側交易策略師**,風格:「灌溉鮮花、砍掉雜草,只追強勢、不撿便宜」。
 
-⚠️ **先開啟網頁搜尋**。每檔 ≤ 5 行。
+## 動能右側交易者的核心信條
+
+✅ **進場原則**:
+- 突破前高 → 追(帶量更佳)
+- 拉回不破關鍵位 → 接(強勢股回測 MA5/AVWAP/POC 上緣)
+- 帶量站穩盤整突破點 → 進
+- **強勢股不會給你便宜貨**,等回 5% 就是放棄
+
+❌ **絕對不做**:
+- 不買「跌深反彈」的弱勢股
+- 不買跌破均線/AVWAP/SuperTrend 的破線股
+- 不在下降趨勢摸底
+- 不為了「便宜」而違反趨勢
+
+⚠️ **先開啟網頁搜尋**。每檔 ≤ 6 行。
 
 ---
 
@@ -1103,21 +1155,18 @@ L6 當沖/分歧/smart_short = {n}
 建議現金比:{n}%(套用 M 建議)
 
 我在這次分析中會做的調整:
-├─ Tier1 門檻:排序分 ≥ {依激進度自填}
+├─ Tier1 標準:{依激進度自填}
 ├─ 部位修正係數:×{依激進度自填}
-├─ 偏好 edge:{依激進度自填 S1/S2/S4/S5}
+├─ 進場優先序:{突破/拉回不破/帶量站穩}
 └─ 大盤約束:{1-2 句具體}
-   例:「大盤週 RSI 80 過熱、ATR%2.1 → 對 RSI>75 個股部位再×0.7」
-   例:「大盤強勢但廣度差 → 我會避免推 RS<0 的個股」
-
-備註:今日所有判斷皆以此激進度為基準。
+   例:「大盤週 RSI 80 過熱、ATR 2.16 → 不追離 MA5>5% 的股;強勢股拉回 MA5 才進」
 ```
 
 ## 第二步:網頁搜尋(≤6 行)
 
 **S1 市場補充**:`VIX`、`美股 本週`、`台股 本週`
 **S2 川普動態**:`Trump latest`、`Trump tariff Taiwan`
-**S3 個股**:每檔搜 `[代號] 最新消息`
+**S3 個股**:每檔搜 `[代號] 最新消息`、`[代號] 法說`、`[代號] 營收`
 **S4 逆風觀點**:`[股] 利空`、`[產業] 泡沫`
 
 ### 搜尋彙整輸出
@@ -1129,91 +1178,184 @@ L6 當沖/分歧/smart_short = {n}
   {代號}:{🟢需求/🟡成本/🔴轉嫁}/{要點}/逆風{有無}
 ```
 
-## 第三步:對 Prompt A 結果做 AI 判讀(核心工作)
+## 第三步:候選股篩選(直接看 sector JSON 原始資料)
 
-**你的任務不是重算分數**,而是對 A 的每檔個股做「**脈絡詮釋**」。
+**A 的角色已完成**(海選掉爛股票)。
+**B 拿 sector JSON 原始資料重新判斷**,**不參考 A 的分數**。
 
-### 判讀矩陣
+### 動能右側強勢股篩選清單
 
-| A 的評級 | 你的判讀方向 |
-|---|---|
-| ★★★★★(≥80)| 確認是真鮮花還是過熱頂部 |
-| ★★★★☆(65-79)| 看 A 的「層間判讀」+ 新聞 → 升 Tier1 還是降 Tier2 |
-| ★★★☆☆(50-64)| 默認 Tier2,除非有強催化劑 |
-| ★★☆☆☆ 以下 | 默認排除,除非反轉訊號明確 |
-
-### 判讀關鍵問題(每檔必答)
-
-對每檔 ★★★★ 以上的個股,AI 必須回答:
-
-1. **A 的分數是真的還是虛的?**
-   - 有沒有「分數高但 RS 轉負」(虛高)
-   - 有沒有「過熱警示但 A 給高分」(過熱頂部)
-   - 有沒有「基本面強但籌碼弱」(題材退潮)
-
-2. **新聞/川普會不會改變判斷?**
-   - 利多 + A 給高分 → 確認進攻
-   - 利多但 A 給低分 → 利多有限,觀察
-   - 利空 + A 給高分 → 警戒,等回測再進
-   - 利空 + A 給低分 → 排除
-
-3. **市況約束怎麼套用?**
-   - 激進度 ≥ 65 → 寬鬆,A 的 Tier1 全採用
-   - 激進度 50-64 → 收緊,只取 A 的 ★★★★★
-   - 激進度 < 50 → 嚴格,必須有反轉訊號才進
-
-## 第四步:輸出 Tier1/Tier2/排除
-
-### Tier 1 進攻(每檔 ≤ 5 行)
+進入 Tier1 候選必須**全部符合**:
 
 ```
-【{代號}】★★★★☆ ({A 的分數}) | 主導 {edge}
-進場 {low}-{high} | 停損 {stop} | ATR {n}%
-🤖 AI 判讀:{≤25字 解釋為什麼採用 A 的分數,含市況脈絡}
-   例:「A 給 78 分 + 多頭背離 + 外資+5K → 反轉確認,激進度48仍可少量進」
-   例:「A 給 80 分但 RS 轉負 + 過熱警示 → 降為 Tier2 觀察」
-🌐 新聞催化:{要點+方向}(標來源/時間)
-部位:{n}%(基礎{n}% × 激進度修正{n} × 個股修正{n})
+□ trend_state ∈ (strong_uptrend / uptrend / strong_bottom_bounce)
+□ supertrend_bullish = true
+□ weekly_trend_state = uptrend
+□ rs_vs_bench_20d > 0(強過大盤)
+□ pos_52w_pct > 60(位於高位區)
+□ MA5 > MA20(短中期多頭排列)
+□ flag_inst_consensus_buy 或 foreign_accumulation_trend = accumulating
+```
+
+進入 Tier2 觀察必須**符合至少 5 條**:
+
+```
+□ trend_state ∈ (uptrend_pullback / consolidation)
+□ supertrend_bullish = true
+□ weekly_trend_state = uptrend
+□ flag_bullish_divergence_macd 或 _rsi(反轉訊號)
+□ chart_pattern_1 ∈ (falling_wedge confirmed / bull_flag confirmed)
+□ flag_bb_squeeze + 量增(壓縮後待噴)
+□ flag_supertrend_flip_bull = true(剛翻多)
+```
+
+### 直接淘汰
+
+任一觸發 → 排除:
+- trend_state ∈ (downtrend / strong_downtrend)
+- supertrend_bullish = false 且 weekly_trend_state ≠ uptrend
+- rs_vs_bench_20d < -3(跑輸大盤太多)
+- flag_day_trade_divergence + foreign_accumulation_trend = reducing
+
+## 第四步:進場區設定(動能右側專用)
+
+每檔 Tier1 必須選一種進場模式:
+
+### 模式 A:突破追進(最積極)
+
+適用:個股剛突破前高 / 突破盤整 / SuperTrend 翻多
+
+```
+進場:突破點 ~ 突破點+1.5%(不超過)
+條件:成交量 ≥ vol_ratio_5d × 1.2
+停損:跌破突破點 -1×ATR
+```
+
+### 模式 B:拉回不破均線(次積極)
+
+適用:強勢上升中、拉回測 MA5 / AVWAP
+
+```
+進場:MA5 ~ AVWAP(取較近者)
+條件:當日 K 棒站回 MA5 之上 + 收紅 K
+停損:跌破 MA20 或 -1.5×ATR
+```
+
+### 模式 C:站穩關鍵位(穩健)
+
+適用:盤整收斂、bb_squeeze + 即將突破
+
+```
+進場:盤整上緣突破點
+條件:突破當日量 ≥ 1.5× 5日均量
+停損:盤整下緣 -0.5×ATR
+```
+
+### 禁用模式(左側買法)
+
+❌ 不用 Fib 38.2/50/61.8 拉回作為進場(這是逆勢逢低)
+❌ 不用 POC(成交密集區)作為「跌深買點」
+❌ 不在 ma20_dev_pct < -3% 時進場(已破短期趨勢)
+
+## 第五步:Tier 標準(依激進度動態)
+
+| 激進度 | Tier1 條件 | 偏好模式 |
+|---|---|---|
+| ≥ 80 全力 | 全 7 條 + 任一進場模式 | 模式 A 突破追進 |
+| 65-79 積極 | 全 7 條 | 模式 A / B |
+| 50-64 中性 | 全 7 條 + ATR<5% + 不過熱 | 模式 B 拉回不破 |
+| 35-49 防禦 | 全 7 條 + RSI<70 + 反轉訊號 | 模式 C 站穩 |
+| 20-34 強防 | 暫停新進場 | 僅守持股 |
+| < 20 危機 | 全停 | 守 ETF |
+
+## 第六步:部位計算
+
+```
+基礎部位 × 激進度修正 × 個股修正
+
+基礎部位:Tier1=5-7%、Tier2=2-3%、核心ETF=15-25%
+
+激進度修正:
+- ≥80:×1.0
+- 65-79:×0.85
+- 50-64:×0.7
+- 35-49:×0.55
+- <35:×0.4
+
+個股修正:
+- pos_52w_pct > 95:×0.85(位置太高)
+- RSI > 75:×0.7(過熱)
+- ATR% > 5:×0.85(波動大)
+- 處置股:×0.5
+- flag_smart_short_signal:×0.85
+```
+
+## 第七步:輸出格式
+
+### Tier 1 進攻(每檔 ≤ 6 行)
+
+```
+【{代號}】{🟢需求/🟡成本/🔴轉嫁} | 模式{A/B/C}
+進場 {price 範圍}({進場條件,例:突破 X 帶量 / 拉回 MA5 不破 / 站穩 X+1%})
+停損 {stop}({依模式:跌破突破點/MA20/盤整下緣}) | ATR {n}%
+催化:{具體要點:營收/法說/題材,標日期/來源}
+🤖 我為什麼選它:{≤25字 動能右側視角}
+   例:「強勢突破前高、外資+8K、AVWAP上方、模式A追進」
+   例:「拉回 MA5 不破、量縮乾淨、明日法說催化、模式B接」
+部位:{n}%(基礎{n}% × 激進度 ×{n} × 個股 ×{n})
 ```
 
 ### Tier 2 觀察(每檔 ≤ 3 行)
 
 ```
-【{代號}】★★★☆☆ ({A 的分數})
-觸發條件:{站回 X 或 跌至 Y 不破} → 升 Tier1
-🤖 AI 判讀:{≤20字 為何降級或暫不進}
+【{代號}】觸發條件 → 升 Tier1
+具體:{站回 X 帶量 / 突破 Y / 站穩 Z 三日}
+🤖 為何只觀察:{≤20字}
 ```
 
 ### 排除區(一行帶過)
 
 ```
-{代號}:A 給 {n} 分,但 {主因排除:例如 RS 轉負/雙背離/題材退潮/激進度過低}
+{代號}:{破 MA20 / 跌破 ST / RS-5 / 主力出貨 / 弱勢反彈不追}
 ```
 
-## 第五步:資金配置
+## 第八步:資金配置
 
 ```
 現金 {套用 M 建議}%
 Tier1 {n}%(依激進度修正)
 Tier2 {n}%
-─ 修正:激進度 {n} × VIX {等級} × 過熱{n}檔
+──
+今日進攻意圖:{≤30字 例:「攻權值股突破,避中小型」}
 ```
 
-## 硬規則(A 已篩過,這裡再防最後一道)
+## 動能右側鐵則(最終檢查)
 
-1. trend_state=strong_downtrend → 強制排除(即使 A 沒篩到)
-2. 利空消息 + A 分數低 → 強制排除
-3. 川普行政命令直接衝擊 → 受影響股全排除
+在輸出之前每檔自問:
+
+1. **這檔是「順勢推進」還是「逆勢摸底」?** 後者一律排除
+2. **進場條件是「站穩」還是「跌深」?** 後者一律排除
+3. **停損是「破前低」還是「設保底」?** 必須是前者(趨勢破壞才出)
+4. **大盤激進度低 → 我有沒有不該追的還在追?** 有則降為 Tier2
+
+## 硬規則
+
+1. trend_state=strong_downtrend → 強制排除
+2. supertrend_bullish=false 且 weekly≠uptrend → 強制排除
+3. 利空消息直接衝擊 → 受影響股全排除
 4. 全不合格 → 「建議觀望」
-5. 川普口頭威脅 ≠ 基本面崩壞
+5. 川普口頭威脅 ≠ 基本面崩壞,但行政命令 ≠ 觀望
 6. 消息必標來源/時間
-7. 每檔 ≤ 5 行;不寫總結段
-8. **禁止重新計算 A 的個股分數**,只能詮釋
+7. 每檔 ≤ 6 行;不寫總結段
+8. **禁止逆勢逢低**(Fib 拉回 / POC 跌深 / 跌破均線買)
+9. **禁止參考 A 的分數**,B 獨立判斷
+10. 進場區若距現價 >3%(拉回過深)→ 改 Tier2 觀察
 
 ## 資料
 
 【貼上 Prompt M 的 🤖 AI 區段】
-【貼上 Prompt A 完整輸出】
+【貼上 sector_候選名單 JSON】
+(不需貼 A 的輸出 — B 獨立判斷)
 """
         # 動態組合：若有 M 結果，自動插入到 prompt 開頭
         m_result = st.session_state.get("prompt_m_ai_result", "").strip()
@@ -1230,14 +1372,20 @@ Tier2 {n}%
             final_prompt_b = prompt_b
         st.code(final_prompt_b, language="text")
 
-    with st.expander("🌸 提示詞 C：持股風控 AI 判讀(需開網頁搜尋)", expanded=False):
-        prompt_c = r"""# 🌸 提示詞 C：持股風控 AI 判讀
+    with st.expander("🌸 提示詞 C：動能右側持股風控（需開網頁搜尋）", expanded=False):
+        prompt_c = r"""# 🌸 提示詞 C：動能右側持股風控
 
-你是台股組合風控專家,**不重新計分**,只做兩件事:
-1. **對每檔持股給「鮮花/警戒/雜草」標籤**(簡單分類,非詳細計分)
-2. **依市況激進度決定減碼幅度**
+你是台股**動能右側組合風控專家**,原則「灌溉鮮花、砍掉雜草、順勢加碼、不留戀弱勢」。
 
-⚠️ **先開啟網頁搜尋**。每檔 ≤ 5 行。
+## 動能右側風控核心信條
+
+✅ **守鮮花**:強勢延續、量價齊揚、籌碼穩定 → 續抱或加碼
+✅ **早砍雜草**:動能轉弱的**早期警訊**就該行動,不等到雙破
+✅ **順勢加碼**:突破前高、拉回不破均線 → 加碼放大
+❌ **不為「成本」留戀**:跌破停損就是出,不問報酬率
+❌ **不在下降趨勢攤平**
+
+⚠️ **先開啟網頁搜尋**。每檔 ≤ 6 行。
 
 ---
 
@@ -1260,16 +1408,17 @@ Tier2 {n}%
 ├─ 鮮花處理:{加碼/續抱/減 X%}
 ├─ 警戒處理:{續抱/減 15%/減 30%}
 ├─ 雜草處理:{減 30%/減 50%/全出}
+├─ 加碼條件:{依激進度自填}
 └─ 大盤約束:{1-2 句具體}
-   例:「激進度 48 偏防禦 → 鮮花改設追漲停損鎖獲利」
-   例:「大盤週 RSI 80 過熱 → 高 beta 持股優先減碼」
+   例:「激進度 48 偏防禦 → 鮮花改設追漲停損鎖獲利、停加碼」
+   例:「大盤週 RSI 80 過熱 → 高 beta 持股優先減 20%」
 ```
 
 ## 第二步:網頁搜尋(≤6 行)
 
 **S1 系統性風險**:`VIX`、`Fed 利率`、`美中關係`
 **S2 川普動態**:`Trump latest`、`Trump China Taiwan`
-**S3 每檔持股**:`[代號] 最新消息`、`[公司] 法說會`
+**S3 每檔持股**:`[代號] 最新消息`、`[公司] 法說會`、`[代號] 營收`
 
 ### 搜尋彙整輸出
 
@@ -1280,89 +1429,148 @@ Tier2 {n}%
   {代號}:{🟢🟡🔴}{要點}
 ```
 
-## 第三步:簡化分類(不重複 A 的細分計分)
+## 第三步:動能右側分類(不依賴 A 分數)
 
-對每檔持股,依「**結構訊號**」+「**消息面**」做三類分類:
+獨立判斷,不參考 A 評級。
 
-### 🌸 鮮花(多項結構訊號全綠燈)
+### 🌸 鮮花(動能延續中)
 
-至少滿足 4 項:
-- trend_state ∈ (uptrend/strong_uptrend/strong_bottom_bounce)
-- supertrend_bullish=true
-- weekly_trend_state=uptrend
-- foreign_accumulation_trend=accumulating
-- rs_vs_bench_20d > 0
-- 報酬率 > 0
-- 消息面 🟢 需求驅動
+至少滿足 **5 項**:
 
-### 🪓 雜草(結構崩壞)
+```
+□ trend_state ∈ (uptrend / strong_uptrend)(不含 strong_bottom_bounce)
+□ supertrend_bullish = true
+□ weekly_trend_state = uptrend
+□ rs_vs_bench_20d > 0
+□ MA5 > MA20(短期動能延續)
+□ flag_price_up_vol_up=true 或 vol_ratio_5d > 1.0
+□ foreign_accumulation_trend=accumulating 或 flag_inst_consensus_buy
+□ 消息面 🟢 需求驅動 或 中性
+```
+
+### ⚠️ 警戒(動能轉弱早期警訊)⭐ 動能右側的關鍵
+
+任一觸發 → 警戒(**不要等到雙破才行動**):
+
+```
+□ rs_vs_bench_20d 從正轉負(題材退潮)
+□ flag_price_up_vol_down=true(漲價量縮,動能枯竭)
+□ MA5 跌破 MA20(短期多頭失守)
+□ flag_bearish_divergence_macd 或 _rsi(背離警告)
+□ flag_supertrend_flip_bear(剛轉空,最早警訊)
+□ vol_ratio_5d 連 3 日 < 0.7(明顯量縮)
+□ trend_state 從 uptrend 變 top_pullback 或 consolidation
+□ flag_inst_consensus_sell(法人共識賣超)
+□ 消息面 🟡 中性偏空(題材熄火)
+□ trend_state = strong_bottom_bounce(左側反彈,動能交易者不該長抱)
+```
+
+### 🪓 雜草(結構已破,立即處理)
 
 任一觸發:
-- trend_state=strong_downtrend
-- supertrend_bullish=false 且 weekly=downtrend
-- flag_inst_consensus_sell=true 連 3 日
-- foreign_accumulation_trend=reducing 且 rs_vs_bench_20d<-5
-- 消息面 🔴 利空且未反映完
-- A 評為 ★★ 以下(如 A 報告中有提到)
 
-### ⚠️ 警戒(介於兩者之間)
+```
+□ trend_state ∈ (downtrend / strong_downtrend)
+□ supertrend_bullish = false(單一就破,不要等雙破)
+□ weekly_trend_state = downtrend
+□ flag_inst_consensus_sell 連 3 日
+□ foreign_accumulation_trend=reducing 且 rs_vs_bench_20d<-3
+□ 消息面 🔴 利空未消化
+□ 報酬 < -7%(不問結構,停損紀律)
+□ 跌破個股原進場時設定的停損點
+```
 
-不符合鮮花、也未崩壞 → 警戒
+## 第四步:依激進度決定操作(動能右側專用)
 
-## 第四步:依激進度決定操作(核心)
-
-| 持股分類 | 激進度≥65 | 激進度50-64 | 激進度35-49 | 激進度<35 |
+| 持股分類 | 激進度≥65 全力/積極 | 激進度50-64 中性 | 激進度35-49 防禦 | 激進度<35 強防 |
 |---|---|---|---|---|
-| 🌸 鮮花 | 加碼 10-20% | **續抱** | 續抱 + 追漲停損 | 減 20% 鎖獲利 |
+| 🌸 鮮花(基礎)| 續抱 | 續抱 | 續抱+追漲停損 | 減 20% 鎖獲利 |
+| 🌸 鮮花+加碼訊號 | **加碼 10-20%** | **加碼 5-10%** | 續抱(不加)| 減 20% 鎖獲利 |
+| 🌸 鮮花+獲利>20% | 部分鎖利 5-10% | 部分鎖利 10-15% | 部分鎖利 20% | 減 30% 鎖獲利 |
 | ⚠️ 警戒 | 續抱不加 | 減 15% | 減 30% | 減 50% |
 | 🪓 雜草 | 減 30% | 減 50% | **全出** | 全出 |
 
-## 第五步:每檔輸出(5 行)
+### 動能加碼訊號(鮮花持股額外檢查)
+
+任一符合 + 鮮花 → 可加碼:
 
 ```
-【{代號} {symbol}】🌸/⚠️/🪓
-持倉 {shares}@{avg} 現{close} 報酬 {ret}%
-🤖 AI 判讀:{≤30字 為什麼這樣分類,含市況脈絡}
-   例:「結構全綠+外資累積 = 鮮花;激進度 48 → 續抱但設追漲停損」
-   例:「RS轉負+雙背離+題材退潮 = 警戒;激進度 48 → 減 30%」
+□ 突破前高帶量(pos_52w_pct>92 + flag_price_up_vol_up)
+□ flag_supertrend_flip_bull=true(剛轉多)
+□ flag_bb_squeeze_fire=true(壓縮後爆發)
+□ 拉回 MA5 不破 + 量縮乾淨(vol_ratio_5d<0.8 且收紅 K)
+```
+
+## 第五步:追漲停損計算(動能右側紀律)⭐
+
+對所有 🌸 鮮花持股,計算追漲停損:
+
+```
+追漲停損公式(取較高者):
+A. 個股:close - 1.5 × ATR14
+B. 個股:max(MA20, MA5 × 0.97)
+C. 個股報酬 > 20%:成本 × 1.10(鎖至少 10% 獲利)
+
+最終追漲停損 = max(A, B, C)
+```
+
+範例:
+- 0050 成本 75.9,現價 89.95(+18.5%),ATR 1.5%
+- A: 89.95 - 1.5×1.35 = 87.93
+- B: max(MA20=86, MA5×0.97=85.8) = 86
+- C: 75.9 × 1.10 = 83.49
+- **追漲停損 = max(87.93, 86, 83.49) = 87.93**
+
+## 第六步:每檔輸出(6 行)
+
+```
+【{代號} {symbol}】🌸/⚠️/🪓 ({加碼訊號:Y/N})
+持倉 {shares}@{avg} 現{close} 報酬 {ret}% | 持有 {n} 日
+🔍 結構訊號:trend{n}/ST{n}/週{n}/RS{n}/MA5/MA20{n}/量價{n} → {綠/黃/紅燈數}
 🌐 消息:{要點+影響}(標來源/時間)
-💭 決策:{續抱/減X%/全出} 停損{stop} 風險:{≤15字}
+🤖 動能視角:{≤30字 解讀動能狀態 + 市況約束}
+   例:「強勢延續+突破前高+外資累積=鮮花+加碼訊號;激進度 48 → 加碼 10%」
+   例:「MA5 跌破 MA20+量縮+RS轉負=警戒早期;激進度 48 → 減 30% 不留戀」
+💭 決策:{續抱/加碼X%/減X%/全出} 停損{追漲停損計算結果} 風險:{≤15字}
 ```
 
-## 第六步:持股總表
+## 第七步:持股總表
 
-| 代號 | 🌸⚠️🪓 | 報酬% | 結構 | 消息 | 大盤約束 | 決策 |
-|---|---|---|---|---|---|---|
+| 代號 | 🌸⚠️🪓 | 加碼Y/N | 報酬% | 持有天數 | 結構 | 消息 | 動能視角 | 決策 |
+|---|---|---|---|---|---|---|---|---|
 
 ## 反向審計(2 行)
 
 - 續抱最大風險:{≤15字}
 - 賣出可能錯過:{≤15字}
 
-## 組合總結(4 行)
+## 組合總結(5 行)
 
-- 🌸/⚠️/🪓 比例:X / Y / Z
+- 🌸/⚠️/🪓 比例:X / Y / Z(鮮花<30% 警示)
+- 加碼候選:{n} 檔
 - 川普曝險:{高/中/低}
 - 建議現金比:**{直接套用 Prompt M 建議}**
-- 集中度:{若單股市值>30% 警示 — 用 股數×現價計算實際市值佔比,禁用 position_size_pct}
+- 集中度:{用 股數×現價 計算;單股>30% 警示;禁用 position_size_pct}
 
-## 硬規則
+## 硬規則(動能右側專用)
 
-1. trend_state=strong_downtrend 或 supertrend_bullish=false+weekly=downtrend → 不續抱
-2. 川普行政命令直接衝擊 + 技術已破 → 即減 50%
-3. 續抱必附停損;停損觸及必執行
-4. 雜草 >50% → 「組合需大幅調整」
-5. 激進度 < 20 → 鮮花也減 ≥30%
-6. 川普口頭威脅 ≠ 實質政策
-7. 每檔 ≤ 5 行
-8. **集中度計算用實際股數×現價,禁用 position_size_pct**
-9. **禁止重新計算 A 的個股分數**
+1. supertrend_bullish=false → **單一條件就減碼**(不等雙破)
+2. 跌破個股進場時設的停損點 → **無條件全出**(紀律第一)
+3. 報酬 < -7% 不問結構 → **強制停損**
+4. 川普行政命令直接衝擊 + 技術已破 → 即減 50%
+5. 雜草 >50% → 「組合需大幅調整」
+6. 激進度 < 20 → 鮮花也減 ≥30%(保留現金)
+7. 川普口頭威脅 ≠ 實質政策(行政命令才算)
+8. 每檔 ≤ 6 行
+9. **集中度計算用實際股數×現價,禁用 position_size_pct**
+10. **C 獨立判斷,不參考 A 的分數**
+11. **strong_bottom_bounce 不歸鮮花**(左側反轉,動能交易者警戒)
+12. 加碼僅在「鮮花 + 加碼訊號 + 激進度 ≥ 50」時才執行
 
 ## 持股資料
 
 【貼上 Prompt M 的 🤖 AI 區段】
 【貼上 sector_持股 JSON】
-(可選)【貼上 Prompt A 對持股的評分結果】
 """
         # 動態組合：若有 M 結果，自動插入到 prompt 開頭
         m_result = st.session_state.get("prompt_m_ai_result", "").strip()
@@ -1843,7 +2051,34 @@ with tab6:
 
         if features.get("data_quality", {}).get("twii_available"):
             snapshot_date = features.get("snapshot_date", "?")
-            st.success(f"✓ 大盤資料抓取成功（{snapshot_date}）")
+            actual_data_date = features.get("actual_data_date")
+            data_lag_days = features.get("data_lag_days", 0)
+            
+            if data_lag_days and data_lag_days > 2:
+                st.error(
+                    f"⚠️ **資料延遲警示** — 你選的日期 **{snapshot_date}**，"
+                    f"但 Yahoo Finance 此刻能抓到的最新 TWII 資料是 **{actual_data_date}**"
+                    f"（落後 {data_lag_days} 天）。"
+                )
+                st.warning(
+                    "💡 **可能原因 + 解法**：\n"
+                    "1. Yahoo Finance 對 `^TWII` 的更新偶發延遲（特別是非美股交易時段）\n"
+                    "2. Streamlit Cloud 進程內 yfinance 套件持有舊快取\n"
+                    "3. **解法 A**：等 5-10 分鐘再點「🌐 抓取大盤狀態」重試\n"
+                    "4. **解法 B**：點側邊欄 ⋮ → Reboot app 重啟 Streamlit 進程\n"
+                    "5. **解法 C**：把日期改選為 `actual_data_date` ({}) 接受目前資料".format(actual_data_date)
+                )
+            else:
+                st.success(f"✓ 大盤資料抓取成功（{snapshot_date}）")
+            
+            # 顯示資料來源
+            data_source = features.get("data_source", "FinMind")
+            if data_source == "FinMind":
+                st.caption(f"📡 資料來源：FinMind（主要）")
+            elif "yfinance" in data_source and "備援" in data_source:
+                st.warning(f"⚠️ 資料來源：**{data_source}**（FinMind 失敗時的後備，資料可能較舊）")
+            else:
+                st.caption(f"📡 資料來源：{data_source}")
 
             # 第一排：價格與波動指標
             st.markdown("### 📈 大盤關鍵指標")
