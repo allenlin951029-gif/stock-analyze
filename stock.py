@@ -3927,7 +3927,8 @@ def _finmind_taiex_fetch(start_date: str, end_date: str) -> pd.DataFrame:
 
 def _fetch_taiex_with_fallback(as_of_date=None, lookback_days: int = 730) -> tuple:
     """
-    抓加權指數，先試 yfinance，落後 >2 天就改用 FinMind 備援。
+    抓加權指數 — 直接用 FinMind 為主（yfinance 對 ^TWII 經常延遲）。
+    只在 FinMind 完全失敗時才退回 yfinance。
     
     Returns: (df_daily, source_name, fallback_used)
     """
@@ -3938,39 +3939,20 @@ def _fetch_taiex_with_fallback(as_of_date=None, lookback_days: int = 730) -> tup
         except Exception:
             target_date = datetime.now().date()
     
-    # 嘗試 1：yfinance
-    twii_yf = _download_yf("^TWII", "2y", "1d")
-    if not twii_yf.empty and len(twii_yf) >= 60:
-        latest_yf = twii_yf.index[-1].date()
-        days_lag = (pd.Timestamp(target_date) - pd.Timestamp(latest_yf)).days
-        
-        if days_lag <= 2:
-            # yfinance 資料夠新，直接用
-            return twii_yf, "yfinance", False
-        else:
-            logger.info(f"yfinance ^TWII 落後 {days_lag} 天，嘗試 FinMind 備援")
-    
-    # 嘗試 2：FinMind 備援
+    # 主要：FinMind TAIEX（最即時，每天盤後更新）
     end_date = target_date.strftime("%Y-%m-%d")
     start_date = (target_date - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     twii_fm = _finmind_taiex_fetch(start_date, end_date)
     
     if not twii_fm.empty and len(twii_fm) >= 60:
-        latest_fm = twii_fm.index[-1].date()
-        days_lag_fm = (pd.Timestamp(target_date) - pd.Timestamp(latest_fm)).days
-        # FinMind 比 yfinance 新就用 FinMind；否則用最大者
-        if not twii_yf.empty:
-            latest_yf = twii_yf.index[-1].date()
-            if latest_fm > latest_yf:
-                return twii_fm, "FinMind", True
-            else:
-                # FinMind 沒比較新，繼續用 yfinance
-                return twii_yf, "yfinance (FinMind 無更新)", False
-        return twii_fm, "FinMind", True
+        logger.info(f"FinMind TAIEX 抓取成功，最新資料 {twii_fm.index[-1].date()}")
+        return twii_fm, "FinMind", False
     
-    # 兩個都失敗 → 回傳 yfinance（即使舊也好過沒有）
-    if not twii_yf.empty:
-        return twii_yf, "yfinance (FinMind 失敗)", False
+    # 備援：yfinance ^TWII（FinMind 失敗才用）
+    logger.warning("FinMind TAIEX 失敗，退回 yfinance")
+    twii_yf = _download_yf("^TWII", "2y", "1d")
+    if not twii_yf.empty and len(twii_yf) >= 60:
+        return twii_yf, "yfinance (FinMind 失敗備援)", True
     
     return pd.DataFrame(), "全部失敗", False
 
@@ -4011,32 +3993,29 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
     # --------- 1. 下載 TWII 日線 + 週線（含 FinMind 備援）----------
     twii, source_used, fallback_used = _fetch_taiex_with_fallback(as_of_date)
     if twii.empty or len(twii) < 60:
-        result["data_quality"]["warnings"].append("TWII 日線資料不足（yfinance + FinMind 都失敗）")
+        result["data_quality"]["warnings"].append("TWII 日線資料不足（FinMind + yfinance 都失敗）")
         return result
     
-    # 紀錄資料來源（讓使用者知道用了哪個）
+    # 紀錄資料來源
     result["data_source"] = source_used
     if fallback_used:
         result["data_quality"]["warnings"].append(
-            f"⚠️ yfinance 資料延遲，已自動切換至 FinMind 備援"
+            f"⚠️ FinMind 失敗，已退回 yfinance 備援（資料可能較舊）"
         )
     
-    # 週線：先試 yfinance；如果日線用了 FinMind，週線從 FinMind 日線重新採樣
-    twii_w = _download_yf("^TWII", "2y", "1wk")
-    if twii_w.empty or len(twii_w) < 20:
-        # yfinance 週線失敗 → 從日線重新採樣
-        try:
-            twii_w = twii.resample("W-FRI").agg({
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Volume": "sum",
-            }).dropna(subset=["Close"])
-            logger.info(f"週線從日線重新採樣，共 {len(twii_w)} 週")
-        except Exception as e:
-            logger.warning(f"日線轉週線失敗: {e}")
-            twii_w = pd.DataFrame()
+    # 週線：直接從日線重新採樣（FinMind 沒有獨立週線端點，且自製 resample 最一致）
+    try:
+        twii_w = twii.resample("W-FRI").agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+        }).dropna(subset=["Close"])
+        logger.info(f"週線從日線重新採樣，共 {len(twii_w)} 週")
+    except Exception as e:
+        logger.warning(f"日線轉週線失敗: {e}")
+        twii_w = pd.DataFrame()
 
     result["data_quality"]["twii_available"] = True
 
