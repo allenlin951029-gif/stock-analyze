@@ -2642,10 +2642,10 @@ with tab6:
 # --- Tab 7: 進攻名單追蹤 ---
 with tab7:
     st.header("🎯 進攻名單追蹤")
-    st.caption("記錄不同 AI（Claude/GPT/Gemini 等）對每檔股票的 Prompt B 判斷，方便後續比對誰準")
+    st.caption("記錄不同 AI（Claude/GPT/Gemini 等）對每檔股票的 Prompt B 判斷原文")
 
     # ============================================
-    # 日期選擇 + 名單管理
+    # 日期選擇
     # ============================================
     al_col1, al_col2, al_col3 = st.columns([1.2, 1, 1])
 
@@ -2667,7 +2667,6 @@ with tab7:
     with al_col3:
         st.write("")
         st.write("")
-        # 顯示該日有幾筆紀錄
         today_list = st.session_state.attack_list.get(attack_date_str, [])
         st.metric("該日股票數", len(today_list))
 
@@ -2676,6 +2675,8 @@ with tab7:
     # ============================================
     # 新增股票區
     # ============================================
+    today_list = st.session_state.attack_list.get(attack_date_str, [])
+
     with st.expander("➕ 新增股票到當日進攻名單", expanded=(len(today_list) == 0)):
         ns_col1, ns_col2, ns_col3 = st.columns([1, 2, 1])
         with ns_col1:
@@ -2698,7 +2699,6 @@ with tab7:
                 if not sid:
                     st.error("請輸入股票代號")
                 else:
-                    # 檢查是否已存在
                     today_list_check = st.session_state.attack_list.get(attack_date_str, [])
                     existing = [s["stock_id"] for s in today_list_check]
                     if sid in existing:
@@ -2733,149 +2733,66 @@ with tab7:
             # 標題列
             title_text = f"【{sid}】{sname}" if sname else f"【{sid}】"
             if judgments:
-                # 顯示有幾個 AI 判斷
                 ai_sources = ", ".join([j["ai_source"] for j in judgments])
-                title_text += f"  —  {len(judgments)} 個判斷（{ai_sources}）"
+                title_text += f"  —  {len(judgments)} 個 AI（{ai_sources}）"
+            else:
+                title_text += "  —  尚無 AI 判斷"
 
             with st.expander(title_text, expanded=False):
                 # 顯示已有的 AI 判斷
                 if judgments:
-                    st.markdown("##### 📊 AI 判斷比較")
-
-                    # 比較表（簡要）
-                    comparison_data = []
-                    for j in judgments:
-                        comparison_data.append({
-                            "AI": j.get("ai_source", "?"),
-                            "Tier": j.get("tier", "?"),
-                            "進場區": f"{j.get('entry_low', '-')} ~ {j.get('entry_high', '-')}",
-                            "停損": j.get("stop_loss", "-"),
-                            "部位%": j.get("position_pct", "-"),
-                            "動能評分": f"{j.get('momentum_score', '-')} {j.get('momentum_level', '')}",
-                            "edge": j.get("dominant_edge", "-"),
-                        })
-                    st.dataframe(comparison_data, use_container_width=True)
-
-                    st.markdown("##### 📝 詳細記錄")
                     for j_idx, j in enumerate(judgments):
                         with st.container(border=True):
-                            jc1, jc2, jc3 = st.columns([2, 2, 1])
+                            jc1, jc2 = st.columns([4, 1])
                             with jc1:
                                 st.markdown(f"**🤖 {j.get('ai_source', '?')}**")
                                 st.caption(f"建立於：{j.get('created_at', '-')}")
                             with jc2:
-                                st.markdown(f"**Tier**: `{j.get('tier', '?')}` | **Edge**: `{j.get('dominant_edge', '?')}`")
-                                st.markdown(f"**進場**: {j.get('entry_low', '-')} ~ {j.get('entry_high', '-')} | **停損**: {j.get('stop_loss', '-')}")
-                                st.markdown(f"**部位**: {j.get('position_pct', '-')}% | **動能**: {j.get('momentum_score', '-')} {j.get('momentum_level', '')}")
-                            with jc3:
                                 if st.button("🗑️ 刪除", key=f"del_judgment_{stock_idx}_{j_idx}_{attack_date_str}"):
                                     st.session_state.attack_list[attack_date_str][stock_idx]["ai_judgments"].pop(j_idx)
                                     save_attack_list_to_db(st.session_state.attack_list)
                                     st.rerun()
 
-                            # 完整原文
+                            # 完整原文直接顯示
                             raw = j.get("raw_text", "").strip()
                             if raw:
-                                with st.expander("📄 完整 AI 輸出", expanded=False):
-                                    st.code(raw, language="text")
-
+                                st.code(raw, language="text")
                 else:
                     st.info("尚未有任何 AI 判斷。請在下方新增。")
 
                 # ----------------------------------------
-                # 新增 AI 判斷區
+                # 新增 AI 判斷區（只有來源 + 原文）
                 # ----------------------------------------
                 st.markdown("---")
                 st.markdown("##### ➕ 新增 AI 判斷")
 
                 form_key = f"add_judgment_{stock_idx}_{attack_date_str}"
                 with st.form(key=form_key, clear_on_submit=True):
-                    fc1, fc2, fc3 = st.columns(3)
-
-                    with fc1:
-                        ai_source = st.selectbox(
-                            "AI 來源",
-                            ["Claude", "GPT", "Gemini", "Grok", "其他"],
-                            key=f"ai_src_{form_key}"
-                        )
-                        tier = st.selectbox(
-                            "Tier 分類",
-                            ["Tier1-A", "Tier1-B", "Tier2-A", "Tier2-B", "軟排除", "硬排除"],
-                            key=f"tier_{form_key}"
-                        )
-
-                    with fc2:
-                        entry_low = st.number_input(
-                            "進場區下限",
-                            min_value=0.0, step=0.5, format="%.2f",
-                            key=f"entry_low_{form_key}"
-                        )
-                        entry_high = st.number_input(
-                            "進場區上限",
-                            min_value=0.0, step=0.5, format="%.2f",
-                            key=f"entry_high_{form_key}"
-                        )
-                        stop_loss = st.number_input(
-                            "停損價",
-                            min_value=0.0, step=0.5, format="%.2f",
-                            key=f"stop_{form_key}"
-                        )
-
-                    with fc3:
-                        position_pct = st.number_input(
-                            "部位 %",
-                            min_value=0.0, max_value=30.0, step=0.5, format="%.2f",
-                            key=f"pos_{form_key}"
-                        )
-                        momentum_score = st.number_input(
-                            "動能評分（0-100）",
-                            min_value=0, max_value=100, step=5,
-                            key=f"mscore_{form_key}"
-                        )
-                        momentum_level = st.selectbox(
-                            "動能等級",
-                            ["🚀 爆發", "💪 續強", "⚡ 偏熱", "🌊 普通", "（無）"],
-                            key=f"mlevel_{form_key}"
-                        )
-
-                    fc4, fc5 = st.columns(2)
-                    with fc4:
-                        dominant_edge = st.selectbox(
-                            "主導 edge",
-                            ["S1+", "S1", "S3", "S4", "S5", "（無）"],
-                            key=f"edge_{form_key}"
-                        )
-
-                    raw_text = st.text_area(
-                        "完整 AI 原文（必填，貼整段 Prompt B 對該股的輸出）",
-                        height=200,
-                        key=f"raw_{form_key}",
-                        placeholder="""【2330】Tier1-A 🟢需求驅動 | 模式 A
-進場 1850-1880（突破前高+量增）
-停損 1820 | ATR 2.4% | RR 1.8
-催化：法說會 4/30、外資+8K
-🔥 動能評分：RS 18/ADX 38/RSI 72/BB 85/Vol 1.4 = 💪續強（總分 75）
-🤖 我為什麼選它：強勢突破前高、AVWAP 上方、模式 A 追進
-👁️ 監控訊號：跌破 1820 / 量縮 < 0.7 / RSI 跌破 70 → 立即降階
-部位：4%（基礎 5% × 激進度 ×0.85 × 個股 ×1.0）"""
+                    ai_source = st.selectbox(
+                        "AI 來源",
+                        ["Claude", "GPT", "Gemini", "Grok", "DeepSeek", "其他"],
+                        key=f"ai_src_{form_key}"
                     )
 
-                    submit_btn = st.form_submit_button("💾 儲存 AI 判斷", type="primary", use_container_width=True)
+                    raw_text = st.text_area(
+                        "完整 AI 原文",
+                        height=300,
+                        key=f"raw_{form_key}",
+                        placeholder="貼整段 Prompt B 對該股的輸出..."
+                    )
+
+                    submit_btn = st.form_submit_button(
+                        "💾 儲存",
+                        type="primary",
+                        use_container_width=True
+                    )
 
                     if submit_btn:
                         if not raw_text.strip():
-                            st.error("請貼上完整 AI 原文")
+                            st.error("請貼上 AI 原文")
                         else:
                             new_judgment = {
                                 "ai_source": ai_source,
-                                "tier": tier,
-                                "entry_low": float(entry_low) if entry_low > 0 else None,
-                                "entry_high": float(entry_high) if entry_high > 0 else None,
-                                "stop_loss": float(stop_loss) if stop_loss > 0 else None,
-                                "position_pct": float(position_pct) if position_pct > 0 else None,
-                                "momentum_score": int(momentum_score) if momentum_score > 0 else None,
-                                "momentum_level": momentum_level if momentum_level != "（無）" else "",
-                                "dominant_edge": dominant_edge if dominant_edge != "（無）" else "",
                                 "raw_text": raw_text.strip(),
                                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                             }
