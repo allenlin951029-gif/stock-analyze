@@ -2761,45 +2761,44 @@ with tab7:
                     st.info("尚未有任何 AI 判斷。請在下方新增。")
 
                 # ----------------------------------------
-                # 新增 AI 判斷區（只有來源 + 原文）
+                # 新增 AI 判斷區（可折疊，預設收起）
                 # ----------------------------------------
                 st.markdown("---")
-                st.markdown("##### ➕ 新增 AI 判斷")
+                with st.expander("➕ 新增 AI 判斷（點此展開）", expanded=False):
+                    form_key = f"add_judgment_{stock_idx}_{attack_date_str}"
+                    with st.form(key=form_key, clear_on_submit=True):
+                        ai_source = st.selectbox(
+                            "AI 來源",
+                            ["Claude", "GPT", "Gemini", "Grok", "DeepSeek", "其他"],
+                            key=f"ai_src_{form_key}"
+                        )
 
-                form_key = f"add_judgment_{stock_idx}_{attack_date_str}"
-                with st.form(key=form_key, clear_on_submit=True):
-                    ai_source = st.selectbox(
-                        "AI 來源",
-                        ["Claude", "GPT", "Gemini", "Grok", "DeepSeek", "其他"],
-                        key=f"ai_src_{form_key}"
-                    )
+                        raw_text = st.text_area(
+                            "完整 AI 原文",
+                            height=300,
+                            key=f"raw_{form_key}",
+                            placeholder="貼整段 Prompt B 對該股的輸出..."
+                        )
 
-                    raw_text = st.text_area(
-                        "完整 AI 原文",
-                        height=300,
-                        key=f"raw_{form_key}",
-                        placeholder="貼整段 Prompt B 對該股的輸出..."
-                    )
+                        submit_btn = st.form_submit_button(
+                            "💾 儲存",
+                            type="primary",
+                            use_container_width=True
+                        )
 
-                    submit_btn = st.form_submit_button(
-                        "💾 儲存",
-                        type="primary",
-                        use_container_width=True
-                    )
-
-                    if submit_btn:
-                        if not raw_text.strip():
-                            st.error("請貼上 AI 原文")
-                        else:
-                            new_judgment = {
-                                "ai_source": ai_source,
-                                "raw_text": raw_text.strip(),
-                                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            }
-                            st.session_state.attack_list[attack_date_str][stock_idx]["ai_judgments"].append(new_judgment)
-                            save_attack_list_to_db(st.session_state.attack_list)
-                            st.success(f"已儲存 {ai_source} 的判斷")
-                            st.rerun()
+                        if submit_btn:
+                            if not raw_text.strip():
+                                st.error("請貼上 AI 原文")
+                            else:
+                                new_judgment = {
+                                    "ai_source": ai_source,
+                                    "raw_text": raw_text.strip(),
+                                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                }
+                                st.session_state.attack_list[attack_date_str][stock_idx]["ai_judgments"].append(new_judgment)
+                                save_attack_list_to_db(st.session_state.attack_list)
+                                st.success(f"已儲存 {ai_source} 的判斷")
+                                st.rerun()
 
                 # 刪除整檔股票
                 st.markdown("---")
@@ -2843,6 +2842,124 @@ with tab7:
                 key="download_attack_list_backup",
                 use_container_width=True
             )
+
+    # ============================================
+    # 📤 匯入 JSON 檔（還原備份 / 跨裝置匯入）
+    # ============================================
+    with st.expander("📤 匯入 JSON 檔（還原備份）", expanded=False):
+        st.caption(
+            "上傳之前下載的「attack_list_backup_xxx.json」備份檔。"
+            "可以選擇『合併』(保留現有資料 + 加入上傳的) 或『覆蓋』(完全取代)。"
+        )
+
+        uploaded_attack_json = st.file_uploader(
+            "選擇 JSON 檔",
+            type=["json"],
+            key="upload_attack_list_json"
+        )
+
+        # 解析上傳檔
+        uploaded_data = None
+        if uploaded_attack_json is not None:
+            try:
+                raw = uploaded_attack_json.read().decode("utf-8")
+                uploaded_data = json.loads(raw)
+
+                if not isinstance(uploaded_data, dict):
+                    st.error("⚠️ JSON 格式錯誤：應為日期 → 股票清單的字典")
+                    uploaded_data = None
+                else:
+                    # 預覽匯入內容
+                    upload_dates = sorted(uploaded_data.keys(), reverse=True)
+                    upload_summary = []
+                    for d in upload_dates:
+                        if not isinstance(uploaded_data[d], list):
+                            continue
+                        stocks = uploaded_data[d]
+                        stock_count = len(stocks)
+                        judgment_count = sum(
+                            len(s.get("ai_judgments", []))
+                            for s in stocks if isinstance(s, dict)
+                        )
+                        stock_ids = ", ".join([
+                            s.get("stock_id", "?")
+                            for s in stocks if isinstance(s, dict)
+                        ])
+                        upload_summary.append({
+                            "日期": d,
+                            "股票數": stock_count,
+                            "AI 判斷總數": judgment_count,
+                            "股票清單": stock_ids[:50] + ("..." if len(stock_ids) > 50 else "")
+                        })
+
+                    st.success(f"✓ 解析成功：{len(upload_dates)} 個日期")
+                    st.dataframe(upload_summary, use_container_width=True)
+
+            except json.JSONDecodeError as e:
+                st.error(f"⚠️ JSON 解析失敗：{e}")
+                uploaded_data = None
+            except Exception as e:
+                st.error(f"⚠️ 讀取失敗：{e}")
+                uploaded_data = None
+
+        # 兩個按鈕：合併 / 覆蓋
+        if uploaded_data is not None:
+            st.markdown("---")
+            mode_col1, mode_col2 = st.columns(2)
+
+            with mode_col1:
+                if st.button(
+                    "🔀 合併匯入（保留現有 + 加入上傳）",
+                    use_container_width=True,
+                    key="btn_merge_import",
+                    type="primary"
+                ):
+                    merged = dict(st.session_state.attack_list)
+                    added_dates = 0
+                    added_stocks = 0
+                    added_judgments = 0
+                    for d, stocks in uploaded_data.items():
+                        if not isinstance(stocks, list):
+                            continue
+                        if d not in merged:
+                            merged[d] = []
+                            added_dates += 1
+                        # 合併：以 stock_id 為 key
+                        existing_ids = {s["stock_id"] for s in merged[d] if isinstance(s, dict) and "stock_id" in s}
+                        for stock in stocks:
+                            if not isinstance(stock, dict) or "stock_id" not in stock:
+                                continue
+                            if stock["stock_id"] in existing_ids:
+                                # 已存在，合併 ai_judgments
+                                for existing in merged[d]:
+                                    if existing.get("stock_id") == stock["stock_id"]:
+                                        new_js = stock.get("ai_judgments", [])
+                                        existing.setdefault("ai_judgments", []).extend(new_js)
+                                        added_judgments += len(new_js)
+                                        break
+                            else:
+                                merged[d].append(stock)
+                                added_stocks += 1
+                                added_judgments += len(stock.get("ai_judgments", []))
+                    st.session_state.attack_list = merged
+                    save_attack_list_to_db(merged)
+                    st.success(
+                        f"✓ 合併完成：新增 {added_dates} 個日期、{added_stocks} 檔股票、"
+                        f"{added_judgments} 筆 AI 判斷"
+                    )
+                    st.rerun()
+
+            with mode_col2:
+                if st.button(
+                    "♻️ 覆蓋匯入（完全取代現有）",
+                    use_container_width=True,
+                    key="btn_replace_import",
+                    type="secondary"
+                ):
+                    st.session_state.attack_list = uploaded_data
+                    save_attack_list_to_db(uploaded_data)
+                    st.success("✓ 已完全取代為上傳的資料")
+                    st.rerun()
 
 # -------------------------
 # Auto Refresh Logic
