@@ -2504,7 +2504,32 @@ def _calc_relative_strength_with_bench(stock_df, bench_df, period=20):
 # ===================================================================
 
 
-def classify_trend(c: float, ma5: float, ma20: float, ma60: float, adx_val: float) -> tuple:
+def classify_trend(c: float, ma5, ma20, ma60, adx_val: float) -> tuple:
+    """
+    [NEW] 容忍 ma5/ma20/ma60 為 None (新上市股票歷史不足)。
+    - ma20 None: 一律回 consolidation
+    - ma60 None: 用 MA5/MA20 簡化分類,沒有 bottom_bounce / top_pullback
+    """
+    adx_val = float(adx_val) if adx_val is not None else 0.0
+
+    if ma20 is None:
+        return "consolidation", _adx_strength(adx_val)
+
+    if ma60 is None:
+        # 短歷史:只有 MA5 + MA20 + close
+        if ma5 is not None and c > ma20 and ma5 > ma20:
+            base = "uptrend"
+        elif ma5 is not None and c < ma20 and ma5 < ma20:
+            base = "downtrend"
+        else:
+            return "consolidation", _adx_strength(adx_val)
+        prefix = "strong_" if adx_val >= 25 else "weak_"
+        return prefix + base, _adx_strength(adx_val)
+
+    # 完整歷史
+    if ma5 is None:
+        ma5 = ma20  # fallback,讓比較不炸
+
     if c > ma20 > ma60 and ma5 > ma20:
         base = "uptrend"
     elif c > ma20 > ma60 and ma5 <= ma20:
@@ -2765,13 +2790,22 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         return {"error": "no data before date", "symbol": stock_id}
 
     df = df_daily.loc[:chosen_ts].copy()
-    if len(df) < 60:
+    # [NEW] 硬門檻從 60 降到 30 — 讓新上市 ETF (例如 009816 才 58 天) 也能分析。
+    # 不足 60 天的指標 (MA60、ADX、percentile、RS_63d、RS_252d、Beta) 會在後面
+    # 個別檢查資料量,不夠就回 None,而不是整檔 fail。
+    HARD_MIN_DAYS = 30
+    if len(df) < HARD_MIN_DAYS:
         return {
-            "error": "less than 60 days data",
+            "error": f"less than {HARD_MIN_DAYS} days data",
             "symbol": stock_id,
             "data_source": "FinMind" if used_finmind_for_price else "yfinance",
             "available_days": len(df),
         }
+
+    # 紀錄資料量,後面指標分支用
+    data_history_days = len(df)
+    has_60d = data_history_days >= 60
+    has_252d = data_history_days >= 252
 
     latest = df.iloc[-1]
     trade_date = chosen_ts.date()
@@ -2813,48 +2847,73 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
     feat["volume_k"] = int(vol_now / 1000)
 
     # -- MA + deviation --
+    # [NEW] MA60 需要 60 天歷史。資料不足時 ma60_now = None,相關欄位也 None。
     ma5 = close.rolling(5).mean()
     ma20 = close.rolling(20).mean()
     ma60 = close.rolling(60).mean()
 
-    ma5_now = float(ma5.iloc[-1])
-    ma20_now = float(ma20.iloc[-1])
-    ma60_now = float(ma60.iloc[-1])
+    ma5_now = float(ma5.iloc[-1]) if not pd.isna(ma5.iloc[-1]) else None
+    ma20_now = float(ma20.iloc[-1]) if not pd.isna(ma20.iloc[-1]) else None
+    ma60_now = float(ma60.iloc[-1]) if has_60d and not pd.isna(ma60.iloc[-1]) else None
 
-    feat["ma5"] = round(ma5_now, 2)
-    feat["ma20"] = round(ma20_now, 2)
-    feat["ma60"] = round(ma60_now, 2)
+    feat["ma5"] = round(ma5_now, 2) if ma5_now is not None else None
+    feat["ma20"] = round(ma20_now, 2) if ma20_now is not None else None
+    feat["ma60"] = round(ma60_now, 2) if ma60_now is not None else None
 
-    ma20_dev = (c_now - ma20_now) / ma20_now * 100
-    ma60_dev = (c_now - ma60_now) / ma60_now * 100
-    feat["ma20_dev_pct"] = round(ma20_dev, 4)
-    feat["ma60_dev_pct"] = round(ma60_dev, 4)
+    if ma20_now and ma20_now > 0:
+        ma20_dev = (c_now - ma20_now) / ma20_now * 100
+        feat["ma20_dev_pct"] = round(ma20_dev, 4)
+    else:
+        feat["ma20_dev_pct"] = None
+
+    if ma60_now and ma60_now > 0:
+        ma60_dev = (c_now - ma60_now) / ma60_now * 100
+        feat["ma60_dev_pct"] = round(ma60_dev, 4)
+    else:
+        feat["ma60_dev_pct"] = None
 
     ma20_dev_series = (close - ma20) / ma20 * 100
-    ma60_dev_series = (close - ma60) / ma60 * 100
-    feat["ma20_dev_percentile_252d"] = percentile_rank(ma20_dev_series.dropna(), 252)
-    feat["ma60_dev_percentile_252d"] = percentile_rank(ma60_dev_series.dropna(), 252)
+    feat["ma20_dev_percentile_252d"] = percentile_rank(ma20_dev_series.dropna(), 252) if has_252d else None
+    if ma60_now is not None:
+        ma60_dev_series = (close - ma60) / ma60 * 100
+        feat["ma60_dev_percentile_252d"] = percentile_rank(ma60_dev_series.dropna(), 252) if has_252d else None
+    else:
+        feat["ma60_dev_percentile_252d"] = None
 
     feat["ma5_slope_5d"] = slope_n(ma5, 5)
     feat["ma20_slope_5d"] = slope_n(ma20, 5)
 
-    if c_now > ma20_now > ma60_now and ma5_now > ma20_now:
-        trend_state = "uptrend"
-    elif c_now > ma20_now > ma60_now and ma5_now <= ma20_now:
-        trend_state = "uptrend_pullback"
-    elif c_now < ma20_now < ma60_now and ma5_now < ma20_now:
-        trend_state = "downtrend"
-    elif c_now < ma20_now < ma60_now and ma5_now >= ma20_now:
-        trend_state = "downtrend_bounce"
-    elif c_now > ma20_now and ma20_now < ma60_now:
-        trend_state = "bottom_bounce"
-    elif c_now < ma20_now and ma20_now > ma60_now:
-        trend_state = "top_pullback"
-    else:
+    # [NEW] trend_state 在 ma60 不存在時回退到 MA20-only 簡化邏輯
+    if ma20_now is None:
         trend_state = "consolidation"
+    elif ma60_now is None:
+        # 只用 MA5 + MA20 + close
+        if ma5_now and c_now > ma20_now and ma5_now > ma20_now:
+            trend_state = "uptrend"
+        elif ma5_now and c_now < ma20_now and ma5_now < ma20_now:
+            trend_state = "downtrend"
+        else:
+            trend_state = "consolidation"
+    else:
+        if c_now > ma20_now > ma60_now and ma5_now and ma5_now > ma20_now:
+            trend_state = "uptrend"
+        elif c_now > ma20_now > ma60_now and ma5_now and ma5_now <= ma20_now:
+            trend_state = "uptrend_pullback"
+        elif c_now < ma20_now < ma60_now and ma5_now and ma5_now < ma20_now:
+            trend_state = "downtrend"
+        elif c_now < ma20_now < ma60_now and ma5_now and ma5_now >= ma20_now:
+            trend_state = "downtrend_bounce"
+        elif c_now > ma20_now and ma20_now < ma60_now:
+            trend_state = "bottom_bounce"
+        elif c_now < ma20_now and ma20_now > ma60_now:
+            trend_state = "top_pullback"
+        else:
+            trend_state = "consolidation"
 
-    high_52 = float(df.tail(252)["High"].max())
-    low_52 = float(df.tail(252)["Low"].min())
+    # 52w position — 不到 252 天就用實際資料量
+    lookback_52w = min(data_history_days, 252)
+    high_52 = float(df.tail(lookback_52w)["High"].max())
+    low_52 = float(df.tail(lookback_52w)["Low"].min())
     feat["pos_52w_pct"] = round((c_now - low_52) / (high_52 - low_52) * 100, 2) if high_52 != low_52 else 50.0
 
     # weekly + multi-timeframe
@@ -2930,15 +2989,27 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         feat["daily_weekly_trend_agree"] = None
         feat["daily_weekly_bias_agree"] = None
 
-    # relative strength
+    # relative strength — 短歷史只算 20 天 RS,避免長期間做無效計算
     if mode == "ai":
+        rs_periods_to_run = [20]
+        if has_60d:
+            rs_periods_to_run.append(63)
+        if has_252d:
+            rs_periods_to_run.append(252)
+
         for rs_period in [20, 63, 252]:
-            rs_data = _calc_relative_strength_with_bench(df, bench_df, period=rs_period)
-            if rs_data:
-                feat[f"rs_vs_bench_{rs_period}d"] = rs_data.get(f"rs_{rs_period}d")
-                if rs_period == 20:
-                    feat["stock_ret_20d"] = rs_data.get("stock_ret_20d")
-                    feat["bench_ret_20d"] = rs_data.get("bench_ret_20d")
+            if rs_period in rs_periods_to_run:
+                rs_data = _calc_relative_strength_with_bench(df, bench_df, period=rs_period)
+                if rs_data:
+                    feat[f"rs_vs_bench_{rs_period}d"] = rs_data.get(f"rs_{rs_period}d")
+                    if rs_period == 20:
+                        feat["stock_ret_20d"] = rs_data.get("stock_ret_20d")
+                        feat["bench_ret_20d"] = rs_data.get("bench_ret_20d")
+                else:
+                    feat[f"rs_vs_bench_{rs_period}d"] = None
+                    if rs_period == 20:
+                        feat["stock_ret_20d"] = None
+                        feat["bench_ret_20d"] = None
             else:
                 feat[f"rs_vs_bench_{rs_period}d"] = None
                 if rs_period == 20:
@@ -3421,7 +3492,12 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         "analysis_date": analysis_date_str,
         # [NEW] price 資料源
         "price_source": "FinMind" if used_finmind_for_price else "yfinance",
+        # [NEW] 短歷史警告:< 60 天 → MA60/Beta/長 RS/percentile_252d 部分指標不可靠或缺失
+        "short_history_warning": not has_60d,
+        "very_short_history_warning": not has_252d and len(df) < 120,
     }
+    # [NEW] feature-level flag — 讓 AI 直接看到短歷史標記
+    feat["flag_short_history"] = not has_60d
     if mode == "ai":
         feat["data_quality"]["inst_data_coverage"] = None
         feat["data_quality"]["external_sources"] = {
@@ -3532,10 +3608,36 @@ def format_text_report(feat: Dict[str, Any]) -> str:
 
     lines.append(SEP)
 
+    # [NEW] 短歷史警告 — 列在開頭讓人馬上看到
+    dq = feat.get("data_quality") or {}
+    if dq.get("short_history_warning"):
+        lines.append("  ⚠ Short history ({} days < 60) — MA60/Beta/long RS skipped".format(
+            dq.get("price_data_days", "?")))
+
+    def _fmt_pct(v, prec=2, sign=True):
+        if v is None:
+            return "N/A"
+        try:
+            f = float(v)
+            return ("{:+." + str(prec) + "f}%").format(f) if sign else ("{:." + str(prec) + "f}%").format(f)
+        except Exception:
+            return str(v)
+
+    def _fmt_num(v, prec=2):
+        if v is None:
+            return "N/A"
+        try:
+            return ("{:." + str(prec) + "f}").format(float(v))
+        except Exception:
+            return str(v)
+
     lines.append("  Close：{}  Trend：{}".format(feat["close"], feat["trend_state"]))
-    lines.append("  MA20 dev：{:+.2f}% (pctl={})".format(feat["ma20_dev_pct"], feat.get("ma20_dev_percentile_252d")))
-    lines.append("  MA60 dev：{:+.2f}% (pctl={})".format(feat["ma60_dev_pct"], feat.get("ma60_dev_percentile_252d")))
-    lines.append("  52w pos：{:.1f}%".format(feat["pos_52w_pct"]))
+    lines.append("  MA20 dev：{} (pctl={})".format(
+        _fmt_pct(feat.get("ma20_dev_pct")), feat.get("ma20_dev_percentile_252d")))
+    lines.append("  MA60 dev：{} (pctl={})".format(
+        _fmt_pct(feat.get("ma60_dev_pct")), feat.get("ma60_dev_percentile_252d")))
+    if feat.get("pos_52w_pct") is not None:
+        lines.append("  52w pos：{:.1f}%".format(feat["pos_52w_pct"]))
 
     lines.append("  RSI14：{}  KD：{}/{}".format(feat["rsi14"], feat["kd_k"], feat["kd_d"]))
     lines.append("  MACD OSC：{:.4f}  ADX：{}".format(feat["macd_osc"], feat["adx"]))
