@@ -107,6 +107,11 @@ _finmind_price_cache: Dict[tuple, Any] = {}
 _finmind_price_cache_lock = threading.Lock()
 _FINMIND_PRICE_TTL_SECONDS = 600  # 10-minute TTL
 
+# [NEW] Last-known FinMind price error per stock, for surfacing real failure cause to caller.
+# Examples: "HTTP 403: Host not in allowlist", "status=400 msg=...", "no data"
+_finmind_price_last_error: Dict[str, str] = {}
+_finmind_price_last_error_lock = threading.Lock()
+
 # [FIX] Serialize TWSE/TPEx API requests to avoid rate-limiting
 _twse_request_semaphore = threading.Semaphore(1)
 
@@ -1575,6 +1580,7 @@ def _finmind_price_fetch(stock_no: str, lookback_days: int = 730) -> pd.DataFram
         headers["Authorization"] = f"Bearer {token}"
 
     df_result = pd.DataFrame()
+    err_msg = None  # 記下本次失敗原因
     try:
         r = sess.get("https://api.finmindtrade.com/api/v4/data",
                      params=params, headers=headers, timeout=20)
@@ -1599,13 +1605,24 @@ def _finmind_price_fetch(stock_no: str, lookback_days: int = 730) -> pd.DataFram
                         "Volume": pd.to_numeric(df.get("Trading_Volume"), errors="coerce").fillna(0),
                     }).dropna(subset=["Close"])
                 else:
+                    err_msg = f"no data (FinMind 查無 {stock_no} 資料)"
                     logger.info(f"FinMind price: {stock_no} 查無資料")
             else:
-                logger.warning(f"FinMind price status={payload.get('status')} msg={payload.get('msg')}")
+                err_msg = f"FinMind status={payload.get('status')} msg={payload.get('msg')}"
+                logger.warning(err_msg)
         else:
-            logger.warning(f"FinMind price HTTP {r.status_code} for {stock_no}")
+            # 把 body 前 200 字一起帶進來,403 /allowlist 之類的訊息才看得到
+            body_snippet = (r.text or "")[:200].strip()
+            err_msg = f"HTTP {r.status_code}: {body_snippet}" if body_snippet else f"HTTP {r.status_code}"
+            logger.warning(f"FinMind price {err_msg} for {stock_no}")
     except Exception as e:
+        err_msg = f"exception: {e}"
         logger.warning(f"FinMind price fetch failed for {stock_no}: {e}")
+
+    # 紀錄本次錯誤(若有),供上游 build_ai_features 判讀
+    if err_msg is not None and df_result.empty:
+        with _finmind_price_last_error_lock:
+            _finmind_price_last_error[stock_no] = err_msg
 
     with _finmind_price_cache_lock:
         _finmind_price_cache[cache_key] = (df_result.copy() if not df_result.empty else df_result, now)
@@ -2716,20 +2733,32 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         yf_ticker = yf_ticker.replace(".TW", ".TWO")
         df_daily = _download_yf(yf_ticker, "2y", "1d")
 
-    # [NEW] FinMind 備援:對新上市 ETF / 主動式 ETF, yfinance 經常沒有資料
-    # 只對台股代號(數字開頭)觸發,避免影響 .KS / .HK / .T 海外標的
-    if df_daily.empty and stock_no and stock_no[0].isdigit():
-        logger.info(f"{stock_id}: yfinance 失敗,嘗試 FinMind 備援")
-        df_daily = _finmind_price_fetch(stock_no, lookback_days=730)
-        if not df_daily.empty:
+    # [NEW] FinMind 備援:對新上市 ETF / 主動式 ETF, yfinance 經常沒有資料,
+    # 或只有殘缺的少量資料 (<60 列)。兩種情況都要觸發 FinMind。
+    # 只對台股代號(數字開頭)觸發,避免影響 .KS / .HK / .T 海外標的。
+    yf_insufficient = df_daily.empty or len(df_daily) < 60
+    if yf_insufficient and stock_no and stock_no[0].isdigit():
+        yf_len = 0 if df_daily.empty else len(df_daily)
+        logger.info(f"{stock_id}: yfinance 資料不足 (len={yf_len}),嘗試 FinMind 備援")
+        df_finmind = _finmind_price_fetch(stock_no, lookback_days=730)
+        # 取較長的那一份 — FinMind 可能比 yfinance 完整 (新 ETF 尤其明顯)
+        if not df_finmind.empty and len(df_finmind) > yf_len:
+            df_daily = df_finmind
             used_finmind_for_price = True
             yf_ticker = f"{stock_no}.TW"
-            logger.info(f"{stock_id}: FinMind 備援成功,共 {len(df_daily)} 筆")
+            logger.info(f"{stock_id}: FinMind 備援成功,共 {len(df_daily)} 筆 (vs yfinance {yf_len} 筆)")
 
     if df_daily.empty:
-        logger.warning("%s (%s): 所有資料源 (yfinance + FinMind) 都失敗",
-                       stock_id, yf_ticker)
-        return {"error": f"not found: {stock_id}", "symbol": stock_id}
+        # [NEW] 把 FinMind 的真正失敗原因帶上去,讓 UI 看得到 (例如 HTTP 403, host allowlist)
+        finmind_err = None
+        with _finmind_price_last_error_lock:
+            finmind_err = _finmind_price_last_error.get(stock_no)
+        logger.warning("%s (%s): 所有資料源 (yfinance + FinMind) 都失敗 | finmind_err=%s",
+                       stock_id, yf_ticker, finmind_err)
+        out = {"error": f"not found: {stock_id}", "symbol": stock_id}
+        if finmind_err:
+            out["finmind_error"] = finmind_err
+        return out
 
     chosen_ts = _nearest_trading_ts(df_daily, as_of_date)
     if chosen_ts is None:
@@ -3472,7 +3501,18 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
 
 def format_text_report(feat: Dict[str, Any]) -> str:
     if "error" in feat and feat["error"]:
-        return "X {}：{}".format(feat.get("symbol", "？"), feat["error"])
+        # [NEW] 顯示更詳盡的錯誤資訊 (FinMind 失敗原因 / 可用天數 / 資料源)
+        msg = "X {}：{}".format(feat.get("symbol", "？"), feat["error"])
+        extras = []
+        if feat.get("finmind_error"):
+            extras.append(f"FinMind: {feat['finmind_error']}")
+        if feat.get("data_source"):
+            extras.append(f"src={feat['data_source']}")
+        if feat.get("available_days") is not None:
+            extras.append(f"days={feat['available_days']}")
+        if extras:
+            msg += "  [" + " | ".join(extras) + "]"
+        return msg
 
     lines = []
     SEP = "=" * 30
