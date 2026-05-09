@@ -1,8 +1,9 @@
-# stock_v2.py – Taiwan Stock Technical Analysis + AI Features JSON1.16
+# stock.py – Taiwan Stock Technical Analysis + AI Features JSON1.16
 # Supports two modes: human (fast, skip network) / ai (full data)
 # *** OPTIMIZED VERSION – key changes marked with # [OPT] ***
 # *** DATA CLEANED VERSION – Added auto_adjust=True and ffill() for dirty data ***
 # *** + ADDED ATR FLOOR & WHIPSAW RISK ALERT ***
+# *** + ADDED FINMIND PRICE FALLBACK for new ETFs (主動式 ETF, 新上市 ETF) ***
 
 import io
 import json
@@ -93,21 +94,29 @@ _finmind_margin_cache: Dict[tuple, Any] = {}
 _finmind_cache_lock = threading.Lock()
 
 # [NEW] FinMind extended data caches — monthly revenue, EPS, major holders, securities lending
-# Monthly revenue and EPS are full-market (keyed by date), major holders and lending are per-stock
-_finmind_revenue_cache: Dict[tuple, Any] = {}   # (stock_no, date) — per-stock
-_finmind_eps_cache: Dict[tuple, Any] = {}       # (stock_no, date) — per-stock
-_finmind_holders_cache: Dict[tuple, Any] = {}   # (stock_no, date) — per-stock (now used for foreign shareholding)
-_finmind_lending_cache: Dict[tuple, Any] = {}   # (stock_no, date) — per-stock
-_finmind_daytrade_cache: Dict[tuple, Any] = {}  # (stock_no, date) — per-stock (day-trading ratio)
+_finmind_revenue_cache: Dict[tuple, Any] = {}
+_finmind_eps_cache: Dict[tuple, Any] = {}
+_finmind_holders_cache: Dict[tuple, Any] = {}
+_finmind_lending_cache: Dict[tuple, Any] = {}
+_finmind_daytrade_cache: Dict[tuple, Any] = {}
 _finmind_ext_cache_lock = threading.Lock()
 
+# [NEW] FinMind price cache — used as fallback when yfinance can't find ETF / new listings.
+# Keyed by (stock_no, lookback_days). TTL-based.
+_finmind_price_cache: Dict[tuple, Any] = {}
+_finmind_price_cache_lock = threading.Lock()
+_FINMIND_PRICE_TTL_SECONDS = 600  # 10-minute TTL
+
 # [FIX] Serialize TWSE/TPEx API requests to avoid rate-limiting
-# Only 1 thread can make an uncached TWSE request at a time
 _twse_request_semaphore = threading.Semaphore(1)
 
 
 def _get_cached_benchmark(ttl_seconds: int = _BENCH_TTL_SECONDS) -> pd.DataFrame:
-    """Download 0050.TW benchmark once, cache for `ttl_seconds`."""
+    """Download 0050.TW benchmark once, cache for `ttl_seconds`.
+
+    [NEW] If yfinance fails (rare but possible), fall back to FinMind so the
+    benchmark series is always available — Beta and RS calculations depend on it.
+    """
     now = datetime.now()
     with _bench_cache_lock:
         if (_bench_cache["df"] is not None
@@ -116,6 +125,8 @@ def _get_cached_benchmark(ttl_seconds: int = _BENCH_TTL_SECONDS) -> pd.DataFrame
             return _bench_cache["df"]
     # Download outside lock to avoid blocking other threads
     df = _download_yf("0050.TW", "2y", "1d")
+    if df is None or df.empty:
+        df = _finmind_price_fetch("0050", lookback_days=730)
     with _bench_cache_lock:
         _bench_cache["df"] = df
         _bench_cache["ts"] = now
@@ -130,7 +141,6 @@ def _get_session() -> requests.Session:
         _http_session.headers.update(
             {"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-TW,zh;q=0.9"}
         )
-        # Increase pool size for concurrent requests
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=10, pool_maxsize=20, max_retries=1
         )
@@ -230,11 +240,8 @@ def _parse_roc_date(date_str: str) -> str:
         return str(date_str)
 
 
-# -------------------------------------------------------------------
-# FIX: _sanitize_numpy — 統一清洗 numpy 型別，確保 JSON 可序列化
-# -------------------------------------------------------------------
 def _sanitize_numpy(obj):
-    """遞迴清洗 dict / list 中的 numpy 型別，確保 JSON 可序列化。"""
+    """遞迴清洗 dict / list 中的 numpy 型別,確保 JSON 可序列化。"""
     if isinstance(obj, dict):
         return {k: _sanitize_numpy(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -296,7 +303,6 @@ def slope_n(series: pd.Series, n: int = 5) -> Optional[float]:
     if np.all(np.isnan(y)):
         return None
     m, _ = np.polyfit(x, y, 1)
-    # Normalize: slope per day as % of series mean
     mean_val = np.mean(y)
     if mean_val == 0:
         return 0.0
@@ -343,7 +349,6 @@ def detect_momentum_candle_patterns(df: pd.DataFrame, n: int = 5) -> Dict[str, A
 
     tail = df.tail(n)
 
-    # [OPT] Vectorised candle classification – no iterrows()
     o_arr = tail["Open"].values.astype(float)
     h_arr = tail["High"].values.astype(float)
     l_arr = tail["Low"].values.astype(float)
@@ -476,12 +481,10 @@ def calculate_obv(df: pd.DataFrame) -> pd.Series:
     return (np.sign(df["Close"].diff()).fillna(0) * df["Volume"]).cumsum()
 
 
-# [OPT] SuperTrend: use numpy arrays inside the loop to avoid pandas iloc overhead
-# [P2] Added smoothing parameter: "wilder" (default, matches ATR) or "ema" (faster response)
 def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0,
                          smoothing: str = None):
     if smoothing is None:
-        smoothing = SUPERTREND_SMOOTHING  # Use global config
+        smoothing = SUPERTREND_SMOOTHING
     n = len(df)
     high = df["High"].values.astype(float)
     low = df["Low"].values.astype(float)
@@ -496,13 +499,12 @@ def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float =
     )
     tr[0] = high[0] - low[0]
 
-    # EWM ATR — smoothing toggle (Phase 3 Item 3)
     atr = np.empty(n, dtype=float)
     atr[0] = tr[0]
     if smoothing == "wilder":
-        alpha = 1.0 / period  # Wilder's smoothing — matches calculate_atr(), more stable
+        alpha = 1.0 / period
     else:
-        alpha = 2.0 / (period + 1)  # Standard EMA — faster response, earlier entry signals
+        alpha = 2.0 / (period + 1)
     for i in range(1, n):
         atr[i] = alpha * tr[i] + (1 - alpha) * atr[i - 1]
 
@@ -577,12 +579,10 @@ def calculate_volume_profile(
 
     bins = np.linspace(lo, hi, n_bins + 1)
 
-    # [OPT] Vectorised volume distribution – replaces double-nested Python loop
     row_lo = sub["Low"].values.astype(float)
     row_hi = sub["High"].values.astype(float)
     row_vol = sub["Volume"].values.astype(float)
 
-    # Mask out invalid rows
     valid = (row_hi > row_lo) & (row_vol > 0)
     row_lo = row_lo[valid]
     row_hi = row_hi[valid]
@@ -591,23 +591,19 @@ def calculate_volume_profile(
     if len(row_lo) == 0:
         return {"poc_price": None, "poc_volume_k": None, "price_vs_poc_pct": None}
 
-    row_range = row_hi - row_lo  # (R,)
+    row_range = row_hi - row_lo
 
-    # bins_lo[b], bins_hi[b] for each bin
-    bins_lo = bins[:-1]  # (B,)
-    bins_hi = bins[1:]  # (B,)
+    bins_lo = bins[:-1]
+    bins_hi = bins[1:]
 
-    # Broadcasting: overlap[row, bin] = max(0, min(row_hi, bin_hi) - max(row_lo, bin_lo))
-    # Shapes: row arrays (R,1), bin arrays (1,B)
     overlap = np.maximum(
         0.0,
         np.minimum(row_hi[:, None], bins_hi[None, :])
         - np.maximum(row_lo[:, None], bins_lo[None, :]),
-    )  # (R, B)
+    )
 
-    # Weighted volume per bin
-    weights = row_vol[:, None] * overlap / row_range[:, None]  # (R, B)
-    vol_by_bin = weights.sum(axis=0)  # (B,)
+    weights = row_vol[:, None] * overlap / row_range[:, None]
+    vol_by_bin = weights.sum(axis=0)
 
     poc_idx = int(np.argmax(vol_by_bin))
     poc_price = round((bins[poc_idx] + bins[poc_idx + 1]) / 2, 2)
@@ -616,7 +612,6 @@ def calculate_volume_profile(
     c_now = float(sub["Close"].iloc[-1])
     price_vs_poc = round((c_now - poc_price) / poc_price * 100, 4) if poc_price > 0 else None
 
-    # Value Area: expand from POC until 70% of total volume is captured
     total_vol = vol_by_bin.sum()
     va_vol = vol_by_bin[poc_idx]
     lo_idx, hi_idx = poc_idx, poc_idx
@@ -645,11 +640,6 @@ def calculate_volume_profile(
 
 def detect_short_term_sr(df: pd.DataFrame, lookback: int = 120, pivot_lr: int = 3, cluster_pct: float = 0.015) -> Dict[
     str, Any]:
-    """
-    Detect support/resistance by clustering pivot highs and lows.
-    Levels where 2+ pivots cluster within `cluster_pct` of each other are S/R.
-    Falls back to range-based min/max if insufficient pivots.
-    """
     sub = df.tail(lookback)
     if sub.empty:
         return {"st_support": None, "st_resistance": None}
@@ -659,13 +649,11 @@ def detect_short_term_sr(df: pd.DataFrame, lookback: int = 120, pivot_lr: int = 
     all_pivot_prices = [p[2] for p in hp] + [p[2] for p in lp]
 
     if len(all_pivot_prices) < 3:
-        # Fallback to range
         return {
             "st_support": round(float(sub["Low"].min()), 2),
             "st_resistance": round(float(sub["High"].max()), 2),
         }
 
-    # Cluster nearby pivot prices
     all_pivot_prices.sort()
     clusters = []
     current_cluster = [all_pivot_prices[0]]
@@ -697,16 +685,8 @@ def detect_divergence(
         price: pd.Series, indicator: pd.Series, lookback: int = 60,
         pivot_left: int = 5, pivot_right: int = 3,
 ) -> Dict[str, bool]:
-    """
-    [P0 FIX] Detect divergence using TIMESTAMP-based indicator lookup
-    instead of positional indexing. This prevents false divergence signals
-    caused by dropped NaN rows creating index misalignment.
-    - Bearish divergence: price makes higher high, indicator makes lower high
-    - Bullish divergence: price makes lower low, indicator makes higher low
-    """
     result = {"bearish_divergence": False, "bullish_divergence": False}
     p = price.dropna().iloc[-lookback:]
-    # Reindex indicator to price index but do NOT dropna — keep alignment
     ind = indicator.reindex(p.index)
     if len(p) < 20:
         return result
@@ -715,8 +695,7 @@ def detect_divergence(
     p_dates = p.index
     n = len(p_vals)
 
-    # Find pivot highs and lows in price
-    pivot_highs = []  # (position, timestamp, price_value)
+    pivot_highs = []
     pivot_lows = []
     for i in range(pivot_left, n - pivot_right):
         window = p_vals[i - pivot_left: i + pivot_right + 1]
@@ -728,11 +707,9 @@ def detect_divergence(
                 if not pivot_lows or pivot_lows[-1][0] < i - pivot_right:
                     pivot_lows.append((i, p_dates[i], p_vals[i]))
 
-    # Bearish divergence: last two pivot highs — price HH, indicator LH
     if len(pivot_highs) >= 2:
         _, ts1, ph1_price = pivot_highs[-2]
         _, ts2, ph2_price = pivot_highs[-1]
-        # [FIX] Use timestamp lookup instead of positional index
         ind_at_ph1 = ind.get(ts1)
         ind_at_ph2 = ind.get(ts2)
         if (ind_at_ph1 is not None and ind_at_ph2 is not None
@@ -740,7 +717,6 @@ def detect_divergence(
                 and ph2_price > ph1_price and ind_at_ph2 < ind_at_ph1):
             result["bearish_divergence"] = True
 
-    # Bullish divergence: last two pivot lows — price LL, indicator HL
     if len(pivot_lows) >= 2:
         _, ts1, pl1_price = pivot_lows[-2]
         _, ts2, pl2_price = pivot_lows[-1]
@@ -792,26 +768,17 @@ def calculate_volume_quality(df: pd.DataFrame, period: int = 20) -> Dict[str, An
 
 def calculate_fibonacci_summary(df: pd.DataFrame, lookback: int = 120, trend_state: str = "consolidation") -> Dict[
     str, Any]:
-    """
-    Direction-aware Fibonacci retracement.
-    - Uptrend: measure from swing low → swing high (retracement = pullback support)
-    - Downtrend: measure from swing high → swing low (retracement = bounce resistance)
-    Adds extension levels (1.272, 1.618) for breakout targets.
-    """
     sub = df.tail(lookback)
     high = float(sub["High"].max())
     low = float(sub["Low"].min())
     diff = high - low
     c_now = float(sub["Close"].iloc[-1])
 
-    # [P3] bottom_bounce excluded from uptrend — in still-bearish context (MA20 < MA60),
-    # uptrend Fib produces misleading support levels. Consolidation Fib is more appropriate.
     is_uptrend = trend_state in (
         "uptrend", "strong_uptrend", "weak_uptrend", "uptrend_pullback",
     )
 
     if is_uptrend:
-        # Uptrend: retracement from high, extensions above high
         levels = {
             "fib_0236": round(high - 0.236 * diff, 2),
             "fib_0382": round(high - 0.382 * diff, 2),
@@ -823,7 +790,6 @@ def calculate_fibonacci_summary(df: pd.DataFrame, lookback: int = 120, trend_sta
             "fib_ext_1618": round(low + 1.618 * diff, 2),
         }
     else:
-        # Downtrend: retracement from low upward, extensions below low
         levels = {
             "fib_0236": round(low + 0.236 * diff, 2),
             "fib_0382": round(low + 0.382 * diff, 2),
@@ -863,7 +829,6 @@ def detect_gaps_summary(df: pd.DataFrame, lookback: int = 30) -> List[Dict]:
     if len(sub) < 2:
         return []
 
-    # [OPT] vectorised: extract arrays once
     highs = sub["High"].values.astype(float)
     lows = sub["Low"].values.astype(float)
     dates = sub.index
@@ -873,7 +838,6 @@ def detect_gaps_summary(df: pd.DataFrame, lookback: int = 30) -> List[Dict]:
         date_str = dates[i].strftime("%Y-%m-%d")
 
         if lows[i] > highs[i - 1]:
-            # Gap up – check fill using vectorised comparison
             future_lows = lows[i + 1:]
             filled = bool(np.any(future_lows <= highs[i - 1])) if len(future_lows) > 0 else False
             if not filled:
@@ -887,7 +851,6 @@ def detect_gaps_summary(df: pd.DataFrame, lookback: int = 30) -> List[Dict]:
                 )
 
         elif highs[i] < lows[i - 1]:
-            # Gap down – check fill using vectorised comparison
             future_highs = highs[i + 1:]
             filled = bool(np.any(future_highs >= lows[i - 1])) if len(future_highs) > 0 else False
             if not filled:
@@ -1098,10 +1061,6 @@ _PATTERN_PRIORITY = {
 
 
 def _prioritize_patterns(raw_patterns: List[Dict]) -> List[Dict]:
-    """
-    將 pattern 分成 bearish / bullish 兩組，
-    每組取 confirmed 優先、priority 最高的 1 個，最多輸出 2 個。
-    """
     bearish = [p for p in raw_patterns if p.get("bias") == "bearish"]
     bullish = [p for p in raw_patterns if p.get("bias") == "bullish"]
 
@@ -1180,13 +1139,12 @@ def _parse_tpex_csv(text: str):
 
 def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back: int = 10):
     stock_no = _strip_suffix(stock_id)
-    sess = _get_session()  # [OPT] connection pooling
+    sess = _get_session()
     headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-TW,zh;q=0.9"}
     prefer_twse = not (isinstance(market_hint, str) and market_hint.upper().endswith(".TWO"))
     last_error = None
 
     def try_twse(d_):
-        # [P1] Use cached full-market CSV — one download per date for ALL stocks
         cache_key = ("twse_t86", d_.strftime('%Y%m%d'))
         with _inst_cache_lock:
             if cache_key in _inst_csv_cache:
@@ -1195,12 +1153,9 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
                     return None, "TWSE cached no-data"
                 return cached, None
 
-        # [FIX] Rate-limit guard: sleep before TWSE request to avoid 429/block
-        # [FIX] Serialize TWSE requests across all threads
         with _twse_request_semaphore:
             time.sleep(0.35)
             url = f"https://www.twse.com.tw/fund/T86?response=csv&date={d_.strftime('%Y%m%d')}&selectType=ALLBUT0999"
-            # [FIX] Double-check cache inside semaphore (another thread may have fetched it)
             with _inst_cache_lock:
                 if cache_key in _inst_csv_cache:
                     cached = _inst_csv_cache[cache_key]
@@ -1210,14 +1165,10 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
             try:
                 r = sess.get(url, headers=headers, timeout=15)
             except Exception as e:
-                # [FIX] Network error → do NOT cache, allow retry on next stock
                 return None, f"TWSE request error: {e}"
         if r.status_code != 200 or len(r.text) < 200:
-            # [FIX] HTTP error (rate-limit etc.) → do NOT cache as None
-            # Only cache legitimate "no data" responses, not transient failures
             return None, f"TWSE HTTP {r.status_code}"
         if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
-            # This IS a legitimate no-data response → safe to cache
             with _inst_cache_lock:
                 _inst_csv_cache[cache_key] = None
             return None, "TWSE no data"
@@ -1229,7 +1180,6 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
     def try_tpex(d_):
         roc_year = d_.year - 1911
         roc_date = f"{roc_year:03d}/{d_.month:02d}/{d_.day:02d}"
-        # [P1] Use cached full-market CSV
         cache_key = ("tpex_inst", roc_date)
         with _inst_cache_lock:
             if cache_key in _inst_csv_cache:
@@ -1238,7 +1188,6 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
                     return None, "TPEx cached no-data"
                 return cached, None
 
-        # [FIX] Rate-limit guard + serialize
         with _twse_request_semaphore:
             time.sleep(0.2)
             url = (
@@ -1247,7 +1196,6 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
             )
             h2 = dict(headers)
             h2["Referer"] = "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge.php"
-            # [FIX] Double-check cache inside semaphore
             with _inst_cache_lock:
                 if cache_key in _inst_csv_cache:
                     cached = _inst_csv_cache[cache_key]
@@ -1259,7 +1207,6 @@ def get_institutional_data(stock_id: str, trade_date, market_hint=None, max_back
             except Exception as e:
                 return None, f"TPEx request error: {e}"
         if r.status_code != 200 or len(r.text) < 200:
-            # [FIX] HTTP error → do NOT cache, allow retry
             return None, f"TPEx HTTP {r.status_code}"
         if "沒有符合條件的資料" in r.text or "很抱歉" in r.text:
             with _inst_cache_lock:
@@ -1396,7 +1343,6 @@ def compute_institutional_features(chips_multi: List[Dict], price_now: float, pr
     feat["dealer_5d_net"] = sum(d_vals[-5:])
     feat["dealer_20d_net"] = sum(d_vals)
 
-    # Normalized institutional flow as % of average daily volume (Item #14)
     if avg_daily_vol > 0:
         feat["foreign_20d_net_pct_adv"] = round(
             sum(f_vals) * 1000 / avg_daily_vol * 100, 2
@@ -1431,7 +1377,6 @@ def compute_institutional_features(chips_multi: List[Dict], price_now: float, pr
     feat["flag_inst_consensus_buy"] = bool(feat["foreign_20d_net"] > 0 and feat["trust_20d_net"] > 0)
     feat["flag_inst_consensus_sell"] = bool(feat["foreign_20d_net"] < 0 and feat["trust_20d_net"] < 0)
 
-    # [V2] Surface the latest T86 data date for staleness checks downstream
     try:
         feat["inst_date"] = chips_multi[-1].get("date") if chips_multi else None
     except Exception:
@@ -1440,9 +1385,8 @@ def compute_institutional_features(chips_multi: List[Dict], price_now: float, pr
     return feat
 
 
-
 # ===================================================================
-# 10. MARGIN TRADING – [OPT] uses pooled session
+# 10. MARGIN TRADING + FinMind extended fetches
 # ===================================================================
 
 
@@ -1481,21 +1425,9 @@ def _parse_twse_json_table(obj):
 
 
 def _finmind_margin_fetch(stock_no: str, trade_date, max_back: int = 10):
-    """Fetch margin/short sale data from FinMind API.
-
-    [FIX] FinMind is a free Taiwan financial data API that proxies TWSE/TPEx data.
-    Used as primary source because Streamlit Cloud's IP can't reach TWSE MI_MARGN
-    endpoint (both JSON and CSV variants are blocked), but TWSE T86 works.
-
-    Returns normalized dict matching get_margin_short_data's return schema,
-    or None if FinMind doesn't have data (caller should fall back to TWSE/TPEx).
-
-    Requires FINMIND_TOKEN env variable (optional — works without but lower rate limit).
-    """
     import os
     token = os.environ.get("FINMIND_TOKEN", "").strip()
 
-    # Cache key — per stock, per requested date
     date_str = trade_date.strftime("%Y-%m-%d")
     cache_key = (stock_no, date_str)
     with _finmind_cache_lock:
@@ -1504,7 +1436,6 @@ def _finmind_margin_fetch(stock_no: str, trade_date, max_back: int = 10):
 
     sess = _get_session()
     url = "https://api.finmindtrade.com/api/v4/data"
-    # Query window: go back max_back days to handle non-trading days
     start_date = (trade_date - timedelta(days=max_back)).strftime("%Y-%m-%d")
     end_date = date_str
 
@@ -1527,7 +1458,6 @@ def _finmind_margin_fetch(stock_no: str, trade_date, max_back: int = 10):
             return None
         payload = r.json()
         if payload.get("status") != 200:
-            # e.g. rate limited, bad token
             logger.warning(f"FinMind status {payload.get('status')} msg={payload.get('msg')}")
             with _finmind_cache_lock:
                 _finmind_margin_cache[cache_key] = None
@@ -1539,18 +1469,15 @@ def _finmind_margin_fetch(stock_no: str, trade_date, max_back: int = 10):
                 _finmind_margin_cache[cache_key] = None
             return None
 
-        # Rows sorted by date ascending — take the latest one
         rows_sorted = sorted(rows, key=lambda x: x.get("date", ""))
         latest = rows_sorted[-1]
 
-        # Map FinMind fields to our schema
         m_bal = latest.get("MarginPurchaseTodayBalance")
         m_yes = latest.get("MarginPurchaseYesterdayBalance")
         m_lim = latest.get("MarginPurchaseLimit")
         s_bal = latest.get("ShortSaleTodayBalance")
         s_yes = latest.get("ShortSaleYesterdayBalance")
 
-        # Compute change from today - yesterday
         m_chg = (m_bal - m_yes) if (m_bal is not None and m_yes is not None) else None
         s_chg = (s_bal - s_yes) if (s_bal is not None and s_yes is not None) else None
         usage = round(m_bal / m_lim * 100, 1) if (m_bal and m_lim and m_lim > 0) else None
@@ -1577,10 +1504,6 @@ def _finmind_margin_fetch(stock_no: str, trade_date, max_back: int = 10):
 
 
 def _finmind_api_get(dataset: str, params: dict, timeout: int = 20):
-    """Unified FinMind API caller. Returns list of row dicts or None.
-
-    Handles: token auth, HTTP errors, status checks, rate limit detection.
-    """
     import os
     token = os.environ.get("FINMIND_TOKEN", "").strip()
     sess = _get_session()
@@ -1605,18 +1528,120 @@ def _finmind_api_get(dataset: str, params: dict, timeout: int = 20):
         return None
 
 
-def _finmind_revenue_fetch(stock_no: str, trade_date):
-    """Fetch monthly revenue data for a stock.
+# ===================================================================
+# [NEW] FinMind PRICE fallback — for new ETFs / 主動式 ETF
+# ===================================================================
 
-    Returns dict with revenue YoY/MoM trend analysis, or None.
+
+def _finmind_price_fetch(stock_no: str, lookback_days: int = 730) -> pd.DataFrame:
+    """從 FinMind 抓台股日線(含 ETF)。
+
+    當 yfinance 對新上市 ETF / 主動式 ETF 抓不到資料時的備援。
+    回傳格式跟 _download_yf 一致:Open/High/Low/Close/Volume,DatetimeIndex。
+
+    Cached per (stock_no, lookback_days) for FINMIND_PRICE_TTL_SECONDS to reduce
+    duplicate hits when the same ETF appears in multiple sectors.
+
+    [FIX] 修正 FinMind 主動式 ETF (如 00992A) 由於後端 SQL UNION 順序不同,
+    同一日可能出現重複列的問題。在 set_index 前先用 (date, stock_id) 去重複,
+    避免 rolling 計算與長度判斷錯亂。
     """
+    if not stock_no:
+        return pd.DataFrame()
+
+    cache_key = (stock_no, lookback_days)
+    now = datetime.now()
+
+    with _finmind_price_cache_lock:
+        cached = _finmind_price_cache.get(cache_key)
+        if cached is not None:
+            df_cached, ts = cached
+            if (now - ts).total_seconds() < _FINMIND_PRICE_TTL_SECONDS:
+                return df_cached.copy() if df_cached is not None and not df_cached.empty else pd.DataFrame()
+
+    import os
+    token = os.environ.get("FINMIND_TOKEN", "").strip()
+    sess = _get_session()
+    end_d = now.date()
+    start_d = end_d - timedelta(days=lookback_days)
+    params = {
+        "dataset": "TaiwanStockPrice",
+        "data_id": stock_no,
+        "start_date": start_d.strftime("%Y-%m-%d"),
+        "end_date": end_d.strftime("%Y-%m-%d"),
+    }
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    df_result = pd.DataFrame()
+    try:
+        r = sess.get("https://api.finmindtrade.com/api/v4/data",
+                     params=params, headers=headers, timeout=20)
+        if r.status_code == 200:
+            payload = r.json()
+            if payload.get("status") == 200:
+                rows = payload.get("data") or []
+                if rows:
+                    df = pd.DataFrame(rows)
+                    df["date"] = pd.to_datetime(df["date"])
+                    # [FIX] 去重複:同一 stock_id + date 只保留一列
+                    if "stock_id" in df.columns:
+                        df = df.drop_duplicates(subset=["date", "stock_id"], keep="last")
+                    else:
+                        df = df.drop_duplicates(subset=["date"], keep="last")
+                    df = df.set_index("date").sort_index()
+                    df_result = pd.DataFrame({
+                        "Open": pd.to_numeric(df.get("open"), errors="coerce"),
+                        "High": pd.to_numeric(df.get("max"), errors="coerce"),
+                        "Low": pd.to_numeric(df.get("min"), errors="coerce"),
+                        "Close": pd.to_numeric(df.get("close"), errors="coerce"),
+                        "Volume": pd.to_numeric(df.get("Trading_Volume"), errors="coerce").fillna(0),
+                    }).dropna(subset=["Close"])
+                else:
+                    logger.info(f"FinMind price: {stock_no} 查無資料")
+            else:
+                logger.warning(f"FinMind price status={payload.get('status')} msg={payload.get('msg')}")
+        else:
+            logger.warning(f"FinMind price HTTP {r.status_code} for {stock_no}")
+    except Exception as e:
+        logger.warning(f"FinMind price fetch failed for {stock_no}: {e}")
+
+    with _finmind_price_cache_lock:
+        _finmind_price_cache[cache_key] = (df_result.copy() if not df_result.empty else df_result, now)
+
+    return df_result
+
+
+def _resample_daily_to_weekly(df_daily: pd.DataFrame) -> pd.DataFrame:
+    """將日線重新採樣成週線(W-FRI),格式跟 yfinance 1wk 一致。
+
+    用在 FinMind 路線下,因為沒有獨立週線端點;
+    或當 yfinance 拿到日線但週線失敗時的備援。
+    """
+    if df_daily is None or df_daily.empty:
+        return pd.DataFrame()
+    try:
+        df_w = df_daily.resample("W-FRI").agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+        }).dropna(subset=["Close"])
+        return df_w
+    except Exception as e:
+        logger.warning(f"_resample_daily_to_weekly failed: {e}")
+        return pd.DataFrame()
+
+
+def _finmind_revenue_fetch(stock_no: str, trade_date):
     date_str = trade_date.strftime("%Y-%m-%d")
     cache_key = (stock_no, date_str)
     with _finmind_ext_cache_lock:
         if cache_key in _finmind_revenue_cache:
             return _finmind_revenue_cache[cache_key]
 
-    # Fetch past 14 months to have enough for 3m rolling YoY + prior year comparison
     start_date = (trade_date - timedelta(days=450)).strftime("%Y-%m-%d")
     rows = _finmind_api_get("TaiwanStockMonthRevenue", {
         "data_id": stock_no,
@@ -1626,7 +1651,6 @@ def _finmind_revenue_fetch(stock_no: str, trade_date):
     result = None
     if rows:
         try:
-            # Sort by revenue_year + revenue_month ascending
             def _rev_key(r):
                 return (int(r.get("revenue_year", 0)), int(r.get("revenue_month", 0)))
             rows_sorted = sorted(rows, key=_rev_key)
@@ -1635,14 +1659,12 @@ def _finmind_revenue_fetch(stock_no: str, trade_date):
                 latest = rows_sorted[-1]
                 latest_rev = latest.get("revenue")
                 latest_yoy = latest.get("revenue_year_ago_yoy") or latest.get("YoY")
-                # FinMind field name varies; compute manually if missing
                 if latest_yoy is None and len(rows_sorted) >= 13:
-                    prev_year = rows_sorted[-13]  # same month last year
+                    prev_year = rows_sorted[-13]
                     pv = prev_year.get("revenue")
                     if pv and pv > 0 and latest_rev:
                         latest_yoy = round((latest_rev - pv) / pv * 100, 2)
 
-                # MoM — current vs last month
                 latest_mom = None
                 if len(rows_sorted) >= 2:
                     prev_month = rows_sorted[-2]
@@ -1650,7 +1672,6 @@ def _finmind_revenue_fetch(stock_no: str, trade_date):
                     if pm and pm > 0 and latest_rev:
                         latest_mom = round((latest_rev - pm) / pm * 100, 2)
 
-                # 3-month rolling YoY average (last 3 months YoY averaged)
                 yoy_3m_avg = None
                 yoys = []
                 for i in range(1, min(4, len(rows_sorted) + 1)):
@@ -1658,11 +1679,9 @@ def _finmind_revenue_fetch(stock_no: str, trade_date):
                     r = rows_sorted[idx]
                     y = r.get("revenue_year_ago_yoy") or r.get("YoY")
                     if y is None:
-                        # try manual compute
                         try:
                             yr = int(r.get("revenue_year"))
                             mo = int(r.get("revenue_month"))
-                            # find same month previous year
                             for pr in rows_sorted:
                                 if int(pr.get("revenue_year", 0)) == yr - 1 and int(pr.get("revenue_month", 0)) == mo:
                                     pv = pr.get("revenue")
@@ -1677,7 +1696,6 @@ def _finmind_revenue_fetch(stock_no: str, trade_date):
                 if yoys:
                     yoy_3m_avg = round(sum(yoys) / len(yoys), 2)
 
-                # Momentum classification
                 momentum = "unknown"
                 if latest_yoy is not None and yoy_3m_avg is not None:
                     if latest_yoy > yoy_3m_avg + 5:
@@ -1708,17 +1726,12 @@ def _finmind_revenue_fetch(stock_no: str, trade_date):
 
 
 def _finmind_eps_fetch(stock_no: str, trade_date):
-    """Fetch EPS data from financial statements.
-
-    Returns dict with latest quarter EPS + trend, or None.
-    """
     date_str = trade_date.strftime("%Y-%m-%d")
     cache_key = (stock_no, date_str)
     with _finmind_ext_cache_lock:
         if cache_key in _finmind_eps_cache:
             return _finmind_eps_cache[cache_key]
 
-    # Fetch past ~2 years of financial statements to get trend
     start_date = (trade_date - timedelta(days=800)).strftime("%Y-%m-%d")
     rows = _finmind_api_get("TaiwanStockFinancialStatements", {
         "data_id": stock_no,
@@ -1728,7 +1741,6 @@ def _finmind_eps_fetch(stock_no: str, trade_date):
     result = None
     if rows:
         try:
-            # Filter to EPS rows only
             eps_rows = [r for r in rows if r.get("type") == "EPS"]
             if eps_rows:
                 eps_sorted = sorted(eps_rows, key=lambda r: r.get("date", ""))
@@ -1736,15 +1748,13 @@ def _finmind_eps_fetch(stock_no: str, trade_date):
                 latest_eps = latest.get("value")
                 latest_date = latest.get("date")
 
-                # EPS YoY — same quarter last year
                 eps_yoy = None
                 if len(eps_sorted) >= 5:
-                    prev_year = eps_sorted[-5]  # 4 quarters ago
+                    prev_year = eps_sorted[-5]
                     pv = prev_year.get("value")
                     if pv is not None and pv != 0 and latest_eps is not None:
                         eps_yoy = round((latest_eps - pv) / abs(pv) * 100, 2)
 
-                # EPS QoQ — last quarter
                 eps_qoq = None
                 if len(eps_sorted) >= 2:
                     prev_q = eps_sorted[-2]
@@ -1752,7 +1762,6 @@ def _finmind_eps_fetch(stock_no: str, trade_date):
                     if pv is not None and pv != 0 and latest_eps is not None:
                         eps_qoq = round((latest_eps - pv) / abs(pv) * 100, 2)
 
-                # Trailing 4Q sum (TTM EPS)
                 eps_ttm = None
                 if len(eps_sorted) >= 4:
                     last4 = eps_sorted[-4:]
@@ -1760,7 +1769,6 @@ def _finmind_eps_fetch(stock_no: str, trade_date):
                     if len(vals) == 4:
                         eps_ttm = round(sum(vals), 2)
 
-                # Trend: last 4 quarters direction
                 trend = "unknown"
                 if len(eps_sorted) >= 4:
                     last4 = [r.get("value") for r in eps_sorted[-4:] if r.get("value") is not None]
@@ -1791,31 +1799,12 @@ def _finmind_eps_fetch(stock_no: str, trade_date):
 
 
 def _finmind_holders_fetch(stock_no: str, trade_date):
-    """Fetch foreign shareholding ratio from TaiwanStockShareholding.
-
-    NOTE: Originally designed for major holder (千張大戶) concentration via
-    TaiwanStockHoldingSharesPer, but that dataset requires FinMind backer/sponsor
-    membership. Switched to TaiwanStockShareholding (free) which gives foreign
-    investment ratio — a different but equally useful chip signal for Taiwan stocks.
-
-    Foreign holding ratio trend analysis:
-      - Rising trend = foreign accumulation (strong chip signal)
-      - Falling trend = foreign distribution
-      - >50% ratio = foreign-dominated stock (e.g. 2330)
-
-    Schema fields (Chinese → English):
-      外資及陸資共用法令投資上限比率 → ChineseInvestmentUpperLimitRatio (overall foreign cap %)
-      外資尚可投資股數 → ForeignInvestmentRemainingShares
-      全體外資持有股數 → ForeignInvestmentShares (what we want)
-      發行股數 → NumberOfSharesIssued (for computing ratio if needed)
-    """
     date_str = trade_date.strftime("%Y-%m-%d")
     cache_key = (stock_no, date_str)
     with _finmind_ext_cache_lock:
         if cache_key in _finmind_holders_cache:
             return _finmind_holders_cache[cache_key]
 
-    # Daily-ish updates — fetch ~35 days for 4-week delta
     start_date = (trade_date - timedelta(days=45)).strftime("%Y-%m-%d")
     rows = _finmind_api_get("TaiwanStockShareholding", {
         "data_id": stock_no,
@@ -1832,10 +1821,6 @@ def _finmind_holders_fetch(stock_no: str, trade_date):
                 return None
 
             def _compute_ratio(row):
-                """Compute foreign holding ratio (%) from a single row.
-                Tries multiple field name variants that FinMind uses.
-                """
-                # Try pre-computed ratio first
                 for key in ("ForeignInvestmentSharesRatio", "foreign_investment_shares_ratio",
                             "PercentageOfShareholding"):
                     v = row.get(key)
@@ -1844,7 +1829,6 @@ def _finmind_holders_fetch(stock_no: str, trade_date):
                             return float(v)
                         except (TypeError, ValueError):
                             pass
-                # Else compute from shares / issued
                 held = None
                 issued = None
                 for key in ("ForeignInvestmentShares", "foreign_investment_shares"):
@@ -1865,7 +1849,6 @@ def _finmind_holders_fetch(stock_no: str, trade_date):
                     return round(held / issued * 100, 4)
                 return None
 
-            # Extract latest and prior-period ratios
             latest_row = rows_sorted[-1]
             latest_ratio = _compute_ratio(latest_row)
             latest_date = latest_row.get("date")
@@ -1875,19 +1858,16 @@ def _finmind_holders_fetch(stock_no: str, trade_date):
                     _finmind_holders_cache[cache_key] = None
                 return None
 
-            # 4-week (~20 trading day) delta
             delta_4w = None
             if len(rows_sorted) >= 20:
                 old_ratio = _compute_ratio(rows_sorted[-20])
                 if old_ratio is not None:
                     delta_4w = round(latest_ratio - old_ratio, 3)
             elif len(rows_sorted) >= 2:
-                # Fallback to oldest available if we don't have 20 days
                 old_ratio = _compute_ratio(rows_sorted[0])
                 if old_ratio is not None:
                     delta_4w = round(latest_ratio - old_ratio, 3)
 
-            # Trend classification — threshold 0.2% over 4 weeks is meaningful
             trend = "unknown"
             if delta_4w is not None:
                 if delta_4w > 0.2:
@@ -1914,10 +1894,6 @@ def _finmind_holders_fetch(stock_no: str, trade_date):
 
 
 def _finmind_lending_fetch(stock_no: str, trade_date):
-    """Fetch securities lending (借券) data.
-
-    Returns dict with lending balance and change.
-    """
     date_str = trade_date.strftime("%Y-%m-%d")
     cache_key = (stock_no, date_str)
     with _finmind_ext_cache_lock:
@@ -1934,7 +1910,6 @@ def _finmind_lending_fetch(stock_no: str, trade_date):
     if rows:
         try:
             rows_sorted = sorted(rows, key=lambda r: r.get("date", ""))
-            # Aggregate by date — lending can have multiple rows per day
             by_date: Dict[str, dict] = {}
             for r in rows_sorted:
                 d = r.get("date", "")
@@ -1955,12 +1930,10 @@ def _finmind_lending_fetch(stock_no: str, trade_date):
             latest_date = dates_sorted[-1]
             latest_vol = by_date[latest_date]["volume"]
 
-            # 5-day cumulative change — sum last 5 days vs 5 days before
             vol_5d = sum(by_date[d]["volume"] for d in dates_sorted[-5:])
             vol_5d_prior = sum(by_date[d]["volume"] for d in dates_sorted[-10:-5]) if len(dates_sorted) >= 10 else 0
             vol_5d_change = vol_5d - vol_5d_prior if vol_5d_prior else None
 
-            # Smart short signal: 5d volume >= 2x prior 5d volume and > 100 lots
             smart_short = False
             if vol_5d >= 100 and vol_5d_prior and vol_5d >= vol_5d_prior * 2:
                 smart_short = True
@@ -1983,31 +1956,12 @@ def _finmind_lending_fetch(stock_no: str, trade_date):
 
 
 def _finmind_daytrade_fetch(stock_no: str, trade_date, total_volume_map: dict = None):
-    """Fetch day-trading (當沖) data from TaiwanStockDayTrading.
-
-    FinMind TaiwanStockDayTrading schema returns ONLY day-trade stats:
-      {stock_id, date, BuyAfterSale, Volume, BuyAmount, SellAmount}
-    where `Volume` is the day-trade volume (shares turned over intraday).
-
-    To compute the day-trade RATIO we need to divide by total Volume from
-    price data. Caller should pass `total_volume_map` = {date_str: total_volume}
-    so we can compute ratio without another API call.
-
-    Returns dict with:
-      day_trade_ratio_latest          — latest day's DT ratio (%)
-      day_trade_ratio_5d_avg          — 5-day moving average
-      day_trade_ratio_20d_avg         — 20-day moving average
-      day_trade_ratio_percentile_252d — percentile in last 252 days
-      flag_day_trade_overheat         — latest > 45% AND 20d avg > 35% (sustained retail frenzy)
-      flag_day_trade_divergence       — ratio rising but volume flat/down (散戶在炒、聰明錢離場)
-    """
     date_str = trade_date.strftime("%Y-%m-%d")
     cache_key = (stock_no, date_str)
     with _finmind_ext_cache_lock:
         if cache_key in _finmind_daytrade_cache:
             return _finmind_daytrade_cache[cache_key]
 
-    # Need ~300 days for 252-day percentile
     start_date = (trade_date - timedelta(days=380)).strftime("%Y-%m-%d")
     rows = _finmind_api_get("TaiwanStockDayTrading", {
         "data_id": stock_no,
@@ -2017,7 +1971,6 @@ def _finmind_daytrade_fetch(stock_no: str, trade_date, total_volume_map: dict = 
     result = None
     if rows and total_volume_map:
         try:
-            # Compute ratio per day where we have both DT volume and total volume
             ratios_by_date: Dict[str, float] = {}
             for r in rows:
                 d = r.get("date", "")
@@ -2041,33 +1994,26 @@ def _finmind_daytrade_fetch(stock_no: str, trade_date, total_volume_map: dict = 
             latest = ratios_sorted[-1]
             latest_date = dates_sorted[-1]
 
-            # 5-day MA
             avg_5d = round(sum(ratios_sorted[-5:]) / min(5, len(ratios_sorted)), 2)
-            # 20-day MA
             avg_20d = round(sum(ratios_sorted[-20:]) / min(20, len(ratios_sorted)), 2) if len(ratios_sorted) >= 2 else latest
 
-            # 252-day percentile
             window = ratios_sorted[-252:] if len(ratios_sorted) >= 30 else ratios_sorted
             rank = sum(1 for x in window if x <= latest) / len(window) if window else None
             percentile = round(rank, 4) if rank is not None else None
 
-            # Overheat flag: sustained high day-trade activity
             flag_overheat = bool(latest > 45 and avg_20d > 35)
 
-            # Divergence flag: DT ratio rising (last 5d avg vs prior 5d avg) while
-            # total volume NOT rising — means the extra turnover is pure retail churn.
             flag_divergence = False
             if len(ratios_sorted) >= 10 and len(dates_sorted) >= 10:
                 recent_5_ratio = sum(ratios_sorted[-5:]) / 5
                 prior_5_ratio = sum(ratios_sorted[-10:-5]) / 5
-                ratio_rising = recent_5_ratio > prior_5_ratio + 3  # ratio climbed at least 3 pp
+                ratio_rising = recent_5_ratio > prior_5_ratio + 3
 
-                # Get corresponding total volumes
                 recent_vols = [total_volume_map.get(d, 0) for d in dates_sorted[-5:]]
                 prior_vols = [total_volume_map.get(d, 0) for d in dates_sorted[-10:-5]]
                 recent_vol_avg = sum(recent_vols) / 5 if recent_vols else 0
                 prior_vol_avg = sum(prior_vols) / 5 if prior_vols else 0
-                vol_not_rising = recent_vol_avg <= prior_vol_avg * 1.1  # allow 10% noise
+                vol_not_rising = recent_vol_avg <= prior_vol_avg * 1.1
 
                 flag_divergence = bool(ratio_rising and vol_not_rising)
 
@@ -2091,14 +2037,10 @@ def _finmind_daytrade_fetch(stock_no: str, trade_date, total_volume_map: dict = 
 
 
 def _parse_twse_margin_csv(text: str):
-    """Parse TWSE MI_MARGN CSV response into a DataFrame.
-    Same pattern as _parse_twse_t86_csv — find header row, parse to DataFrame.
-    """
     if not text or len(text) < 200:
         return None
     text = text.replace("\r", "").replace("=", "")
     lines = [ln for ln in text.split("\n") if ln.strip()]
-    # Find header row — look for column headers containing 股票代號/代號 + 融資/資
     start = next(
         (
             i
@@ -2125,19 +2067,8 @@ def _parse_twse_margin_csv(text: str):
 
 
 def _twse_margin_json(date_yyyymmdd: str, headers: dict):
-    """Fetch TWSE margin data for ALL stocks on a given date.
+    sess = _get_session()
 
-    [FIX] Added full-market cache (like _inst_csv_cache) so that multiple
-    stocks on the same date share a single HTTP request. This eliminates
-    the rate-limit problem where 7 TWSE stocks = 7 identical requests.
-
-    [FIX] Changed from JSON to CSV format. The JSON endpoint is rate-limited
-    more aggressively by TWSE, while the CSV endpoint (same as T86 三大法人)
-    works reliably. Added CSV as primary, JSON as fallback.
-    """
-    sess = _get_session()  # [OPT]
-
-    # [FIX] Check cache first
     cache_key = ("twse_margin", date_yyyymmdd)
     with _margin_cache_lock:
         if cache_key in _margin_csv_cache:
@@ -2146,7 +2077,6 @@ def _twse_margin_json(date_yyyymmdd: str, headers: dict):
                 return None, "TWSE margin cached no-data"
             return cached, None
 
-    # [FIX] CSV first (reliable, same as T86), JSON as fallback
     urls = [
         (f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=csv&date={date_yyyymmdd}&selectType=ALL", "csv"),
         (f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=csv&date={date_yyyymmdd}&selectType=ALL", "csv"),
@@ -2156,10 +2086,8 @@ def _twse_margin_json(date_yyyymmdd: str, headers: dict):
     h2["Referer"] = "https://www.twse.com.tw/zh/trading/margin/mi-margn.html"
     last_err = None
 
-    # [FIX] Serialize via semaphore to avoid hammering TWSE
     with _twse_request_semaphore:
         time.sleep(0.35)
-        # Double-check cache inside semaphore (another thread may have fetched it)
         with _margin_cache_lock:
             if cache_key in _margin_csv_cache:
                 cached = _margin_csv_cache[cache_key]
@@ -2196,7 +2124,6 @@ def _twse_margin_json(date_yyyymmdd: str, headers: dict):
             except Exception as e:
                 last_err = str(e)
 
-    # All URLs failed — only cache legitimate no-data, not transient errors
     return None, last_err or "failed"
 
 
@@ -2230,11 +2157,6 @@ def _parse_tpex_margin_csv(text: str):
 
 
 def _tpex_margin_csv_cached(roc_date: str, headers: dict):
-    """Fetch TPEx margin data for ALL stocks on a given date.
-
-    [FIX] Added full-market cache (like TWSE margin) so that multiple
-    TPEx stocks on the same date share a single HTTP request.
-    """
     sess = _get_session()
     cache_key = ("tpex_margin", roc_date)
     with _margin_cache_lock:
@@ -2246,7 +2168,6 @@ def _tpex_margin_csv_cached(roc_date: str, headers: dict):
 
     with _twse_request_semaphore:
         time.sleep(0.2)
-        # Double-check cache inside semaphore
         with _margin_cache_lock:
             if cache_key in _margin_csv_cache:
                 cached = _margin_csv_cache[cache_key]
@@ -2266,7 +2187,6 @@ def _tpex_margin_csv_cached(roc_date: str, headers: dict):
                 with _margin_cache_lock:
                     _margin_csv_cache[cache_key] = df
                 return df, None
-            # Legitimate no-data
             with _margin_cache_lock:
                 _margin_csv_cache[cache_key] = None
             return None, "TPEx margin empty"
@@ -2280,10 +2200,8 @@ def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, ma
     is_two = isinstance(market_hint, str) and market_hint.upper().endswith(".TWO")
     last_error = None
 
-    # [FIX] Try FinMind first — works for both TWSE and TPEx, not blocked by rate limits
     finmind_result = _finmind_margin_fetch(stock_no, trade_date, max_back)
     if finmind_result is not None and finmind_result.get("margin_balance") is not None:
-        # Fix the id suffix for TPEx stocks
         if is_two:
             finmind_result["id"] = f"{stock_no}.TWO"
         return finmind_result
@@ -2346,7 +2264,6 @@ def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, ma
             else:
                 last_error = err
 
-        # [FIX] TPEx margin — now uses cached helper
         roc_year = d.year - 1911
         roc_date = f"{roc_year:03d}/{d.month:02d}/{d.day:02d}"
         df, err = _tpex_margin_csv_cached(roc_date, headers)
@@ -2379,13 +2296,13 @@ def get_margin_short_data(stock_id: str, trade_date, market_hint: str = None, ma
 
 
 # ===================================================================
-# 11. TDCC – [OPT] uses pooled session
+# 11. TDCC
 # ===================================================================
 
 
 def get_tdcc_distribution(stock_no: str, weeks_back: int = 2) -> Dict[str, Any]:
     stock_no = _strip_suffix(stock_no)
-    sess = _get_session()  # [OPT]
+    sess = _get_session()
     headers = {"User-Agent": "Mozilla/5.0"}
     result = {"error": None, "data": [], "as_of_date": None, "data_lag_days": None}
 
@@ -2532,7 +2449,6 @@ def compute_tdcc_features(tdcc_data: Dict) -> Dict[str, Any]:
 def calc_relative_strength(stock_df, benchmark_ticker="0050.TW", period=20):
     try:
         with _yf_lock:
-            # [FIX] auto_adjust=True and ffill() to avoid missing data/unadjusted price bugs
             bench = yf.download(benchmark_ticker, period="3mo", progress=False, auto_adjust=True)
             bench = clean_yf_columns(_ensure_naive_index(bench))
             if not bench.empty:
@@ -2551,9 +2467,7 @@ def calc_relative_strength(stock_df, benchmark_ticker="0050.TW", period=20):
         return None
 
 
-# [OPT] Pre-fetch benchmark with provided df to avoid extra yf.download call
 def _calc_relative_strength_with_bench(stock_df, bench_df, period=20):
-    """Compute relative strength using pre-fetched benchmark data."""
     try:
         if bench_df is None or bench_df.empty or len(stock_df) < period:
             return None
@@ -2569,17 +2483,11 @@ def _calc_relative_strength_with_bench(stock_df, bench_df, period=20):
 
 
 # ===================================================================
-# 13. DECISION FIELDS (MODIFIED: ATR FLOOR & WHIPSAW WARNING)
+# 13. DECISION FIELDS (ATR FLOOR & WHIPSAW WARNING)
 # ===================================================================
 
-# [P3] Unified trend classifier — ADX qualification in one pass, no intermediate states
+
 def classify_trend(c: float, ma5: float, ma20: float, ma60: float, adx_val: float) -> tuple:
-    """
-    Returns (trend_state, trend_strength) in a single pass.
-    Eliminates the bug where ADX qualification could be bypassed
-    by exceptions between the initial classification and the qualifier.
-    """
-    # Determine base trend from MA cascade
     if c > ma20 > ma60 and ma5 > ma20:
         base = "uptrend"
     elif c > ma20 > ma60 and ma5 <= ma20:
@@ -2589,7 +2497,6 @@ def classify_trend(c: float, ma5: float, ma20: float, ma60: float, adx_val: floa
     elif c < ma20 < ma60 and ma5 >= ma20:
         return "downtrend_bounce", _adx_strength(adx_val)
     elif c > ma20 and ma20 < ma60:
-        # [FIX] bottom_bounce also gets ADX qualification
         prefix = "strong_" if adx_val >= 25 else "weak_"
         return prefix + "bottom_bounce", _adx_strength(adx_val)
     elif c < ma20 and ma20 > ma60:
@@ -2597,7 +2504,6 @@ def classify_trend(c: float, ma5: float, ma20: float, ma60: float, adx_val: floa
     else:
         return "consolidation", _adx_strength(adx_val)
 
-    # Qualify directional trends with ADX strength
     prefix = "strong_" if adx_val >= 25 else "weak_"
     return prefix + base, _adx_strength(adx_val)
 
@@ -2619,13 +2525,11 @@ def compute_decision_fields(
         bb_squeeze: bool = False,
         trend_state: str = "consolidation",
         volatility_regime: str = "normal",
-        # [P4] Additional inputs for event-based entry trigger
         bb_squeeze_fire: bool = False,
         vol_ratio: Optional[float] = None,
         supertrend_flip_bull: bool = False,
         kd_golden_cross: bool = False,
         macd_golden_cross: bool = False,
-        # [P1-B] Veto rule inputs
         above_bb_upper: bool = False,
         price_down_vol_up: bool = False,
         close_gt_open: bool = False,
@@ -2640,7 +2544,6 @@ def compute_decision_fields(
     is_bullish = supertrend_dir == 1
     is_bearish_trend = trend_state in ("downtrend", "strong_downtrend", "weak_downtrend")
 
-    # Adaptive stop-loss multiplier based on context
     if is_bearish_trend:
         multiplier = 2.5
         feat["stop_loss_context"] = "bearish_trend_caution"
@@ -2659,7 +2562,6 @@ def compute_decision_fields(
 
     raw_stop = c_now - multiplier * atr_now
 
-    # --- ATR FLOOR MECHANISM ---
     min_stop_distance = 1.5 * atr_now
     max_stop_price = c_now - min_stop_distance
 
@@ -2685,7 +2587,6 @@ def compute_decision_fields(
         rr = round(reward / risk, 2) if risk > 0 else None
         feat["risk_reward_ratio"] = rr
 
-        # [P3 FIX] Tighter anomaly threshold
         if rr and rr > RR_ANOMALY_THRESHOLD:
             feat["flag_rr_anomaly"] = True
             feat["stop_loss_context"] += "_[Whipsaw_Risk]"
@@ -2704,18 +2605,10 @@ def compute_decision_fields(
         feat["nearest_support"] = None
         feat["support_distance_pct"] = None
 
-    # ---------------------------------------------------------------
-    # [P4 Item 1] EVENT-BASED ENTRY TRIGGER (v2)
-    # Now includes:
-    #   - Veto rules for adverse tape conditions (P1-B)
-    #   - Single-event confirmation requirement
-    #   - Price-action quality check
-    # ---------------------------------------------------------------
     rr_val = feat.get("risk_reward_ratio")
-    rr_ok = bool(rr_val is not None and rr_val >= ENTRY_MIN_RR)  # kept for display, not gating
+    rr_ok = bool(rr_val is not None and rr_val >= ENTRY_MIN_RR)
     vol_surge = bool(vol_ratio is not None and vol_ratio > 1.5)
 
-    # "Today events" — instantaneous signals that only fire on transition day
     today_events = []
     if bb_squeeze_fire:
         today_events.append("bb_squeeze_fire")
@@ -2731,38 +2624,20 @@ def compute_decision_fields(
     has_event = len(today_events) >= 1
     not_bearish = trend_state not in ("downtrend", "strong_downtrend", "weak_downtrend", "top_pullback")
 
-    # [SOFT WARNINGS] These conditions used to be hard vetoes that blocked the trigger.
-    # They're now surfaced as warnings for AI to weigh against other context.
-    # Rationale: any single rule viewed in isolation can misfire (e.g. strong stock
-    # pulling back to MA20 on volume looks like distribution; a breakout running
-    # above BB upper for days looks overextended but may continue). Let AI integrate
-    # these warnings with fundamentals, chip signals, retail sentiment, and news.
     entry_warnings = []
     if price_down_vol_up and not supertrend_flip_bull:
-        # Distribution bar candidate — down close + volume surge, no reversal signal
         entry_warnings.append("price_down_vol_up_distribution")
     if above_bb_upper and volatility_regime in ("high_volatility", "expansion"):
-        # Overextension candidate — closed above BB upper in high-vol regime
         entry_warnings.append("above_bb_upper_in_high_vol")
     if not close_gt_open and not supertrend_flip_bull and not kd_golden_cross:
-        # Unconfirmed red candle — no reversal signal to rescue it
         entry_warnings.append("red_candle_no_reversal_confirm")
 
     has_warnings = len(entry_warnings) > 0
 
-    # [P1-B] CONFIRMATION REQUIREMENT — single-event triggers need extra support
-    # This one REMAINS a hard gate because it's about signal quality, not risk judgement.
-    # bb_squeeze_fire alone is a "candidate", not a trigger. It needs at least one of:
-    #   - volume confirmation (vol_surge)
-    #   - green candle
     needs_confirmation = (len(today_events) == 1 and today_events[0] == "bb_squeeze_fire")
     has_confirmation = vol_surge or close_gt_open
     single_event_blocked = needs_confirmation and not has_confirmation
 
-    # Final trigger decision
-    # [CHANGED] Neither RR nor soft warnings gate the trigger anymore. Only signal
-    # quality (has_event + bullish context + confirmation) determines pass/fail.
-    # Warnings are shown in a separate field for AI to consider holistically.
     trigger_pass = bool(
         has_event and not_bearish and is_bullish
         and not single_event_blocked
@@ -2771,12 +2646,9 @@ def compute_decision_fields(
     feat["flag_entry_trigger"] = trigger_pass
     feat["entry_trigger_events"] = today_events if trigger_pass else []
 
-    # [NEW FIELD NAME] entry_warnings replaces entry_trigger_veto
     feat["entry_warnings"] = entry_warnings if entry_warnings else []
     feat["entry_warning_count"] = len(entry_warnings)
 
-    # Backward-compat alias — keep entry_trigger_veto populated so any prompt that
-    # still references it won't break. Will be removed in a future cleanup.
     feat["entry_trigger_veto"] = entry_warnings if entry_warnings else []
 
     if trigger_pass:
@@ -2792,11 +2664,6 @@ def compute_decision_fields(
     else:
         feat["entry_trigger_reason"] = "no_trigger"
 
-    # ---------------------------------------------------------------
-    # [P4 Item 2] SUGGESTED POSITION SIZE
-    # Formula: Position % = Portfolio Risk % / |ATR Stop Loss %|
-    # Capped at MAX_POSITION_PCT to prevent concentration.
-    # ---------------------------------------------------------------
     stop_pct = abs(feat.get("atr_stop_loss_pct", -3.0))
     if stop_pct > 0:
         raw_size = PORTFOLIO_RISK_PCT / stop_pct * 100
@@ -2809,24 +2676,14 @@ def compute_decision_fields(
 
 # ===================================================================
 # 14. MAIN: BUILD AI FEATURES JSON
-# [OPT] Sequential yf downloads (thread-unsafe) + parallel external data
 # ===================================================================
 
 
 def _download_yf(ticker: str, period: str, interval: str, max_retries: int = 3):
-    """Helper for threaded yf.download — serialised via _yf_lock.
-
-    [FIX] Added retry with exponential backoff to handle Yahoo rate-limiting.
-    Yahoo intermittently returns empty JSON (HTTP 200 but no data) or HTTP 429
-    when too many requests are made in a short window. This causes yfinance to
-    return an empty DataFrame, which downstream code treats as "not found".
-    Retrying with increasing delays (2s → 4s → 8s) resolves most transient
-    failures without changing any downstream logic.
-    """
+    """Helper for threaded yf.download — serialised via _yf_lock."""
     for attempt in range(max_retries):
         with _yf_lock:
             try:
-                # [FIX] auto_adjust=True and ffill() to avoid missing data/unadjusted price bugs
                 df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
                 df = clean_yf_columns(_ensure_naive_index(df))
                 if not df.empty:
@@ -2835,7 +2692,6 @@ def _download_yf(ticker: str, period: str, interval: str, max_retries: int = 3):
             except Exception as e:
                 logger.warning("yf.download(%s) attempt %d/%d exception: %s",
                                ticker, attempt + 1, max_retries, e)
-        # Empty df or exception — wait before retrying (backoff: 2s, 4s, 8s)
         if attempt < max_retries - 1:
             wait = 2 ** (attempt + 1)
             logger.info("yf.download(%s) returned empty, retrying in %ds (%d/%d)",
@@ -2854,14 +2710,25 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
 
     # -- download daily (sequential — yf.download is NOT thread-safe) --
     df_daily = _download_yf(yf_ticker, "2y", "1d")
+    used_finmind_for_price = False  # 標記:這檔有沒有走 FinMind 備援
 
     if df_daily.empty and yf_ticker.endswith(".TW"):
         yf_ticker = yf_ticker.replace(".TW", ".TWO")
         df_daily = _download_yf(yf_ticker, "2y", "1d")
 
+    # [NEW] FinMind 備援:對新上市 ETF / 主動式 ETF, yfinance 經常沒有資料
+    # 只對台股代號(數字開頭)觸發,避免影響 .KS / .HK / .T 海外標的
+    if df_daily.empty and stock_no and stock_no[0].isdigit():
+        logger.info(f"{stock_id}: yfinance 失敗,嘗試 FinMind 備援")
+        df_daily = _finmind_price_fetch(stock_no, lookback_days=730)
+        if not df_daily.empty:
+            used_finmind_for_price = True
+            yf_ticker = f"{stock_no}.TW"
+            logger.info(f"{stock_id}: FinMind 備援成功,共 {len(df_daily)} 筆")
+
     if df_daily.empty:
-        logger.warning("%s (%s): all yf.download attempts returned empty — "
-                       "likely Yahoo rate-limit, not a bad ticker", stock_id, yf_ticker)
+        logger.warning("%s (%s): 所有資料源 (yfinance + FinMind) 都失敗",
+                       stock_id, yf_ticker)
         return {"error": f"not found: {stock_id}", "symbol": stock_id}
 
     chosen_ts = _nearest_trading_ts(df_daily, as_of_date)
@@ -2870,25 +2737,34 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
 
     df = df_daily.loc[:chosen_ts].copy()
     if len(df) < 60:
-        return {"error": "less than 60 days data", "symbol": stock_id}
+        return {
+            "error": "less than 60 days data",
+            "symbol": stock_id,
+            "data_source": "FinMind" if used_finmind_for_price else "yfinance",
+            "available_days": len(df),
+        }
 
     latest = df.iloc[-1]
     trade_date = chosen_ts.date()
     query_date = as_of_date if as_of_date else datetime.now().date()
 
-    # -- download weekly + benchmark sequentially (AI only) --
+    # -- download weekly + benchmark --
     df_weekly_upto = None
     bench_df = None
     if mode == "ai":
-        df_weekly = _download_yf(yf_ticker, "2y", "1wk")
+        if used_finmind_for_price:
+            # FinMind 路線:從日線重採樣產生週線
+            df_weekly = _resample_daily_to_weekly(df_daily)
+        else:
+            df_weekly = _download_yf(yf_ticker, "2y", "1wk")
+            # yfinance 抓到日線但週線失敗時,也用日線重採樣
+            if df_weekly is None or df_weekly.empty:
+                df_weekly = _resample_daily_to_weekly(df_daily)
         df_weekly_upto = df_weekly.loc[:chosen_ts] if df_weekly is not None and not df_weekly.empty else None
-        # [P1] Use cached benchmark — downloaded once, reused for all stocks
         bench_df = _get_cached_benchmark()
 
     # -- basic price --
     close = df["Close"]
-    # [FIX] round to 2 decimals to fix yfinance float32 precision artifacts
-    # e.g. 69.19999694824219 → 69.2
     c_now = round(float(latest["Close"]), 2)
     o_now = round(float(latest["Open"]), 2)
     h_now = round(float(latest["High"]), 2)
@@ -2896,6 +2772,9 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
     vol_now = float(latest["Volume"])
 
     feat: Dict[str, Any] = {"symbol": yf_ticker, "price_date": str(trade_date), "query_date": str(query_date)}
+
+    # [NEW] 註記資料來源
+    feat["price_data_source"] = "FinMind" if used_finmind_for_price else "yfinance"
 
     feat["close"] = c_now
     feat["open"] = o_now
@@ -2930,8 +2809,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
     feat["ma5_slope_5d"] = slope_n(ma5, 5)
     feat["ma20_slope_5d"] = slope_n(ma20, 5)
 
-    # [P3 FIX] Preliminary MA-only trend classification for sections that run
-    # before ADX is available. Will be overwritten by classify_trend() after ADX.
     if c_now > ma20_now > ma60_now and ma5_now > ma20_now:
         trend_state = "uptrend"
     elif c_now > ma20_now > ma60_now and ma5_now <= ma20_now:
@@ -2946,20 +2823,17 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         trend_state = "top_pullback"
     else:
         trend_state = "consolidation"
-    # Note: trend_state will be REFINED with ADX qualification by classify_trend() below
 
-    # 52w position
     high_52 = float(df.tail(252)["High"].max())
     low_52 = float(df.tail(252)["Low"].min())
     feat["pos_52w_pct"] = round((c_now - low_52) / (high_52 - low_52) * 100, 2) if high_52 != low_52 else 50.0
 
-    # weekly vs 20w MA + multi-timeframe analysis (AI only, Item #12)
+    # weekly + multi-timeframe
     if mode == "ai" and df_weekly_upto is not None and not df_weekly_upto.empty and len(df_weekly_upto) >= 20:
         w_close = df_weekly_upto["Close"]
         wma20 = float(w_close.rolling(20).mean().iloc[-1])
         feat["weekly_above_ma20"] = bool(float(w_close.iloc[-1]) > wma20)
 
-        # Weekly trend state
         wma5 = w_close.rolling(5).mean()
         wma60_s = w_close.rolling(60).mean()
         wma5_now = float(wma5.iloc[-1]) if len(wma5.dropna()) >= 1 else None
@@ -2977,15 +2851,12 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
             weekly_trend = "insufficient_data"
         feat["weekly_trend_state"] = weekly_trend
 
-        # Weekly RSI
         if len(w_close.dropna()) >= 20:
             w_rsi = calculate_rsi(w_close, 14)
             feat["weekly_rsi14"] = round(float(w_rsi.iloc[-1]), 2)
         else:
             feat["weekly_rsi14"] = None
 
-        # Multi-timeframe alignment — upgraded taxonomy (P2-C)
-        # States: aligned_bull, aligned_bear, mixed_bull_bias, mixed_bear_bias, conflicting
         daily_strong_bull = trend_state in ("uptrend", "strong_uptrend")
         daily_bull_bias = trend_state in (
             "uptrend", "strong_uptrend", "weak_uptrend", "uptrend_pullback",
@@ -3009,17 +2880,15 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         elif daily_bear_bias and weekly_neutral:
             feat["mtf_alignment"] = "mixed_bear_bias"
         elif daily_strong_bull and weekly_bear:
-            feat["mtf_alignment"] = "conflicting"  # True directional disagreement
+            feat["mtf_alignment"] = "conflicting"
         elif daily_strong_bear and weekly_bull:
             feat["mtf_alignment"] = "conflicting"
         else:
             feat["mtf_alignment"] = "mixed_neutral"
 
-        # Strict agreement (unchanged — directional only)
         feat["daily_weekly_trend_agree"] = bool(
             (daily_bull_bias and weekly_bull) or (daily_bear_bias and weekly_bear)
         )
-        # [P2-C] Bias agreement (looser — includes neutral weekly)
         feat["daily_weekly_bias_agree"] = bool(
             (daily_bull_bias and (weekly_bull or weekly_neutral))
             or (daily_bear_bias and (weekly_bear or weekly_neutral))
@@ -3032,8 +2901,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         feat["daily_weekly_trend_agree"] = None
         feat["daily_weekly_bias_agree"] = None
 
-    # [OPT] relative strength using pre-fetched benchmark (no extra download)
-    # Multi-period RS (Item #18): 20d, 63d, 252d
+    # relative strength
     if mode == "ai":
         for rs_period in [20, 63, 252]:
             rs_data = _calc_relative_strength_with_bench(df, bench_df, period=rs_period)
@@ -3048,7 +2916,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
                     feat["stock_ret_20d"] = None
                     feat["bench_ret_20d"] = None
 
-        # RS acceleration: is short-term RS improving vs medium-term?
         rs_20 = feat.get("rs_vs_bench_20d")
         rs_63 = feat.get("rs_vs_bench_63d")
         feat["rs_improving"] = bool(rs_20 is not None and rs_63 is not None and rs_20 > rs_63)
@@ -3056,8 +2923,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         feat["rs_vs_bench_20d"] = None
 
     # volume analysis
-    # [P0 FIX] Use PREVIOUS 5 days as baseline, excluding today's volume.
-    # Including today dampens the ratio (today is 1/5 of the denominator).
     avg_vol_5_prev = float(df["Volume"].iloc[-6:-1].mean()) if len(df) >= 6 else float(df["Volume"].tail(5).mean())
     feat["vol_ratio_5d"] = round(vol_now / avg_vol_5_prev, 4) if avg_vol_5_prev > 0 else None
     prev_close = float(df["Close"].iloc[-2]) if len(df) >= 2 else c_now
@@ -3084,7 +2949,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
     feat["kd_k"] = round(float(k_val.iloc[-1]), 2)
     feat["kd_d"] = round(float(d_val.iloc[-1]), 2)
 
-    # [P2] KD cross with anti-whipsaw filter (zone + dynamic spread)
     if len(k_val) >= 2 and len(d_val) >= 2:
         k_prev = float(k_val.iloc[-2])
         d_prev = float(d_val.iloc[-2])
@@ -3094,10 +2958,9 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         raw_cross_down = k_prev >= d_prev and k_now_v < d_now_v
         kd_spread = abs(k_now_v - d_now_v)
 
-        # Dynamic spread threshold: use recent KD volatility
         kd_diff_series = (k_val - d_val).dropna().tail(60)
         kd_std = float(kd_diff_series.std()) if len(kd_diff_series) >= 20 else 3.0
-        min_spread = max(kd_std * KD_SPREAD_STD_MULT, 1.0)  # Floor at 1.0
+        min_spread = max(kd_std * KD_SPREAD_STD_MULT, 1.0)
 
         feat["flag_kd_golden_cross"] = bool(
             raw_cross_up and k_now_v < KD_ZONE_OVERSOLD and kd_spread > min_spread
@@ -3105,7 +2968,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         feat["flag_kd_death_cross"] = bool(
             raw_cross_down and k_now_v > KD_ZONE_OVERBOUGHT and kd_spread > min_spread
         )
-        # Raw crosses (unfiltered) — for the AI consumer
         feat["flag_kd_cross_up_raw"] = bool(raw_cross_up)
         feat["flag_kd_cross_down_raw"] = bool(raw_cross_down)
     else:
@@ -3131,7 +2993,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
     feat["flag_macd_death_cross"] = bool(
         len(dif) >= 2 and len(dea) >= 2 and dif.iloc[-2] > dea.iloc[-2] and dif.iloc[-1] < dea.iloc[-1]
     )
-    # [P0] Raw MACD crosses (unfiltered) — ghost field implementation
     feat["flag_macd_cross_up_raw"] = feat["flag_macd_golden_cross"]
     feat["flag_macd_cross_down_raw"] = feat["flag_macd_death_cross"]
 
@@ -3143,9 +3004,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
     feat["flag_strong_trend"] = bool(float(adx.iloc[-1]) > 25)
     feat["flag_di_bullish"] = bool(float(pdi.iloc[-1]) > float(mdi.iloc[-1]))
 
-    # [P3 FIX] Unified trend classification — ADX + MA in one atomic call
-    # This eliminates the bug where intermediate exceptions could leave
-    # trend_state in an unqualified state like bare "uptrend".
     adx_now_val = float(adx.iloc[-1])
     trend_state, trend_strength = classify_trend(c_now, ma5_now, ma20_now, ma60_now, adx_now_val)
     feat["trend_state"] = trend_state
@@ -3159,7 +3017,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
     feat["atr14_percentile_252d"] = percentile_rank(atr_series, 252)
 
     # Volatility
-    # Volatility (annualized)
     returns_20d = close.pct_change().tail(20)
     if len(returns_20d) >= 10:
         daily_std = float(returns_20d.std())
@@ -3181,10 +3038,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         feat["bb_width_percentile_252d"] is not None and feat["bb_width_percentile_252d"] < 0.15)
     feat["flag_above_bb_upper"] = bool(c_now > bb_upper_now)
 
-    # Volatility regime classifier WITH HYSTERESIS (Phase 3 Item 2)
-    # Requires VOL_REGIME_CONFIRM_DAYS consecutive days in new regime before switching
     def _classify_vol_regime_single(bb_p, atr_p):
-        """Classify a single day's regime (raw, no hysteresis)."""
         if bb_p is None or atr_p is None or not np.isfinite(bb_p) or not np.isfinite(atr_p):
             return "unknown"
         if bb_p < 0.15 and atr_p < 0.25:
@@ -3198,21 +3052,14 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         return "normal"
 
     def _classify_vol_regime_with_hysteresis(bbw_series, atr_series, confirm_days=VOL_REGIME_CONFIRM_DAYS):
-        """
-        Apply hysteresis: only switch regime if the NEW regime has been
-        consistent for `confirm_days` consecutive days. This prevents the
-        stop-loss multiplier from jumping erratically on single-day spikes.
-        """
         if bbw_series is None or atr_series is None:
             return "unknown"
         n_check = confirm_days + 1
         if len(bbw_series.dropna()) < n_check or len(atr_series.dropna()) < n_check:
-            # Not enough data for hysteresis — fall back to single-day
             bb_p = percentile_rank(bbw_series.dropna(), 252)
             atr_p = percentile_rank(atr_series.dropna(), 252)
             return _classify_vol_regime_single(bb_p, atr_p)
 
-        # Compute regime for each of the last N days
         recent_regimes = []
         for offset in range(confirm_days):
             idx = -(offset + 1)
@@ -3222,22 +3069,17 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
             atr_p = percentile_rank(atr_slice.dropna(), 252)
             recent_regimes.append(_classify_vol_regime_single(bb_p, atr_p))
 
-        # Current day's raw classification
         bb_p_now = percentile_rank(bbw_series.dropna(), 252)
         atr_p_now = percentile_rank(atr_series.dropna(), 252)
         current_raw = _classify_vol_regime_single(bb_p_now, atr_p_now)
 
-        # Hysteresis: only adopt new regime if ALL recent days agree
         if all(r == current_raw for r in recent_regimes):
             return current_raw
-        # Otherwise stay with the most common recent regime (conservative)
         from collections import Counter
         counts = Counter(recent_regimes + [current_raw])
         return counts.most_common(1)[0][0]
 
     feat["volatility_regime"] = _classify_vol_regime_with_hysteresis(bbw, atr_series)
-
-    # Also store the raw single-day classification for transparency
     feat["volatility_regime_raw"] = _classify_vol_regime_single(
         feat.get("bb_width_percentile_252d"),
         feat.get("atr14_percentile_252d"),
@@ -3245,15 +3087,12 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
 
     # SuperTrend
     st_direction = 0
-    st_dir_series = None
     try:
         st_line, st_dir = calculate_supertrend(df)
         st_val = float(st_line.iloc[-1])
         st_direction = int(st_dir.iloc[-1])
-        st_dir_series = st_dir
         feat["supertrend_bullish"] = bool(st_direction == 1)
         feat["supertrend_distance_pct"] = round((c_now - st_val) / st_val * 100, 4)
-        # [P0] SuperTrend flip flags — fire only on the transition day
         if len(st_dir) >= 2:
             feat["flag_supertrend_flip_bull"] = bool(
                 int(st_dir.iloc[-2]) == -1 and int(st_dir.iloc[-1]) == 1
@@ -3270,7 +3109,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         feat["flag_supertrend_flip_bull"] = False
         feat["flag_supertrend_flip_bear"] = False
 
-    # [P0] BB Squeeze Fire — bandwidth expanding after being in squeeze territory
     if len(bbw.dropna()) >= 6:
         recent_5_bbw = bbw.iloc[-6:-1]
         squeeze_threshold = bbw.quantile(0.15)
@@ -3297,11 +3135,11 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
     vp = calculate_volume_profile(df, lookback=60)
     feat.update(vp)
 
-    # short term S/R (pivot-clustered)
+    # short term S/R
     sr = detect_short_term_sr(df, lookback=120)
     feat.update(sr)
 
-    # Fibonacci (direction-aware)
+    # Fibonacci
     fib = calculate_fibonacci_summary(df, trend_state=trend_state)
     feat.update(fib)
 
@@ -3354,14 +3192,11 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         feat["chart_pattern_2_confirmed"] = False
         feat["chart_pattern_2_bias"] = None
 
-    # [OPT] External data (AI only) – run all 4 fetches in PARALLEL
+    # External data (AI only) — parallel
     if mode == "ai":
         latest_overall_ts = df_daily.index[-1]
         price_20d_ago = float(df["Close"].iloc[-20]) if len(df) >= 20 else c_now
         avg_daily_vol_20d = float(df["Volume"].tail(20).mean()) if len(df) >= 20 else 0
-
-        # Define tasks for parallel execution
-        ext_results = {}
 
         def _fetch_institutional():
             try:
@@ -3384,8 +3219,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
                     m_chg = margin.get("margin_change")
                     s_chg = margin.get("short_change")
                     m_usage = margin.get("margin_usage_rate")
-                    as_of = margin.get("as_of_date") or margin.get("date")  # FinMind returns 'date', TWSE returns 'as_of_date'
-                    # [P0-A FIX] Only mark available if at least one core field is non-null
+                    as_of = margin.get("as_of_date") or margin.get("date")
                     has_real_data = any(v is not None for v in [m_bal, s_bal, m_chg, s_chg, m_usage])
                     return {
                         "margin_balance": m_bal,
@@ -3394,7 +3228,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
                         "short_balance": s_bal,
                         "short_change": s_chg,
                         "short_margin_ratio": round(s_bal / m_bal * 100, 2) if m_bal and s_bal and m_bal > 0 else None,
-                        "margin_date": as_of,  # [V2] surface data date for staleness checks
+                        "margin_date": as_of,
                         "margin_data_available": has_real_data,
                     }
                 return {"margin_data_available": False, "margin_date": None}
@@ -3408,7 +3242,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
             except Exception:
                 return {"tdcc_available": False}
 
-        # [NEW] FinMind extended fetches — revenue, EPS, major holders, lending
         def _fetch_revenue():
             try:
                 r = _finmind_revenue_fetch(stock_no, latest_overall_ts.date())
@@ -3439,8 +3272,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
 
         def _fetch_daytrade():
             try:
-                # Build {date_str: total_volume} map from df for ratio computation.
-                # df is in scope from build_ai_features' enclosing frame.
                 vol_map = {}
                 try:
                     for ts, v in df["Volume"].items():
@@ -3455,7 +3286,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
             except Exception:
                 return {"day_trade_data_available": False}
 
-        # [OPT] Run all external data fetches in parallel threads
         with ThreadPoolExecutor(max_workers=8) as pool:
             fut_inst = pool.submit(_fetch_institutional)
             fut_margin = pool.submit(_fetch_margin)
@@ -3485,11 +3315,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         feat["lending_data_available"] = False
         feat["day_trade_data_available"] = False
 
-    # ===================================================================
-    # [P0] GHOST FIELD IMPLEMENTATIONS — Beta, Liquidity, Divergence Net
-    # ===================================================================
-
-    # Beta (60-day vs benchmark)
+    # Beta
     if mode == "ai" and bench_df is not None and not bench_df.empty and len(df) >= 60:
         try:
             stock_ret = df["Close"].pct_change().iloc[-60:].dropna()
@@ -3510,13 +3336,13 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
     else:
         feat["beta_60d"] = None
 
-    # Liquidity metrics
+    # Liquidity
     avg_vol_20 = float(df["Volume"].tail(20).mean()) if len(df) >= 20 else 0
     feat["avg_daily_volume_20d"] = int(avg_vol_20)
     feat["avg_daily_turnover_20d_m"] = round(avg_vol_20 * c_now / 1_000_000, 2)
-    feat["is_liquid"] = bool(feat["avg_daily_turnover_20d_m"] >= 50)  # >= 50M TWD/day
+    feat["is_liquid"] = bool(feat["avg_daily_turnover_20d_m"] >= 50)
 
-    # Divergence net signal (resolve conflicting RSI vs MACD divergences)
+    # Divergence net signal
     bull_div = feat.get("flag_bullish_divergence_rsi") or feat.get("flag_bullish_divergence_macd")
     bear_div = feat.get("flag_bearish_divergence_rsi") or feat.get("flag_bearish_divergence_macd")
     if bull_div and bear_div:
@@ -3528,45 +3354,34 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
     else:
         feat["divergence_net_signal"] = "none"
 
-    # ===================================================================
-    # Decision fields (WITH ATR FLOOR, EVENT-BASED TRIGGERS, POSITION SIZING)
-    # ===================================================================
+    # Decision fields
     resistance = feat.get("fib_nearest_resistance_1") or feat.get("st_resistance")
-    # For breakout stocks at highs with no retracement resistance, use extension levels
     if resistance and resistance <= c_now * 1.005:
         ext_resistance = feat.get("fib_ext_1272")
         if ext_resistance and ext_resistance > c_now:
             resistance = ext_resistance
     support = feat.get("fib_nearest_support_1") or feat.get("st_support")
 
-    # [P4] Pass event-based trigger inputs to decision engine
     decision = compute_decision_fields(
         c_now, atr_now, resistance, support, st_direction,
         bb_squeeze=bool(feat.get("flag_bb_squeeze")),
         trend_state=trend_state,
         volatility_regime=feat.get("volatility_regime", "normal"),
-        # Event-based trigger inputs
         bb_squeeze_fire=bool(feat.get("flag_bb_squeeze_fire")),
         vol_ratio=feat.get("vol_ratio_5d"),
         supertrend_flip_bull=bool(feat.get("flag_supertrend_flip_bull")),
         kd_golden_cross=bool(feat.get("flag_kd_golden_cross")),
         macd_golden_cross=bool(feat.get("flag_macd_golden_cross")),
-        # [P1-B] Veto rule inputs
         above_bb_upper=bool(feat.get("flag_above_bb_upper")),
         price_down_vol_up=bool(feat.get("flag_price_down_vol_up")),
         close_gt_open=bool(c_now > o_now),
     )
     feat.update(decision)
 
-    # [P0] Poor risk/reward flag
     rr = feat.get("risk_reward_ratio")
     feat["flag_poor_risk_reward"] = bool(rr is not None and rr < 1.0)
 
-    # Data quality metadata (Item #19)
-    # [P0-A] Data quality metadata — now includes external source reliability
-    # [V2] Each source now carries its actual data date (no lag_days/stale flags —
-    # those are inferred by AI from comparing to analysis_date, since each source
-    # has different "normal" lag (revenue ~monthly, EPS ~quarterly, chip daily).
+    # Data quality metadata
     analysis_date_str = trade_date.isoformat() if trade_date else None
     feat["analysis_date"] = analysis_date_str
 
@@ -3575,12 +3390,11 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
         "volume_zero_pct": round(float((df["Volume"] == 0).sum()) / len(df) * 100, 1) if len(df) > 0 else None,
         "stale_warning": bool((datetime.now().date() - trade_date).days > 3),
         "analysis_date": analysis_date_str,
+        # [NEW] price 資料源
+        "price_source": "FinMind" if used_finmind_for_price else "yfinance",
     }
     if mode == "ai":
         feat["data_quality"]["inst_data_coverage"] = None
-        # [P0-A V2] External source metadata — only date, available, source.
-        # AI reads analysis_date and compares with each source's date to determine
-        # staleness based on per-source context (monthly vs quarterly vs daily).
         feat["data_quality"]["external_sources"] = {
             "margin": {
                 "available": feat.get("margin_data_available", False),
@@ -3619,7 +3433,7 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
             },
         }
 
-    # ---- Regulatory list flags (Attention / Disposition) ----
+    # Regulatory list flags
     _reg = regulatory_data or {}
     _attn_set = _reg.get("attention_stocks", set())
     _disp_dict = _reg.get("disposition_stocks", {})
@@ -3647,7 +3461,6 @@ def build_ai_features(stock_id: str, as_of_date=None, mode: str = "ai",
             "source": disp_info.get("source", ""),
         }
 
-    # Final sanitize
     feat = _sanitize_numpy(feat)
     return feat
 
@@ -3829,7 +3642,7 @@ def analyze_sector_performance(sector_name: str, as_of_date=None, custom_tickers
 
 
 # ===================================================================
-# 17. ENTRY POINT
+# 17. ENTRY POINT (analyze_stock_technical)
 # mode="human" => fast, text only
 # mode="ai"    => full JSON
 # ===================================================================
@@ -3871,9 +3684,9 @@ def analyze_stock_technical(stock_id: str, as_of_date=None, mode: str = "human",
 
 def _finmind_taiex_fetch(start_date: str, end_date: str) -> pd.DataFrame:
     """從 FinMind 抓加權指數 (TAIEX) 日線資料，作為 yfinance ^TWII 的備援。
-    
+
     使用 TaiwanStockPrice 資料集，data_id="TAIEX" 即取得加權指數。
-    
+
     回傳：DataFrame with columns [Open, High, Low, Close, Volume], index=DatetimeIndex
     若失敗 → 空 DataFrame
     """
@@ -3881,7 +3694,7 @@ def _finmind_taiex_fetch(start_date: str, end_date: str) -> pd.DataFrame:
     token = os.environ.get("FINMIND_TOKEN", "").strip()
     sess = _get_session()
     url = "https://api.finmindtrade.com/api/v4/data"
-    
+
     params = {
         "dataset": "TaiwanStockPrice",
         "data_id": "TAIEX",
@@ -3891,7 +3704,7 @@ def _finmind_taiex_fetch(start_date: str, end_date: str) -> pd.DataFrame:
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    
+
     try:
         r = sess.get(url, params=params, headers=headers, timeout=30)
         if r.status_code != 200:
@@ -3904,13 +3717,11 @@ def _finmind_taiex_fetch(start_date: str, end_date: str) -> pd.DataFrame:
         rows = payload.get("data") or []
         if not rows:
             return pd.DataFrame()
-        
-        # FinMind 欄位：date, stock_id, max, min, open, close, Trading_Volume, Trading_money, spread, Trading_turnover
+
         df = pd.DataFrame(rows)
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date").sort_index()
-        
-        # 重新命名為標準格式
+
         result = pd.DataFrame({
             "Open": pd.to_numeric(df.get("open"), errors="coerce"),
             "High": pd.to_numeric(df.get("max"), errors="coerce"),
@@ -3929,7 +3740,7 @@ def _fetch_taiex_with_fallback(as_of_date=None, lookback_days: int = 730) -> tup
     """
     抓加權指數 — 直接用 FinMind 為主（yfinance 對 ^TWII 經常延遲）。
     只在 FinMind 完全失敗時才退回 yfinance。
-    
+
     Returns: (df_daily, source_name, fallback_used)
     """
     target_date = as_of_date if as_of_date else datetime.now().date()
@@ -3938,22 +3749,20 @@ def _fetch_taiex_with_fallback(as_of_date=None, lookback_days: int = 730) -> tup
             target_date = pd.Timestamp(target_date).date()
         except Exception:
             target_date = datetime.now().date()
-    
-    # 主要：FinMind TAIEX（最即時，每天盤後更新）
+
     end_date = target_date.strftime("%Y-%m-%d")
     start_date = (target_date - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     twii_fm = _finmind_taiex_fetch(start_date, end_date)
-    
+
     if not twii_fm.empty and len(twii_fm) >= 60:
         logger.info(f"FinMind TAIEX 抓取成功，最新資料 {twii_fm.index[-1].date()}")
         return twii_fm, "FinMind", False
-    
-    # 備援：yfinance ^TWII（FinMind 失敗才用）
+
     logger.warning("FinMind TAIEX 失敗，退回 yfinance")
     twii_yf = _download_yf("^TWII", "2y", "1d")
     if not twii_yf.empty and len(twii_yf) >= 60:
         return twii_yf, "yfinance (FinMind 失敗備援)", True
-    
+
     return pd.DataFrame(), "全部失敗", False
 
 
@@ -3974,13 +3783,11 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
         "data_quality": {"twii_available": False, "vix_available": False, "warnings": []},
     }
 
-    # --------- 0. 強制清除 yfinance 快取（避免 Streamlit Cloud 進程內快取陳舊資料）----------
+    # 強制清除 yfinance 快取
     try:
         import yfinance as yf
-        # yfinance 0.2+ 內部快取 reset
         if hasattr(yf, "_BasePriceHistory") and hasattr(yf._BasePriceHistory, "_metadata"):
             yf._BasePriceHistory._metadata.clear()
-        # 清除 utils 快取（如果存在）
         try:
             from yfinance import cache as _yf_cache
             if hasattr(_yf_cache, "_cache"):
@@ -3990,20 +3797,19 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # --------- 1. 下載 TWII 日線 + 週線（含 FinMind 備援）----------
+    # 1. TWII 日線 (含 FinMind 備援)
     twii, source_used, fallback_used = _fetch_taiex_with_fallback(as_of_date)
     if twii.empty or len(twii) < 60:
         result["data_quality"]["warnings"].append("TWII 日線資料不足（FinMind + yfinance 都失敗）")
         return result
-    
-    # 紀錄資料來源
+
     result["data_source"] = source_used
     if fallback_used:
         result["data_quality"]["warnings"].append(
             f"⚠️ FinMind 失敗，已退回 yfinance 備援（資料可能較舊）"
         )
-    
-    # 週線：直接從日線重新採樣（FinMind 沒有獨立週線端點，且自製 resample 最一致）
+
+    # 週線從日線重新採樣
     try:
         twii_w = twii.resample("W-FRI").agg({
             "Open": "first",
@@ -4019,28 +3825,25 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
 
     result["data_quality"]["twii_available"] = True
 
-    # --------- 1.5 資料新鮮度檢查 ----------
-    latest_data_date = twii.index[-1].date()  # 抓到的最新資料日
+    # 1.5 資料新鮮度檢查
+    latest_data_date = twii.index[-1].date()
     target_check = as_of_date if as_of_date else datetime.now().date()
     if isinstance(target_check, str):
         try:
             target_check = pd.Timestamp(target_check).date()
         except Exception:
             target_check = datetime.now().date()
-    
-    # 計算資料延遲天數（不算週末）
+
     days_lag = (pd.Timestamp(target_check) - pd.Timestamp(latest_data_date)).days
     if days_lag > 2:
         result["data_quality"]["warnings"].append(
             f"⚠️ TWII 資料延遲 {days_lag} 天！抓到的最新日為 {latest_data_date}，"
-            f"目標日為 {target_check}。Yahoo Finance 對 ^TWII 偶發更新延遲，"
-            f"建議稍後重試或選擇較早日期。"
+            f"目標日為 {target_check}。"
         )
-        # 將實際資料日寫入 result 讓使用者看到
         result["actual_data_date"] = str(latest_data_date)
         result["data_lag_days"] = days_lag
 
-    # --------- 2. 過濾到 as_of_date 並對齊 ----------
+    # 2. 過濾到 as_of_date
     if as_of_date is not None:
         target_ts = _nearest_trading_ts(twii, as_of_date)
         if target_ts is not None:
@@ -4059,7 +3862,7 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
     low = twii["Low"]
     volume = twii["Volume"]
 
-    # --------- 3. 價格與漲跌幅 ----------
+    # 3. 價格與漲跌幅
     c_now = float(close.iloc[-1])
     c_prev = float(close.iloc[-2]) if len(close) > 1 else c_now
     daily_change = (c_now / c_prev - 1) * 100 if c_prev > 0 else 0.0
@@ -4080,18 +3883,16 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
         "twii_volume": int(volume.iloc[-1]),
     })
 
-    # --------- 4. 移動平均 + 趨勢狀態 ----------
+    # 4. MA + Trend
     ma5 = float(close.rolling(5).mean().iloc[-1])
     ma20 = float(close.rolling(20).mean().iloc[-1])
     ma60 = float(close.rolling(60).mean().iloc[-1])
 
-    # ADX (回傳 tuple: ADX, +DI, -DI)
     adx_series, plus_di_series, minus_di_series = calculate_adx(twii, 14)
     adx_val = float(adx_series.iloc[-1]) if not adx_series.empty and pd.notna(adx_series.iloc[-1]) else 0.0
     plus_di = float(plus_di_series.iloc[-1]) if not plus_di_series.empty and pd.notna(plus_di_series.iloc[-1]) else 0.0
     minus_di = float(minus_di_series.iloc[-1]) if not minus_di_series.empty and pd.notna(minus_di_series.iloc[-1]) else 0.0
 
-    # 用 stock.py 的 classify_trend 一致邏輯
     trend_state, trend_strength = classify_trend(c_now, ma5, ma20, ma60, adx_val)
 
     result.update({
@@ -4108,7 +3909,7 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
         "market_di_bullish": bool(plus_di > minus_di),
     })
 
-    # --------- 5. 週線趨勢 ----------
+    # 5. 週線
     if not twii_w.empty and len(twii_w) >= 20:
         c_w_now = float(twii_w["Close"].iloc[-1])
         wma20 = float(twii_w["Close"].rolling(20).mean().iloc[-1])
@@ -4127,14 +3928,12 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
             "market_weekly_rsi14": None,
         })
 
-    # --------- 6. RSI / SuperTrend / Bollinger ----------
+    # 6. RSI / SuperTrend / BB
     rsi_val = float(calculate_rsi(close, 14).iloc[-1])
 
-    # SuperTrend (回傳 tuple: supertrend_series, direction_series; direction +1=多頭, -1=空頭)
     st_series, st_direction = calculate_supertrend(twii, period=10, multiplier=3.0)
     st_bullish = bool(st_direction.iloc[-1] == 1) if not st_direction.empty else False
 
-    # Bollinger Bands (回傳 tuple: bbw, upper, lower)
     bbw_series, bb_upper_series, bb_lower_series = calculate_bbands(twii, 20, 2)
     bb_upper = float(bb_upper_series.iloc[-1]) if not bb_upper_series.empty and pd.notna(bb_upper_series.iloc[-1]) else c_now * 1.05
     bb_lower = float(bb_lower_series.iloc[-1]) if not bb_lower_series.empty and pd.notna(bb_lower_series.iloc[-1]) else c_now * 0.95
@@ -4148,7 +3947,7 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
         "market_bb_position_pct": round(bb_pos, 2),
     })
 
-    # --------- 7. ATR / 波動 Regime ----------
+    # 7. ATR / Vol Regime
     atr_series = calculate_atr(twii, 14)
     atr_now = float(atr_series.iloc[-1])
     atr_pct = (atr_now / c_now) * 100 if c_now > 0 else 0.0
@@ -4167,7 +3966,7 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
         "market_volatility_regime": vol_regime,
     })
 
-    # --------- 8. 量能 ----------
+    # 8. 量能
     vol_5d_avg = float(volume.rolling(5).mean().iloc[-1])
     vol_ratio_5d = float(volume.iloc[-1]) / vol_5d_avg if vol_5d_avg > 0 else 1.0
 
@@ -4175,7 +3974,7 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
         "market_vol_ratio_5d": round(vol_ratio_5d, 2),
     })
 
-    # --------- 9. VIX ----------
+    # 9. VIX
     try:
         vix = _download_yf("^VIX", "3mo", "1d")
         if not vix.empty and len(vix) >= 2:
@@ -4184,13 +3983,13 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
             vix_change = vix_now - vix_prev
 
             if vix_now < 18:
-                vix_level = "low"          # 低恐慌
+                vix_level = "low"
             elif vix_now < 25:
-                vix_level = "normal"       # 正常
+                vix_level = "normal"
             elif vix_now < 30:
-                vix_level = "elevated"     # 偏高警戒
+                vix_level = "elevated"
             else:
-                vix_level = "panic"        # 恐慌
+                vix_level = "panic"
 
             result.update({
                 "vix_latest": round(vix_now, 2),
@@ -4205,32 +4004,29 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
         result["data_quality"]["warnings"].append(f"VIX 下載失敗: {str(e)[:50]}")
         result.update({"vix_latest": None, "vix_change": None, "vix_level": None})
 
-    # --------- 10. 推算市場狀態（給 AI 參考，非必需） ----------
+    # 10. 推算市場狀態
     rsi_d = result.get("market_rsi14", 50)
     rsi_w = result.get("market_weekly_rsi14") or 50
     vix_lvl = result.get("vix_level", "normal")
     daily_chg = result["twii_change_pct"]
 
-    # 簡單分類（AI 仍可基於更多訊號自行判斷）
     suggested_regime = None
     if vix_lvl == "panic" or daily_chg < -2.0:
-        suggested_regime = "crisis"           # 黑天鵝
+        suggested_regime = "crisis"
     elif rsi_d > 75 and daily_chg > 1.0:
-        suggested_regime = "late_trend_or_blowoff"   # 末段過熱或權值噴發
+        suggested_regime = "late_trend_or_blowoff"
     elif rsi_d > 75:
-        suggested_regime = "late_trend"       # 末段過熱
+        suggested_regime = "late_trend"
     elif 50 <= rsi_d <= 75 and adx_val > 25:
-        suggested_regime = "trend"            # 趨勢盤
+        suggested_regime = "trend"
     elif 40 <= rsi_d <= 60 and adx_val < 20:
-        suggested_regime = "range"            # 震盪盤
+        suggested_regime = "range"
     else:
-        suggested_regime = "transition"       # 轉折期
+        suggested_regime = "transition"
 
     result["suggested_regime"] = suggested_regime
 
-    # --------- 11. 移除 NaN 與不可序列化值 ----------
     result = _sanitize_numpy(result)
-
     return result
 
 
@@ -4248,7 +4044,7 @@ def save_market_features(features: Dict[str, Any], output_path: str = None) -> s
 
 
 # ===================================================================
-# 19. ENTRY POINT
+# 19. CLI ENTRY
 # ===================================================================
 
 if __name__ == "__main__":
@@ -4257,7 +4053,6 @@ if __name__ == "__main__":
     sid = sys.argv[1] if len(sys.argv) > 1 else "2330"
     m = sys.argv[2] if len(sys.argv) > 2 else "human"
 
-    # market 模式 - 只產出大盤 features
     if sid == "market":
         as_of = sys.argv[2] if len(sys.argv) > 2 else None
         features = compute_market_features(as_of_date=as_of)
