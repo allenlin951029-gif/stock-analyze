@@ -2,6 +2,7 @@ import json
 import io
 import os
 import csv
+import zipfile  # [NEW] for Batch Sectors ZIP
 from contextlib import redirect_stdout
 from datetime import datetime
 
@@ -305,6 +306,10 @@ if "prompt_m_ai_result" not in st.session_state:
 if "attack_list" not in st.session_state:
     st.session_state.attack_list = load_attack_list_from_db()
 
+# [NEW] Batch Sectors — 結果保存到 session,讓使用者下載
+if "batch_sector_results" not in st.session_state:
+    st.session_state.batch_sector_results = []
+
 
 # -------------------------
 # CSV Parsing for Regulatory Lists
@@ -529,21 +534,43 @@ def _get_holdings_map():
     return m
 
 
-def run_full_sector_report(sector_name, as_of_date, custom_list=None):
-    target_list = custom_list if custom_list else SECTOR_DICT.get(sector_name, [])
-    if not target_list:
-        save_to_archive(f"Full: {sector_name}", as_of_date, "No stocks.")
-        return
-
-    mode = st.session_state.report_mode
+def _build_full_sector_payload(sector_name, target_list, as_of_date, mode):
+    """
+    [NEW] 抽出 run_full_sector_report 的核心邏輯 — 給 Batch Sectors 用。
+    不寫 archive,只回傳結果 dict。
+    回傳:
+    {
+        "sector_name": ..., "as_of_date": ..., "mode": "ai"|"human",
+        "human_report_text": str|None,
+        "ai_report_dict": dict|None,
+        "stocks_count": int,
+        "errors": [str],
+    }
+    """
     h_map = _get_holdings_map()
+    errors = []
+    out = {
+        "sector_name": sector_name,
+        "as_of_date": str(as_of_date),
+        "mode": mode,
+        "human_report_text": None,
+        "ai_report_dict": None,
+        "stocks_count": len(target_list),
+        "errors": errors,
+    }
+
+    if not target_list:
+        out["human_report_text"] = f"Sector [{sector_name}] is empty."
+        return out
 
     if mode == "ai":
         all_reports = {}
         for stock in target_list:
             try:
-                res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="ai",
-                                              regulatory_data=st.session_state.get("regulatory_data"))
+                res = analyze_stock_technical(
+                    stock, as_of_date=as_of_date, mode="ai",
+                    regulatory_data=st.session_state.get("regulatory_data"),
+                )
                 if isinstance(res, dict):
                     feat = res.get("ai_report", {})
                     hinfo = h_map.get(stock.strip().upper())
@@ -558,67 +585,101 @@ def run_full_sector_report(sector_name, as_of_date, custom_list=None):
                             feat["holding_return_pct"] = round((c - avg) / avg * 100, 2)
                             feat["holding_unrealized_pnl"] = round((c - avg) * shares, 2)
                     all_reports[stock] = feat
+                    if isinstance(feat, dict) and feat.get("error"):
+                        errors.append(f"{stock}: {feat.get('error')}")
                 else:
                     all_reports[stock] = {"error": "unexpected format"}
+                    errors.append(f"{stock}: unexpected format")
             except Exception as e:
                 all_reports[stock] = {"error": str(e)}
+                errors.append(f"{stock}: {type(e).__name__}: {e}")
 
+        out["ai_report_dict"] = {
+            "sector": sector_name,
+            "date": str(as_of_date),
+            "stocks": all_reports,
+        }
+        return out
+
+    # human mode
+    full_content = []
+    full_content.append(f"Sector [{sector_name}] Quick Screen Report")
+    full_content.append(f"Date: {as_of_date}")
+    full_content.append(f"Stocks: {', '.join(target_list)}")
+    full_content.append("=" * 60)
+    full_content.append("")
+
+    for stock in target_list:
+        try:
+            res = analyze_stock_technical(
+                stock, as_of_date=as_of_date, mode="human",
+                regulatory_data=st.session_state.get("regulatory_data"),
+            )
+            if isinstance(res, dict):
+                txt = res.get("human_report", str(res))
+                full_content.append(txt)
+                hinfo = h_map.get(stock.strip().upper())
+                if hinfo:
+                    avg = hinfo["avg_price"]
+                    shares = hinfo["shares"]
+                    close_val = None
+                    for line in txt.split("\n"):
+                        if "Close：" in line:
+                            try:
+                                close_val = float(line.split("Close：")[1].split()[0])
+                            except (IndexError, ValueError):
+                                pass
+                    h_lines = [
+                        f"  ── Holdings ──",
+                        f"  Avg：{avg:.2f}  Shares：{shares}  Cost：{avg * shares:,.0f}",
+                    ]
+                    if close_val and avg > 0:
+                        ret = (close_val - avg) / avg * 100
+                        pnl = (close_val - avg) * shares
+                        emoji = "📈" if ret >= 0 else "📉"
+                        h_lines.append(f"  {emoji} Return：{ret:+.2f}%  P&L：{pnl:+,.0f}")
+                    full_content.append("\n".join(h_lines))
+                # 偵測錯誤行
+                first_line = txt.split("\n", 1)[0] if txt else ""
+                if first_line.strip().startswith("X "):
+                    errors.append(f"{stock}: {first_line.strip()}")
+            else:
+                full_content.append(str(res))
+            full_content.append("")
+            full_content.append("=" * 60)
+            full_content.append("")
+        except Exception as e:
+            full_content.append(f"FAIL {stock}: {e}")
+            full_content.append("-" * 60)
+            errors.append(f"{stock}: {type(e).__name__}: {e}")
+
+    out["human_report_text"] = "\n".join(full_content)
+    return out
+
+
+def run_full_sector_report(sector_name, as_of_date, custom_list=None):
+    """[REFACTORED] 改為呼叫 _build_full_sector_payload,跟 Batch 共用邏輯。"""
+    target_list = custom_list if custom_list else SECTOR_DICT.get(sector_name, [])
+    if not target_list:
+        save_to_archive(f"Full: {sector_name}", as_of_date, "No stocks.")
+        return
+
+    mode = st.session_state.report_mode
+    payload = _build_full_sector_payload(sector_name, target_list, as_of_date, mode)
+
+    if mode == "ai":
         combined = {
-            "human_report": f"Sector [{sector_name}] Deep Dive report ({len(target_list)} stocks)\nDate: {as_of_date}",
-            "ai_report": {
-                "sector": sector_name,
-                "date": str(as_of_date),
-                "stocks": all_reports,
-            },
+            "human_report": (
+                f"Sector [{sector_name}] Deep Dive report ({len(target_list)} stocks)\n"
+                f"Date: {as_of_date}"
+            ),
+            "ai_report": payload["ai_report_dict"],
         }
         save_to_archive(f"Full: {sector_name}", as_of_date, combined)
     else:
-        full_content = []
-        full_content.append(f"Sector [{sector_name}] Quick Screen Report")
-        full_content.append(f"Date: {as_of_date}")
-        full_content.append(f"Stocks: {', '.join(target_list)}")
-        full_content.append("=" * 60)
-        full_content.append("")
-
-        for stock in target_list:
-            try:
-                res = analyze_stock_technical(stock, as_of_date=as_of_date, mode="human",
-                                              regulatory_data=st.session_state.get("regulatory_data"))
-                if isinstance(res, dict):
-                    txt = res.get("human_report", str(res))
-                    full_content.append(txt)
-                    hinfo = h_map.get(stock.strip().upper())
-                    if hinfo:
-                        avg = hinfo["avg_price"]
-                        shares = hinfo["shares"]
-                        close_val = None
-                        for line in txt.split("\n"):
-                            if "Close：" in line:
-                                try:
-                                    close_val = float(line.split("Close：")[1].split()[0])
-                                except (IndexError, ValueError):
-                                    pass
-                        h_lines = [f"  ── Holdings ──",
-                                   f"  Avg：{avg:.2f}  Shares：{shares}  Cost：{avg * shares:,.0f}"]
-                        if close_val and avg > 0:
-                            ret = (close_val - avg) / avg * 100
-                            pnl = (close_val - avg) * shares
-                            emoji = "📈" if ret >= 0 else "📉"
-                            h_lines.append(f"  {emoji} Return：{ret:+.2f}%  P&L：{pnl:+,.0f}")
-                        full_content.append("\n".join(h_lines))
-                else:
-                    full_content.append(str(res))
-                full_content.append("")
-                full_content.append("=" * 60)
-                full_content.append("")
-            except Exception as e:
-                full_content.append(f"FAIL {stock}: {e}")
-                full_content.append("-" * 60)
-
-        combined_report = "\n".join(full_content)
         final_struct = {
-            "human_report": combined_report,
-            "ai_report": None
+            "human_report": payload["human_report_text"],
+            "ai_report": None,
         }
         save_to_archive(f"Full: {sector_name}", as_of_date, final_struct)
 
@@ -1919,8 +1980,18 @@ C. 個股報酬 > 20%:成本 × 1.10(鎖至少 10% 獲利)
 # -------------------------
 # Main Content
 # -------------------------
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["Stock Analysis", "Sector Analysis", "Custom Sectors", "Regulatory Lists", "Holdings", "📊 Market Snapshot", "🎯 進攻名單追蹤"])
+tab1, tab2, tab_batch, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    [
+        "Stock Analysis",
+        "Sector Analysis",
+        "🚀 Batch Sectors",
+        "Custom Sectors",
+        "Regulatory Lists",
+        "Holdings",
+        "📊 Market Snapshot",
+        "🎯 進攻名單追蹤",
+    ]
+)
 
 # --- Tab 1: Stock Analysis ---
 with tab1:
@@ -2000,6 +2071,303 @@ with tab2:
                     clist = target_list if source_type == "Custom" else None
                     run_full_sector_report(selected_sector, sector_date, custom_list=clist)
                     st.rerun()
+
+
+# --- [NEW] Tab Batch: Batch Sectors ---
+with tab_batch:
+    st.header("🚀 Batch Sectors — 一次跑多個族群")
+    st.caption(
+        "勾選想要分析的族群,系統會逐一處理,每個族群輸出獨立檔案。"
+        "目前 Report Mode:**" + ("Deep Dive (JSON)" if is_ai_mode() else "Quick Screen (TXT)") +
+        "**(在 Sidebar 切換)"
+    )
+
+    bc1, bc2 = st.columns([2, 1])
+    with bc2:
+        batch_date = st.date_input(
+            "Date",
+            value=st.session_state.sector_as_of_date,
+            key="batch_sector_date",
+        )
+
+    builtin_opts = list(SECTOR_DICT.keys())
+    custom_opts = list(st.session_state.custom_sectors.keys())
+
+    with bc1:
+        st.markdown("#### 1️⃣ 選擇 Built-in 族群")
+        if builtin_opts:
+            bb1, bb2 = st.columns(2)
+            with bb1:
+                if st.button("全選 Built-in", key="batch_builtin_all", use_container_width=True):
+                    st.session_state["batch_builtin_select"] = list(builtin_opts)
+                    st.rerun()
+            with bb2:
+                if st.button("清除 Built-in", key="batch_builtin_clear", use_container_width=True):
+                    st.session_state["batch_builtin_select"] = []
+                    st.rerun()
+            selected_builtin = st.multiselect(
+                "Built-in",
+                options=builtin_opts,
+                default=st.session_state.get("batch_builtin_select", []),
+                key="batch_builtin_select",
+                label_visibility="collapsed",
+            )
+        else:
+            selected_builtin = []
+            st.caption("(無 built-in 族群)")
+
+        st.markdown("#### 2️⃣ 選擇 Custom 族群")
+        if custom_opts:
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                if st.button("全選 Custom", key="batch_custom_all", use_container_width=True):
+                    st.session_state["batch_custom_select"] = list(custom_opts)
+                    st.rerun()
+            with cc2:
+                if st.button("清除 Custom", key="batch_custom_clear", use_container_width=True):
+                    st.session_state["batch_custom_select"] = []
+                    st.rerun()
+            selected_custom = st.multiselect(
+                "Custom",
+                options=custom_opts,
+                default=st.session_state.get("batch_custom_select", []),
+                key="batch_custom_select",
+                label_visibility="collapsed",
+            )
+        else:
+            selected_custom = []
+            st.caption("(無 custom 族群,可到「Custom Sectors」分頁建立)")
+
+    sectors_to_run = []
+    total_stocks_set = set()
+    for name in selected_builtin:
+        tickers = SECTOR_DICT.get(name, [])
+        sectors_to_run.append((name, "builtin", tickers))
+        total_stocks_set.update(tickers)
+    for name in selected_custom:
+        tickers = st.session_state.custom_sectors.get(name, [])
+        sectors_to_run.append((name, "custom", tickers))
+        total_stocks_set.update(tickers)
+
+    st.divider()
+
+    if sectors_to_run:
+        st.markdown(
+            f"### 📊 即將分析 {len(sectors_to_run)} 個族群,合計 {len(total_stocks_set)} 檔不重複股票"
+        )
+
+        with st.expander("查看選取的族群細節", expanded=False):
+            for name, source, tickers in sectors_to_run:
+                st.markdown(
+                    f"- **{name}** _({source}, {len(tickers)} 檔)_ : "
+                    f"`{', '.join(tickers) if tickers else '(empty)'}`"
+                )
+
+        avg_seconds_per_stock = 8 if is_ai_mode() else 2
+        est_total_seconds = len(total_stocks_set) * avg_seconds_per_stock
+        est_str = (
+            f"{est_total_seconds} 秒"
+            if est_total_seconds < 60
+            else f"約 {est_total_seconds // 60} 分 {est_total_seconds % 60} 秒"
+        )
+        st.caption(f"⏱️ 預估時間:{est_str}(僅供參考;Deep Dive 較慢)")
+
+        run_batch = st.button(
+            f"▶️ 開始批次分析 ({len(sectors_to_run)} 個族群)",
+            type="primary",
+            use_container_width=True,
+            key="run_batch_btn",
+        )
+
+        if run_batch:
+            mode = st.session_state.report_mode
+            results_collected = []
+
+            progress_text = st.empty()
+            progress_bar = st.progress(0.0)
+            status_box = st.empty()
+
+            errors_total = 0
+            t_start = datetime.now()
+
+            for idx, (name, source, tickers) in enumerate(sectors_to_run, start=1):
+                pct = (idx - 1) / len(sectors_to_run)
+                progress_bar.progress(pct)
+                progress_text.markdown(
+                    f"**進度**:第 **{idx}** / {len(sectors_to_run)} 個 — "
+                    f"正在處理 `{name}` ({len(tickers)} 檔股票)..."
+                )
+
+                try:
+                    payload = _build_full_sector_payload(name, tickers, batch_date, mode)
+                    err_count = len(payload.get("errors", []))
+                    errors_total += err_count
+
+                    # 也寫到 archive — 跟原 Full Report 行為一致,可在下方分頁瀏覽
+                    if mode == "ai":
+                        combined = {
+                            "human_report": (
+                                f"Sector [{name}] Deep Dive report ({len(tickers)} stocks)\n"
+                                f"Date: {batch_date}"
+                            ),
+                            "ai_report": payload["ai_report_dict"],
+                        }
+                        save_to_archive(f"Full: {name}", batch_date, combined)
+                    else:
+                        final_struct = {
+                            "human_report": payload["human_report_text"],
+                            "ai_report": None,
+                        }
+                        save_to_archive(f"Full: {name}", batch_date, final_struct)
+
+                    results_collected.append({
+                        "sector_name": name,
+                        "source": source,
+                        "stocks_count": len(tickers),
+                        "errors_count": err_count,
+                        "mode": mode,
+                        "as_of_date": str(batch_date),
+                        "payload": payload,
+                        "status": "ok" if err_count == 0 else f"partial ({err_count} 個錯誤)",
+                    })
+
+                    if err_count > 0:
+                        status_box.warning(
+                            f"⚠️ `{name}` 完成,但有 {err_count} 檔錯誤:" +
+                            "; ".join(payload["errors"][:3]) +
+                            ("..." if err_count > 3 else "")
+                        )
+                    else:
+                        status_box.success(f"✓ `{name}` 完成 ({len(tickers)} 檔)")
+
+                except Exception as e:
+                    results_collected.append({
+                        "sector_name": name,
+                        "source": source,
+                        "stocks_count": len(tickers),
+                        "errors_count": len(tickers),
+                        "mode": mode,
+                        "as_of_date": str(batch_date),
+                        "payload": None,
+                        "status": f"FAIL: {type(e).__name__}: {e}",
+                    })
+                    status_box.error(f"✗ `{name}` 整批失敗:{e}")
+                    errors_total += len(tickers)
+
+            progress_bar.progress(1.0)
+            elapsed = (datetime.now() - t_start).total_seconds()
+            elapsed_str = (
+                f"{int(elapsed // 60)}分{int(elapsed % 60)}秒"
+                if elapsed >= 60
+                else f"{int(elapsed)}秒"
+            )
+            progress_text.markdown(
+                f"### ✅ 批次完成!共 {len(sectors_to_run)} 個族群,耗時 {elapsed_str}" +
+                (f",個股錯誤 {errors_total} 檔" if errors_total > 0 else "")
+            )
+            status_box.empty()
+
+            st.session_state.batch_sector_results = results_collected
+            st.balloons()
+
+    else:
+        st.info("👆 請在上方勾選至少一個族群")
+
+    # ----- 顯示已完成的批次結果 + 下載 -----
+    if st.session_state.batch_sector_results:
+        st.divider()
+        st.markdown("### 📦 批次結果 (上次執行)")
+
+        summary_rows = []
+        for r in st.session_state.batch_sector_results:
+            summary_rows.append({
+                "族群": r["sector_name"],
+                "來源": r["source"],
+                "股數": r["stocks_count"],
+                "錯誤": r["errors_count"],
+                "模式": "Deep Dive" if r["mode"] == "ai" else "Quick Screen",
+                "狀態": r["status"],
+            })
+        st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+
+        # ZIP 打包
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for r in st.session_state.batch_sector_results:
+                payload = r.get("payload")
+                if payload is None:
+                    continue
+                safe_name = (
+                    r["sector_name"]
+                    .replace("/", "_").replace("\\", "_")
+                    .replace(" ", "_").replace(":", "_")
+                )
+                if r["mode"] == "ai":
+                    fn = f"sector_{safe_name}_{r['as_of_date']}.json"
+                    content = json.dumps(
+                        payload["ai_report_dict"],
+                        ensure_ascii=False, indent=2, default=str,
+                    )
+                else:
+                    fn = f"sector_{safe_name}_{r['as_of_date']}.txt"
+                    content = payload["human_report_text"] or ""
+                zf.writestr(fn, content)
+        zip_buffer.seek(0)
+
+        st.markdown("#### 📦 一次下載全部 (ZIP)")
+        valid_count = len([r for r in st.session_state.batch_sector_results if r.get("payload")])
+        st.download_button(
+            label=f"📦 下載 ZIP ({valid_count} 個族群)",
+            data=zip_buffer.getvalue(),
+            file_name=f"batch_sectors_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            mime="application/zip",
+            key="dl_batch_zip",
+            use_container_width=True,
+            type="primary",
+        )
+
+        st.markdown("#### 📥 個別下載")
+        n_cols = 3
+        cols = st.columns(n_cols)
+        for i, r in enumerate(st.session_state.batch_sector_results):
+            payload = r.get("payload")
+            if payload is None:
+                cols[i % n_cols].error(f"❌ {r['sector_name']}\n({r['status']})")
+                continue
+            safe_name = (
+                r["sector_name"]
+                .replace("/", "_").replace("\\", "_")
+                .replace(" ", "_").replace(":", "_")
+            )
+            if r["mode"] == "ai":
+                fn = f"sector_{safe_name}_{r['as_of_date']}.json"
+                content = json.dumps(
+                    payload["ai_report_dict"],
+                    ensure_ascii=False, indent=2, default=str,
+                )
+                mime = "application/json"
+                btn_label = f"📄 {r['sector_name']}.json"
+            else:
+                fn = f"sector_{safe_name}_{r['as_of_date']}.txt"
+                content = payload["human_report_text"] or ""
+                mime = "text/plain"
+                btn_label = f"📄 {r['sector_name']}.txt"
+
+            with cols[i % n_cols]:
+                st.download_button(
+                    label=btn_label,
+                    data=content,
+                    file_name=fn,
+                    mime=mime,
+                    key=f"dl_batch_{i}_{r['sector_name']}",
+                    use_container_width=True,
+                )
+
+        st.divider()
+        if st.button("🗑️ 清除批次結果", key="clear_batch_results"):
+            st.session_state.batch_sector_results = []
+            st.rerun()
+
 
 # --- Tab 3: Custom Sectors ---
 with tab3:
@@ -2234,6 +2602,7 @@ with tab4:
             save_regulatory_to_db()
             st.rerun()
 
+
 # --- Tab 5: Holdings ---
 with tab5:
     st.header("📊 Holdings Management")
@@ -2380,7 +2749,7 @@ with tab6:
             snapshot_date = features.get("snapshot_date", "?")
             actual_data_date = features.get("actual_data_date")
             data_lag_days = features.get("data_lag_days", 0)
-            
+
             if data_lag_days and data_lag_days > 2:
                 st.error(
                     f"⚠️ **資料延遲警示** — 你選的日期 **{snapshot_date}**，"
@@ -2397,7 +2766,7 @@ with tab6:
                 )
             else:
                 st.success(f"✓ 大盤資料抓取成功（{snapshot_date}）")
-            
+
             # 顯示資料來源
             data_source = features.get("data_source", "FinMind")
             if data_source == "FinMind":
@@ -2639,6 +3008,7 @@ with tab6:
             st.session_state["_show_combined_preview"] = False
             st.rerun()
 
+
 # --- Tab 7: 進攻名單追蹤 ---
 with tab7:
     st.header("🎯 進攻名單追蹤")
@@ -2723,7 +3093,7 @@ with tab7:
     if not today_list:
         st.info(f"📭 {attack_date_str} 尚無進攻名單。請先在上方新增股票。")
     else:
-        st.subheader(f"📋 {attack_date_str} 進攻名單（{len(today_list)} 檔）")
+        st.subheader(f"📋 {attack_date_str} 進攻名單({len(today_list)} 檔)")
 
         for stock_idx, stock_entry in enumerate(today_list):
             sid = stock_entry["stock_id"]
@@ -2734,7 +3104,7 @@ with tab7:
             title_text = f"【{sid}】{sname}" if sname else f"【{sid}】"
             if judgments:
                 ai_sources = ", ".join([j["ai_source"] for j in judgments])
-                title_text += f"  —  {len(judgments)} 個 AI（{ai_sources}）"
+                title_text += f"  —  {len(judgments)} 個 AI({ai_sources})"
             else:
                 title_text += "  —  尚無 AI 判斷"
 
