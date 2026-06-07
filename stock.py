@@ -3820,17 +3820,32 @@ def analyze_stock_technical(stock_id: str, as_of_date=None, mode: str = "human",
 
 # ===================================================================
 # 18. MARKET FEATURES (大盤狀態指標)
-# 提供 AI 判讀「現在是什麼盤」所需的客觀數據
+#
+# 完整替換 stock.py 中原本 § 18 區段 (從 `def _finmind_taiex_fetch` 開始,
+# 到 `def save_market_features` 結尾)。
+#
+# 主要變更:
+#   - 統一 twii_volume 單位為「張」(千股),修正 FinMind / yfinance 單位不一致
+#   - 新增整體市場融資融券 (TaiwanStockTotalMarginPurchaseShortSale)
+#   - 新增外資台指期未平倉淨口數 (TaiwanFuturesInstitutionalInvestors)
+#   - vol_ratio_5d 改用 [-6:-1] 排除今天,與個股版一致
+#   - 強化 suggested_regime 邏輯 (考慮 weekly_rsi / VIX 急升 / ma20_dev)
+#   - 新增 market_overheat_score (0-100 綜合過熱分數)
+#   - 無條件輸出 actual_data_date / data_lag_days
 # ===================================================================
 
 
 def _finmind_taiex_fetch(start_date: str, end_date: str) -> pd.DataFrame:
-    """從 FinMind 抓加權指數 (TAIEX) 日線資料，作為 yfinance ^TWII 的備援。
+    """從 FinMind 抓加權指數 (TAIEX) 日線資料。
 
-    使用 TaiwanStockPrice 資料集，data_id="TAIEX" 即取得加權指數。
+    **單位處理**:
+      - FinMind Trading_Volume 原始單位 = 「股」
+      - 本函式輸出 Volume 統一除以 1000,轉成「張」(千股)
+      - 這樣與 yfinance ^TWII 的 volume 單位一致 (yfinance 也是「張」量級)
+      - 額外回傳 trading_money 欄位 (千元,原始單位),供呼叫端換算億元
 
-    回傳：DataFrame with columns [Open, High, Low, Close, Volume], index=DatetimeIndex
-    若失敗 → 空 DataFrame
+    回傳:DataFrame with [Open, High, Low, Close, Volume, trading_money],
+    index=DatetimeIndex。Volume 已統一為「張」單位。
     """
     import os
     token = os.environ.get("FINMIND_TOKEN", "").strip()
@@ -3864,12 +3879,20 @@ def _finmind_taiex_fetch(start_date: str, end_date: str) -> pd.DataFrame:
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date").sort_index()
 
+        # [UNIT FIX] FinMind Trading_Volume 是「股」, 除以 1000 統一為「張」
+        # (與 yfinance ^TWII 量級一致)
+        vol_shares = pd.to_numeric(df.get("Trading_Volume"), errors="coerce").fillna(0)
+        vol_lots = (vol_shares / 1000).round(0)
+
+        trading_money = pd.to_numeric(df.get("Trading_money"), errors="coerce").fillna(0)
+
         result = pd.DataFrame({
             "Open": pd.to_numeric(df.get("open"), errors="coerce"),
             "High": pd.to_numeric(df.get("max"), errors="coerce"),
             "Low": pd.to_numeric(df.get("min"), errors="coerce"),
             "Close": pd.to_numeric(df.get("close"), errors="coerce"),
-            "Volume": pd.to_numeric(df.get("Trading_Volume"), errors="coerce").fillna(0),
+            "Volume": vol_lots,
+            "trading_money": trading_money,  # 千元
         })
         result = result.dropna(subset=["Close"])
         return result
@@ -3880,8 +3903,7 @@ def _finmind_taiex_fetch(start_date: str, end_date: str) -> pd.DataFrame:
 
 def _fetch_taiex_with_fallback(as_of_date=None, lookback_days: int = 730) -> tuple:
     """
-    抓加權指數 — 直接用 FinMind 為主（yfinance 對 ^TWII 經常延遲）。
-    只在 FinMind 完全失敗時才退回 yfinance。
+    抓加權指數 — FinMind 優先,yfinance 為備援。
 
     Returns: (df_daily, source_name, fallback_used)
     """
@@ -3897,35 +3919,499 @@ def _fetch_taiex_with_fallback(as_of_date=None, lookback_days: int = 730) -> tup
     twii_fm = _finmind_taiex_fetch(start_date, end_date)
 
     if not twii_fm.empty and len(twii_fm) >= 60:
-        logger.info(f"FinMind TAIEX 抓取成功，最新資料 {twii_fm.index[-1].date()}")
+        logger.info(f"FinMind TAIEX 抓取成功,最新資料 {twii_fm.index[-1].date()}")
         return twii_fm, "FinMind", False
 
-    logger.warning("FinMind TAIEX 失敗，退回 yfinance")
+    logger.warning("FinMind TAIEX 失敗,退回 yfinance")
     twii_yf = _download_yf("^TWII", "2y", "1d")
     if not twii_yf.empty and len(twii_yf) >= 60:
+        # yfinance 沒有 trading_money 欄位,補一個 NaN 欄位讓下游邏輯一致
+        twii_yf = twii_yf.copy()
+        twii_yf["trading_money"] = np.nan
         return twii_yf, "yfinance (FinMind 失敗備援)", True
 
     return pd.DataFrame(), "全部失敗", False
 
 
+# ===================================================================
+# 18.1 整體市場融資融券 (TaiwanStockTotalMarginPurchaseShortSale)
+# ===================================================================
+
+
+def _finmind_total_margin_fetch(trade_date, lookback_days: int = 30) -> pd.DataFrame:
+    """抓整體市場融資融券,回傳完整時序 DataFrame (供算 5 日 / 20 日變化)。
+
+    FinMind dataset schema:
+      { TodayBalance, YesBalance, buy, date, name, Return, sell }
+
+    name 欄位有「融資(股票)」「融券(股票)」「現股當沖」等,我們只保留前兩種。
+
+    Returns: DataFrame indexed by date, columns:
+      [margin_balance, margin_buy, margin_sell, margin_return,
+       short_balance, short_buy, short_sell, short_return]
+      單位:融資=「萬元」,融券=「張」(依 FinMind 文件)
+    """
+    import os
+    token = os.environ.get("FINMIND_TOKEN", "").strip()
+    sess = _get_session()
+    url = "https://api.finmindtrade.com/api/v4/data"
+
+    start_d = (trade_date - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    end_d = trade_date.strftime("%Y-%m-%d")
+
+    params = {
+        "dataset": "TaiwanStockTotalMarginPurchaseShortSale",
+        "start_date": start_d,
+        "end_date": end_d,
+    }
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        r = sess.get(url, params=params, headers=headers, timeout=20)
+        if r.status_code != 200:
+            logger.warning(f"FinMind TotalMargin HTTP {r.status_code}")
+            return pd.DataFrame()
+        payload = r.json()
+        if payload.get("status") != 200:
+            logger.warning(f"FinMind TotalMargin status={payload.get('status')} msg={payload.get('msg')}")
+            return pd.DataFrame()
+        rows = payload.get("data") or []
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date"])
+
+        def _filter_pivot(name_keyword: str) -> pd.DataFrame:
+            sub = df[df["name"].astype(str).str.contains(name_keyword, na=False)]
+            if sub.empty:
+                return pd.DataFrame()
+            # 同一個 date 可能有多列(例如「融資(股票)」「融資(權證)」),只取第一筆主要分類
+            sub = sub.drop_duplicates(subset=["date"], keep="first").set_index("date").sort_index()
+            return sub
+
+        margin = _filter_pivot("融資")
+        short = _filter_pivot("融券")
+
+        if margin.empty and short.empty:
+            return pd.DataFrame()
+
+        # 對齊兩個時序
+        all_dates = sorted(set(margin.index.tolist()) | set(short.index.tolist()))
+        out = pd.DataFrame(index=pd.DatetimeIndex(all_dates))
+
+        if not margin.empty:
+            out["margin_balance"] = pd.to_numeric(margin.get("TodayBalance"), errors="coerce")
+            out["margin_buy"] = pd.to_numeric(margin.get("buy"), errors="coerce")
+            out["margin_sell"] = pd.to_numeric(margin.get("sell"), errors="coerce")
+            out["margin_return"] = pd.to_numeric(margin.get("Return"), errors="coerce")
+        if not short.empty:
+            out["short_balance"] = pd.to_numeric(short.get("TodayBalance"), errors="coerce")
+            out["short_buy"] = pd.to_numeric(short.get("buy"), errors="coerce")
+            out["short_sell"] = pd.to_numeric(short.get("sell"), errors="coerce")
+            out["short_return"] = pd.to_numeric(short.get("Return"), errors="coerce")
+
+        return out.sort_index()
+    except Exception as e:
+        logger.warning(f"FinMind TotalMargin fetch failed: {e}")
+        return pd.DataFrame()
+
+
+def _compute_total_margin_features(margin_df: pd.DataFrame) -> Dict[str, Any]:
+    """從整體融資融券時序計算特徵欄位。"""
+    feat = {
+        "market_margin_data_available": False,
+        "market_margin_balance": None,
+        "market_margin_5d_change": None,
+        "market_margin_5d_change_pct": None,
+        "market_margin_net_buy_5d": None,
+        "market_short_balance": None,
+        "market_short_5d_change": None,
+        "market_short_net_buy_5d": None,
+        "market_margin_short_ratio": None,
+        "market_margin_date": None,
+        "flag_margin_overheat": False,
+    }
+
+    if margin_df is None or margin_df.empty:
+        return feat
+
+    latest_idx = margin_df.index[-1]
+    feat["market_margin_date"] = latest_idx.strftime("%Y-%m-%d")
+
+    # 融資相關
+    m_bal_series = margin_df.get("margin_balance")
+    if m_bal_series is not None and not m_bal_series.dropna().empty:
+        latest_m = float(m_bal_series.iloc[-1])
+        feat["market_margin_balance"] = round(latest_m, 0)
+        feat["market_margin_data_available"] = True
+
+        if len(m_bal_series.dropna()) >= 6:
+            m_5d_ago = float(m_bal_series.iloc[-6])
+            change = latest_m - m_5d_ago
+            feat["market_margin_5d_change"] = round(change, 0)
+            if m_5d_ago > 0:
+                feat["market_margin_5d_change_pct"] = round(change / m_5d_ago * 100, 2)
+
+        # 5 日累計買 - 賣 - 償還
+        m_buy = margin_df.get("margin_buy")
+        m_sell = margin_df.get("margin_sell")
+        m_ret = margin_df.get("margin_return")
+        if all(s is not None for s in [m_buy, m_sell, m_ret]):
+            net_5d = (m_buy.tail(5).sum() - m_sell.tail(5).sum() - m_ret.tail(5).sum())
+            try:
+                feat["market_margin_net_buy_5d"] = round(float(net_5d), 0)
+            except Exception:
+                pass
+
+    # 融券相關
+    s_bal_series = margin_df.get("short_balance")
+    if s_bal_series is not None and not s_bal_series.dropna().empty:
+        latest_s = float(s_bal_series.iloc[-1])
+        feat["market_short_balance"] = round(latest_s, 0)
+
+        if len(s_bal_series.dropna()) >= 6:
+            s_5d_ago = float(s_bal_series.iloc[-6])
+            feat["market_short_5d_change"] = round(latest_s - s_5d_ago, 0)
+
+        s_buy = margin_df.get("short_buy")
+        s_sell = margin_df.get("short_sell")
+        s_ret = margin_df.get("short_return")
+        if all(s is not None for s in [s_buy, s_sell, s_ret]):
+            # 融券:賣方加開倉、買方回補。淨增 = sell - buy - return
+            net_5d = (s_sell.tail(5).sum() - s_buy.tail(5).sum() - s_ret.tail(5).sum())
+            try:
+                feat["market_short_net_buy_5d"] = round(float(net_5d), 0)
+            except Exception:
+                pass
+
+    # 券資比 (整體市場)
+    mb = feat.get("market_margin_balance") or 0
+    sb = feat.get("market_short_balance") or 0
+    if mb > 0:
+        feat["market_margin_short_ratio"] = round(sb / mb * 100, 3)
+
+    # 融資過熱 flag: 5 日變化 > 3% 為警訊
+    pct = feat.get("market_margin_5d_change_pct")
+    if pct is not None and pct > 3.0:
+        feat["flag_margin_overheat"] = True
+
+    return feat
+
+
+# ===================================================================
+# 18.2 外資台指期未平倉 (TaiwanFuturesInstitutionalInvestors)
+# ===================================================================
+
+
+def _finmind_taifex_foreign_oi_fetch(trade_date, lookback_days: int = 15) -> pd.DataFrame:
+    """抓外資台指期 (TX) 未平倉淨口數時序。
+
+    FinMind dataset: TaiwanFuturesInstitutionalInvestors data_id=TX
+
+    回傳 DataFrame indexed by date, columns:
+      [foreign_long_oi, foreign_short_oi, foreign_net_oi]
+      單位:口
+    """
+    import os
+    token = os.environ.get("FINMIND_TOKEN", "").strip()
+    sess = _get_session()
+    url = "https://api.finmindtrade.com/api/v4/data"
+
+    start_d = (trade_date - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    end_d = trade_date.strftime("%Y-%m-%d")
+
+    params = {
+        "dataset": "TaiwanFuturesInstitutionalInvestors",
+        "data_id": "TX",
+        "start_date": start_d,
+        "end_date": end_d,
+    }
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        r = sess.get(url, params=params, headers=headers, timeout=20)
+        if r.status_code != 200:
+            logger.warning(f"FinMind FuturesInst HTTP {r.status_code}")
+            return pd.DataFrame()
+        payload = r.json()
+        if payload.get("status") != 200:
+            logger.warning(f"FinMind FuturesInst status={payload.get('status')} msg={payload.get('msg')}")
+            return pd.DataFrame()
+        rows = payload.get("data") or []
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        # 只保留外資
+        foreign = df[df["institutional_investors"].astype(str).str.contains("外資", na=False)].copy()
+        if foreign.empty:
+            return pd.DataFrame()
+
+        foreign["date"] = pd.to_datetime(foreign["date"])
+        foreign = foreign.drop_duplicates(subset=["date"], keep="first")
+        foreign = foreign.set_index("date").sort_index()
+
+        long_oi = pd.to_numeric(foreign.get("long_open_interest_balance_volume"), errors="coerce")
+        short_oi = pd.to_numeric(foreign.get("short_open_interest_balance_volume"), errors="coerce")
+
+        out = pd.DataFrame({
+            "foreign_long_oi": long_oi,
+            "foreign_short_oi": short_oi,
+            "foreign_net_oi": long_oi - short_oi,
+        })
+        return out.dropna(subset=["foreign_net_oi"])
+    except Exception as e:
+        logger.warning(f"FinMind FuturesInst fetch failed: {e}")
+        return pd.DataFrame()
+
+
+def _compute_taifex_foreign_features(oi_df: pd.DataFrame) -> Dict[str, Any]:
+    """外資台指期未平倉特徵欄位。
+
+    判讀邏輯:
+      - net_oi > +30000  → 外資強多 (近年常見的「樂觀」分位)
+      - +10000 ~ +30000  → 偏多
+      - -10000 ~ +10000  → 中性
+      - -30000 ~ -10000  → 偏空
+      - net_oi < -30000  → 外資強空 (含警示)
+      - net_oi < -60000  → 極端淨空 (歷史頭部前兆,記憶裡你看過 -64000)
+    """
+    feat = {
+        "market_foreign_futures_oi_available": False,
+        "market_foreign_futures_net_oi": None,
+        "market_foreign_futures_long_oi": None,
+        "market_foreign_futures_short_oi": None,
+        "market_foreign_futures_net_oi_5d_change": None,
+        "market_foreign_futures_position_state": "unknown",
+        "market_foreign_futures_oi_date": None,
+        "flag_foreign_futures_extreme_short": False,
+    }
+
+    if oi_df is None or oi_df.empty:
+        return feat
+
+    feat["market_foreign_futures_oi_available"] = True
+    latest_idx = oi_df.index[-1]
+    feat["market_foreign_futures_oi_date"] = latest_idx.strftime("%Y-%m-%d")
+
+    latest_net = int(oi_df["foreign_net_oi"].iloc[-1])
+    latest_long = int(oi_df["foreign_long_oi"].iloc[-1])
+    latest_short = int(oi_df["foreign_short_oi"].iloc[-1])
+
+    feat["market_foreign_futures_net_oi"] = latest_net
+    feat["market_foreign_futures_long_oi"] = latest_long
+    feat["market_foreign_futures_short_oi"] = latest_short
+
+    if len(oi_df) >= 6:
+        net_5d_ago = int(oi_df["foreign_net_oi"].iloc[-6])
+        feat["market_foreign_futures_net_oi_5d_change"] = latest_net - net_5d_ago
+
+    if latest_net > 30000:
+        state = "strong_bull"
+    elif latest_net > 10000:
+        state = "bullish"
+    elif latest_net > -10000:
+        state = "neutral"
+    elif latest_net > -30000:
+        state = "bearish"
+    elif latest_net > -60000:
+        state = "strong_bear"
+    else:
+        state = "extreme_short"
+
+    feat["market_foreign_futures_position_state"] = state
+
+    # 極端淨空警示(歷史頭部前兆)
+    if latest_net < -50000:
+        feat["flag_foreign_futures_extreme_short"] = True
+
+    return feat
+
+
+# ===================================================================
+# 18.3 過熱分數 (0-100) — 多訊號加權加總
+# ===================================================================
+
+
+def _compute_market_overheat_score(feat: Dict[str, Any]) -> Dict[str, Any]:
+    """綜合過熱分數,0-100。分數越高越過熱。
+
+    權重:
+      - weekly_rsi   : 0-30 分  (主要)
+      - daily_rsi    : 0-15 分
+      - ma20_dev_pct : 0-15 分
+      - bb_position  : 0-10 分
+      - vix_spike    : 0-10 分
+      - 外資台指期淨空 : 0-15 分
+      - 融資5日增   : 0-5 分
+    """
+    score = 0.0
+    breakdown = {}
+
+    # 1. Weekly RSI (0-30)
+    wrsi = feat.get("market_weekly_rsi14")
+    if wrsi is not None:
+        if wrsi >= 85:
+            s = 30
+        elif wrsi >= 80:
+            s = 25
+        elif wrsi >= 75:
+            s = 20
+        elif wrsi >= 70:
+            s = 12
+        elif wrsi >= 65:
+            s = 6
+        else:
+            s = 0
+        score += s
+        breakdown["weekly_rsi"] = s
+
+    # 2. Daily RSI (0-15)
+    drsi = feat.get("market_rsi14")
+    if drsi is not None:
+        if drsi >= 80:
+            s = 15
+        elif drsi >= 75:
+            s = 12
+        elif drsi >= 70:
+            s = 8
+        elif drsi >= 65:
+            s = 4
+        else:
+            s = 0
+        score += s
+        breakdown["daily_rsi"] = s
+
+    # 3. MA20 deviation (0-15) — 大盤距離 MA20 越遠越過熱
+    ma20 = feat.get("twii_ma20")
+    close = feat.get("twii_close")
+    ma20_dev_pct = None
+    if ma20 and close and ma20 > 0:
+        ma20_dev_pct = (close - ma20) / ma20 * 100
+    if ma20_dev_pct is not None:
+        if ma20_dev_pct >= 10:
+            s = 15
+        elif ma20_dev_pct >= 7:
+            s = 11
+        elif ma20_dev_pct >= 5:
+            s = 7
+        elif ma20_dev_pct >= 3:
+            s = 3
+        else:
+            s = 0
+        score += s
+        breakdown["ma20_dev"] = s
+
+    # 4. BB position (0-10) — 越靠上軌越過熱
+    bb_pos = feat.get("market_bb_position_pct")
+    if bb_pos is not None:
+        if bb_pos >= 95:
+            s = 10
+        elif bb_pos >= 85:
+            s = 7
+        elif bb_pos >= 75:
+            s = 4
+        else:
+            s = 0
+        score += s
+        breakdown["bb_position"] = s
+
+    # 5. VIX spike (0-10) — VIX 急升警訊
+    vix_change = feat.get("vix_change")
+    vix_now = feat.get("vix_latest")
+    if vix_change is not None and vix_now is not None:
+        if vix_change >= 6 or (vix_now > 0 and vix_change / vix_now > 0.30):
+            s = 10
+        elif vix_change >= 3:
+            s = 6
+        elif vix_change >= 1.5:
+            s = 3
+        else:
+            s = 0
+        score += s
+        breakdown["vix_spike"] = s
+
+    # 6. 外資台指期淨空 (0-15)
+    fnet = feat.get("market_foreign_futures_net_oi")
+    if fnet is not None:
+        if fnet <= -60000:
+            s = 15
+        elif fnet <= -40000:
+            s = 11
+        elif fnet <= -20000:
+            s = 6
+        elif fnet <= -5000:
+            s = 3
+        else:
+            s = 0
+        score += s
+        breakdown["foreign_futures_short"] = s
+
+    # 7. 融資 5 日大增 (0-5)
+    margin_pct = feat.get("market_margin_5d_change_pct")
+    if margin_pct is not None:
+        if margin_pct >= 5:
+            s = 5
+        elif margin_pct >= 3:
+            s = 3
+        elif margin_pct >= 1.5:
+            s = 1
+        else:
+            s = 0
+        score += s
+        breakdown["margin_surge"] = s
+
+    score = round(min(score, 100), 1)
+
+    if score >= 80:
+        label = "extreme_overheat"
+    elif score >= 65:
+        label = "overheat"
+    elif score >= 50:
+        label = "warm"
+    elif score >= 30:
+        label = "neutral"
+    else:
+        label = "cool"
+
+    return {
+        "market_overheat_score": score,
+        "market_overheat_label": label,
+        "market_overheat_breakdown": breakdown,
+        "market_ma20_dev_pct": round(ma20_dev_pct, 2) if ma20_dev_pct is not None else None,
+    }
+
+
+# ===================================================================
+# 18.4 主函式:compute_market_features
+# ===================================================================
+
+
 def compute_market_features(as_of_date=None) -> Dict[str, Any]:
     """
-    抓 ^TWII（加權指數）+ ^VIX 計算大盤狀態指標。
+    抓 ^TWII (加權指數) + ^VIX + 整體融資融券 + 外資台指期未平倉
+    計算大盤狀態指標。
 
-    產出可直接給 AI 判市況的客觀數據，包括：
-    - 趨勢、動能、波動、量能
-    - VIX 等級
-    - 大盤 RSI、ADX、MA、SuperTrend、Bollinger
-
-    Returns: dict（可直接 json.dumps 成獨立檔案）
+    Returns: dict(可直接 json.dumps)
     """
     result = {
         "snapshot_date": str(as_of_date) if as_of_date else datetime.now().strftime("%Y-%m-%d"),
         "fetched_at": datetime.now().isoformat(),
-        "data_quality": {"twii_available": False, "vix_available": False, "warnings": []},
+        "data_quality": {
+            "twii_available": False,
+            "vix_available": False,
+            "margin_available": False,
+            "foreign_futures_available": False,
+            "warnings": [],
+        },
     }
 
-    # 強制清除 yfinance 快取
+    # 強制清除 yfinance 快取(避免抓到舊資料)
     try:
         import yfinance as yf
         if hasattr(yf, "_BasePriceHistory") and hasattr(yf._BasePriceHistory, "_metadata"):
@@ -3939,16 +4425,17 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 1. TWII 日線 (含 FinMind 備援)
+    # ----- 1. TWII 日線 -----
     twii, source_used, fallback_used = _fetch_taiex_with_fallback(as_of_date)
     if twii.empty or len(twii) < 60:
-        result["data_quality"]["warnings"].append("TWII 日線資料不足（FinMind + yfinance 都失敗）")
+        result["data_quality"]["warnings"].append("TWII 日線資料不足 (FinMind + yfinance 都失敗)")
         return result
 
     result["data_source"] = source_used
     if fallback_used:
         result["data_quality"]["warnings"].append(
-            f"⚠️ FinMind 失敗，已退回 yfinance 備援（資料可能較舊）"
+            "⚠️ FinMind 失敗,已退回 yfinance 備援。注意 trading_money 不可用,"
+            "且 volume 單位仍為「張」但精確度可能較差。"
         )
 
     # 週線從日線重新採樣
@@ -3960,14 +4447,14 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
             "Close": "last",
             "Volume": "sum",
         }).dropna(subset=["Close"])
-        logger.info(f"週線從日線重新採樣，共 {len(twii_w)} 週")
+        logger.info(f"週線從日線重新採樣,共 {len(twii_w)} 週")
     except Exception as e:
         logger.warning(f"日線轉週線失敗: {e}")
         twii_w = pd.DataFrame()
 
     result["data_quality"]["twii_available"] = True
 
-    # 1.5 資料新鮮度檢查
+    # ----- 1.5 資料新鮮度檢查 (無條件輸出) -----
     latest_data_date = twii.index[-1].date()
     target_check = as_of_date if as_of_date else datetime.now().date()
     if isinstance(target_check, str):
@@ -3977,15 +4464,15 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
             target_check = datetime.now().date()
 
     days_lag = (pd.Timestamp(target_check) - pd.Timestamp(latest_data_date)).days
+    # 無條件輸出
+    result["actual_data_date"] = str(latest_data_date)
+    result["data_lag_days"] = int(days_lag)
     if days_lag > 2:
         result["data_quality"]["warnings"].append(
-            f"⚠️ TWII 資料延遲 {days_lag} 天！抓到的最新日為 {latest_data_date}，"
-            f"目標日為 {target_check}。"
+            f"⚠️ TWII 資料延遲 {days_lag} 天!最新日 {latest_data_date},目標日 {target_check}"
         )
-        result["actual_data_date"] = str(latest_data_date)
-        result["data_lag_days"] = days_lag
 
-    # 2. 過濾到 as_of_date
+    # ----- 2. 過濾到 as_of_date -----
     if as_of_date is not None:
         target_ts = _nearest_trading_ts(twii, as_of_date)
         if target_ts is not None:
@@ -4003,8 +4490,9 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
     high = twii["High"]
     low = twii["Low"]
     volume = twii["Volume"]
+    trading_money = twii.get("trading_money")  # 千元,FinMind 才有
 
-    # 3. 價格與漲跌幅
+    # ----- 3. 價格與漲跌幅 -----
     c_now = float(close.iloc[-1])
     c_prev = float(close.iloc[-2]) if len(close) > 1 else c_now
     daily_change = (c_now / c_prev - 1) * 100 if c_prev > 0 else 0.0
@@ -4022,10 +4510,26 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
         "twii_low": float(low.iloc[-1]),
         "twii_change_pct": round(daily_change, 2),
         "twii_weekly_change_pct": round(weekly_change, 2) if weekly_change is not None else None,
-        "twii_volume": int(volume.iloc[-1]),
+        "twii_volume": int(volume.iloc[-1]),  # 單位:張
+        "twii_volume_unit": "lots (千股)",
     })
 
-    # 4. MA + Trend
+    # 成交金額 — 僅 FinMind 路徑可用
+    # 注意:FinMind Trading_money 對 TAIEX 的單位文件沒明說,推測為「元」。
+    # 個股 (e.g. 2330) 通常給「元」(每天 1e10 ~ 1e11 量級),TAIEX 整體應比個股大 10-100x。
+    # 為了讓你驗算,同時輸出原始值與「除以 1e8 視為元 → 億元」的換算值。
+    if trading_money is not None and not trading_money.empty and pd.notna(trading_money.iloc[-1]):
+        tm_now = float(trading_money.iloc[-1])
+        result["twii_trading_money_raw"] = round(tm_now, 0)
+        # 假設單位「元」: 除以 1e8 = 億元
+        result["twii_trading_value_billion_assume_yuan"] = round(tm_now / 1e8, 2)
+        # 第一次跑出來請對比真實的「大盤成交額」(自由時報 / 鉅亨網 / TWSE 公告),
+        # 判斷哪個比例對。台股大盤一天 4000-6000 億是常見區間。
+    else:
+        result["twii_trading_money_raw"] = None
+        result["twii_trading_value_billion_assume_yuan"] = None
+
+    # ----- 4. MA + Trend -----
     ma5 = float(close.rolling(5).mean().iloc[-1])
     ma20 = float(close.rolling(20).mean().iloc[-1])
     ma60 = float(close.rolling(60).mean().iloc[-1])
@@ -4051,7 +4555,7 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
         "market_di_bullish": bool(plus_di > minus_di),
     })
 
-    # 5. 週線
+    # ----- 5. 週線 -----
     if not twii_w.empty and len(twii_w) >= 20:
         c_w_now = float(twii_w["Close"].iloc[-1])
         wma20 = float(twii_w["Close"].rolling(20).mean().iloc[-1])
@@ -4063,14 +4567,14 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
             "market_weekly_rsi14": round(weekly_rsi, 2),
         })
     else:
-        result["data_quality"]["warnings"].append("TWII 週線資料不足，無 weekly RSI/trend")
+        result["data_quality"]["warnings"].append("TWII 週線資料不足,無 weekly RSI/trend")
         result.update({
             "market_weekly_above_ma20": None,
             "market_weekly_trend_state": None,
             "market_weekly_rsi14": None,
         })
 
-    # 6. RSI / SuperTrend / BB
+    # ----- 6. RSI / SuperTrend / BB -----
     rsi_val = float(calculate_rsi(close, 14).iloc[-1])
 
     st_series, st_direction = calculate_supertrend(twii, period=10, multiplier=3.0)
@@ -4089,7 +4593,7 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
         "market_bb_position_pct": round(bb_pos, 2),
     })
 
-    # 7. ATR / Vol Regime
+    # ----- 7. ATR / Vol Regime -----
     atr_series = calculate_atr(twii, 14)
     atr_now = float(atr_series.iloc[-1])
     atr_pct = (atr_now / c_now) * 100 if c_now > 0 else 0.0
@@ -4108,15 +4612,16 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
         "market_volatility_regime": vol_regime,
     })
 
-    # 8. 量能
-    vol_5d_avg = float(volume.rolling(5).mean().iloc[-1])
-    vol_ratio_5d = float(volume.iloc[-1]) / vol_5d_avg if vol_5d_avg > 0 else 1.0
+    # ----- 8. 量能 (修:用 [-6:-1] 排除今天) -----
+    if len(volume) >= 6:
+        vol_5d_avg_prev = float(volume.iloc[-6:-1].mean())
+        vol_ratio_5d = float(volume.iloc[-1]) / vol_5d_avg_prev if vol_5d_avg_prev > 0 else 1.0
+    else:
+        vol_ratio_5d = 1.0
 
-    result.update({
-        "market_vol_ratio_5d": round(vol_ratio_5d, 2),
-    })
+    result["market_vol_ratio_5d"] = round(vol_ratio_5d, 2)
 
-    # 9. VIX
+    # ----- 9. VIX -----
     try:
         vix = _download_yf("^VIX", "3mo", "1d")
         if not vix.empty and len(vix) >= 2:
@@ -4133,47 +4638,114 @@ def compute_market_features(as_of_date=None) -> Dict[str, Any]:
             else:
                 vix_level = "panic"
 
+            # VIX spike flag (急升)
+            vix_spike = bool(
+                vix_change >= 6.0
+                or (vix_prev > 0 and vix_change / vix_prev > 0.30)
+            )
+
             result.update({
                 "vix_latest": round(vix_now, 2),
                 "vix_change": round(vix_change, 2),
+                "vix_change_pct": round(vix_change / vix_prev * 100, 2) if vix_prev > 0 else None,
                 "vix_level": vix_level,
+                "flag_vix_spike": vix_spike,
             })
             result["data_quality"]["vix_available"] = True
         else:
             result["data_quality"]["warnings"].append("VIX 資料不足")
-            result.update({"vix_latest": None, "vix_change": None, "vix_level": None})
+            result.update({
+                "vix_latest": None, "vix_change": None, "vix_change_pct": None,
+                "vix_level": None, "flag_vix_spike": False,
+            })
     except Exception as e:
         result["data_quality"]["warnings"].append(f"VIX 下載失敗: {str(e)[:50]}")
-        result.update({"vix_latest": None, "vix_change": None, "vix_level": None})
+        result.update({
+            "vix_latest": None, "vix_change": None, "vix_change_pct": None,
+            "vix_level": None, "flag_vix_spike": False,
+        })
 
-    # 10. 推算市場狀態
-    rsi_d = result.get("market_rsi14", 50)
+    # ----- 10. 整體融資融券 (FinMind) -----
+    try:
+        margin_df = _finmind_total_margin_fetch(latest_data_date, lookback_days=30)
+        margin_feat = _compute_total_margin_features(margin_df)
+        result.update(margin_feat)
+        result["data_quality"]["margin_available"] = margin_feat.get("market_margin_data_available", False)
+    except Exception as e:
+        result["data_quality"]["warnings"].append(f"整體融資融券失敗: {str(e)[:60]}")
+        result.update(_compute_total_margin_features(pd.DataFrame()))
+
+    # ----- 11. 外資台指期未平倉 (FinMind) -----
+    try:
+        oi_df = _finmind_taifex_foreign_oi_fetch(latest_data_date, lookback_days=15)
+        oi_feat = _compute_taifex_foreign_features(oi_df)
+        result.update(oi_feat)
+        result["data_quality"]["foreign_futures_available"] = oi_feat.get(
+            "market_foreign_futures_oi_available", False
+        )
+    except Exception as e:
+        result["data_quality"]["warnings"].append(f"外資台指期未平倉失敗: {str(e)[:60]}")
+        result.update(_compute_taifex_foreign_features(pd.DataFrame()))
+
+    # ----- 12. 過熱分數 -----
+    overheat = _compute_market_overheat_score(result)
+    result.update(overheat)
+
+    # ----- 13. 推算市場狀態 (強化版) -----
+    rsi_d = result.get("market_rsi14", 50) or 50
     rsi_w = result.get("market_weekly_rsi14") or 50
     vix_lvl = result.get("vix_level", "normal")
+    vix_spike = result.get("flag_vix_spike", False)
     daily_chg = result["twii_change_pct"]
+    overheat_score = result.get("market_overheat_score", 0) or 0
+    ma20_dev = result.get("market_ma20_dev_pct") or 0
+    ext_short = result.get("flag_foreign_futures_extreme_short", False)
 
-    suggested_regime = None
-    if vix_lvl == "panic" or daily_chg < -2.0:
-        suggested_regime = "crisis"
-    elif rsi_d > 75 and daily_chg > 1.0:
-        suggested_regime = "late_trend_or_blowoff"
-    elif rsi_d > 75:
-        suggested_regime = "late_trend"
+    # 優先序:危機 > 過熱blowoff > late_trend > trend > range > transition
+    if vix_lvl == "panic" or daily_chg < -3.0:
+        suggested = "crisis"
+    elif (overheat_score >= 80) or (rsi_w >= 85 and ma20_dev >= 8 and daily_chg > 0):
+        suggested = "late_trend_or_blowoff"
+    elif overheat_score >= 65 or rsi_w >= 80 or ext_short:
+        suggested = "late_trend"
+    elif vix_spike and daily_chg < -1.0:
+        # VIX 急升但還沒崩 → 過熱觸頂警戒
+        suggested = "late_trend_warning"
     elif 50 <= rsi_d <= 75 and adx_val > 25:
-        suggested_regime = "trend"
+        suggested = "trend"
     elif 40 <= rsi_d <= 60 and adx_val < 20:
-        suggested_regime = "range"
+        suggested = "range"
+    elif rsi_d < 30:
+        suggested = "oversold_bounce_setup"
     else:
-        suggested_regime = "transition"
+        suggested = "transition"
 
-    result["suggested_regime"] = suggested_regime
+    result["suggested_regime"] = suggested
+
+    # ----- 14. 把所有 flag 收集成清單,方便 AI 快速掃 -----
+    flags = []
+    if result.get("flag_vix_spike"):
+        flags.append("vix_spike")
+    if result.get("flag_margin_overheat"):
+        flags.append("margin_overheat")
+    if result.get("flag_foreign_futures_extreme_short"):
+        flags.append("foreign_futures_extreme_short")
+    if overheat_score >= 80:
+        flags.append("overheat_extreme")
+    if rsi_w and rsi_w >= 85:
+        flags.append("weekly_rsi_extreme")
+    if ma20_dev >= 10:
+        flags.append("ma20_far_extended")
+    if daily_chg < -2.5:
+        flags.append("sharp_decline")
+    result["market_flags"] = flags
 
     result = _sanitize_numpy(result)
     return result
 
 
 def save_market_features(features: Dict[str, Any], output_path: str = None) -> str:
-    """把大盤 features 存成 JSON 檔案，預設檔名 market_features_YYYY-MM-DD.json"""
+    """把大盤 features 存成 JSON 檔案,預設檔名 market_features_YYYY-MM-DD.json"""
     if output_path is None:
         date = features.get("snapshot_date", datetime.now().strftime("%Y-%m-%d"))
         output_path = f"market_features_{date}.json"
